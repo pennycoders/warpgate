@@ -40,6 +40,15 @@ Desktop drew every bitmap at a quarter of its width and rejected widths whose qu
 not a multiple of 4 ("bad width - must be divisible by 4"). `src/encoder/bitmap.rs` sends
 the row length in bytes.
 
+## Last row of a sub-rectangle
+
+`BitmapUpdate::sub` slices a changed region out of the frame with the frame's stride, so
+its data ends at the region's last pixel, short of a full stride. The legacy bitmap
+encoder counted rows as `len / stride`, which drops that last row: every region narrower
+than the screen went out one row short and one row high, leaving a stale row behind
+(horizontal lines in Jump Desktop while the screen changes). `src/encoder/bitmap.rs`
+rounds up.
+
 ## Pointer AND mask
 
 `DisplayUpdate::RGBAPointer` went out with an empty AND mask, which MS-RDPBCGR
