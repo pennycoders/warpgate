@@ -30,6 +30,16 @@ pub enum Input {
         height: u16,
     },
     Clipboard(String),
+    /// The target's pointer shape: BGRA pixels, top row first. Zero size hides it.
+    Cursor {
+        hot_x: u16,
+        hot_y: u16,
+        width: u16,
+        height: u16,
+        data: Bytes,
+    },
+    /// The target asked for the viewer's own default pointer.
+    DefaultCursor,
     Shutdown,
 }
 

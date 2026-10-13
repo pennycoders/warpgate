@@ -845,6 +845,16 @@ impl Sequence for Acceptor {
 
                         let ShareControlPdu::ClientConfirmActive(confirm) = capabilities_confirm.share_control_pdu
                         else {
+                            // A client keeps sending until it processes the Deactivate All, so
+                            // during reactivation a PDU it sent before that can still arrive here.
+                            if self.reactivation {
+                                warn!(
+                                    pdu = ?capabilities_confirm.share_control_pdu,
+                                    "Dropping unexpected PDU during reactivation"
+                                );
+                                self.state = prev_state;
+                                return Ok(Written::Nothing);
+                            }
                             return Err(ConnectorError::general("expected client confirm active"));
                         };
 
