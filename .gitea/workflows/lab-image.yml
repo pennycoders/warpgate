@@ -1,9 +1,8 @@
 # The lab's Warpgate image: upstream's docker/Dockerfile, unchanged, built from this
 # branch (an upstream release plus vendored fixes, see vendor/*/PATCHES.md) and pushed
-# to the lab's Harbor. Base images come through Harbor's proxy cache, with the digests
-# upstream pins; the `# syntax` frontend (docker/dockerfile, not reachable through the
-# proxy) is dropped, BuildKit's built-in frontend handles the heredocs. Gitea runs only
-# these workflows (.gitea/workflows), not .github's.
+# to the lab's Harbor. Base images and the Dockerfile frontend come through Harbor's
+# proxy cache, with the digests upstream pins. Gitea runs only these workflows
+# (.gitea/workflows), not .github's.
 name: lab-image
 
 on:
@@ -24,7 +23,7 @@ jobs:
           REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
         run: |
           sed -i \
-            -e "/^# syntax=docker\/dockerfile:/d" \
+            -e "s#^\# syntax=docker/dockerfile:#\# syntax=${REGISTRY}/dockerhub/docker/dockerfile:#" \
             -e "s#^FROM rust:#FROM ${REGISTRY}/dockerhub/library/rust:#" \
             -e "s#^FROM debian:#FROM ${REGISTRY}/dockerhub/library/debian:#" \
             docker/Dockerfile
