@@ -16,7 +16,7 @@ use ironrdp_server::tokio_rustls::TlsAcceptor;
 use ironrdp_server::tokio_rustls::rustls::ServerConfig as TlsServerConfig;
 use ironrdp_server::{
     BitmapUpdate, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
-    DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer,
+    DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RGBAPointer, RdpServer,
     RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -229,6 +229,24 @@ async fn route_input(
                 });
             }
             Input::Clipboard(text) => clipboard.offer(text),
+            Input::Cursor {
+                hot_x,
+                hot_y,
+                width,
+                height,
+                data,
+            } => {
+                if let Some(update) = cursor_to_update(hot_x, hot_y, width, height, &data)
+                    && frame_tx.send(update).await.is_err()
+                {
+                    break;
+                }
+            }
+            Input::DefaultCursor => {
+                if frame_tx.send(DisplayUpdate::DefaultPointer).await.is_err() {
+                    break;
+                }
+            }
             Input::Shutdown => break,
         }
     }
@@ -254,6 +272,43 @@ fn frame_to_update(x: u16, y: u16, width: u16, height: u16, data: Bytes) -> Opti
         format: PixelFormat::BgrA32,
         data,
         stride,
+    }))
+}
+
+/// Convert a BGRA pointer shape (top row first) into an IronRDP pointer update. A 32 bpp
+/// pointer's XOR mask goes out bottom row first (MS-RDPBCGR TS_COLORPOINTERATTRIBUTE), which is all
+/// that changes. Zero size hides the pointer; a short buffer is dropped.
+fn cursor_to_update(
+    hot_x: u16,
+    hot_y: u16,
+    width: u16,
+    height: u16,
+    data: &[u8],
+) -> Option<DisplayUpdate> {
+    if width == 0 || height == 0 {
+        return Some(DisplayUpdate::HidePointer);
+    }
+    let stride = usize::from(width) * 4;
+    let Some(pixels) = data.get(..stride * usize::from(height)) else {
+        warn!(
+            width,
+            height,
+            len = data.len(),
+            "ignoring undersized pointer"
+        );
+        return None;
+    };
+    let mut xor_mask = Vec::with_capacity(pixels.len());
+    for row in pixels.chunks_exact(stride).rev() {
+        xor_mask.extend_from_slice(row);
+    }
+    Some(DisplayUpdate::RGBAPointer(RGBAPointer {
+        cache_index: 0,
+        width,
+        height,
+        hot_x,
+        hot_y,
+        data: xor_mask,
     }))
 }
 
@@ -698,5 +753,37 @@ mod framed_tests {
             .await
             .expect("read_by_hint spun instead of returning");
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use ironrdp_server::DisplayUpdate;
+
+    use super::cursor_to_update;
+
+    #[test]
+    fn a_cursor_goes_out_bottom_row_first() {
+        let top = [1, 2, 3, 4];
+        let bottom = [5, 6, 7, 8];
+        let Some(DisplayUpdate::RGBAPointer(pointer)) =
+            cursor_to_update(0, 1, 1, 2, &[top, bottom].concat())
+        else {
+            panic!("expected a pointer update");
+        };
+        assert_eq!(
+            (pointer.width, pointer.height, pointer.hot_x, pointer.hot_y),
+            (1, 2, 0, 1)
+        );
+        assert_eq!(pointer.data, [bottom, top].concat());
+    }
+
+    #[test]
+    fn an_empty_cursor_hides_the_pointer_and_a_short_one_is_dropped() {
+        assert!(matches!(
+            cursor_to_update(0, 0, 0, 0, &[]),
+            Some(DisplayUpdate::HidePointer)
+        ));
+        assert!(cursor_to_update(0, 0, 2, 2, &[0; 8]).is_none());
     }
 }
