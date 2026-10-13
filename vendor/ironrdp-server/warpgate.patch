@@ -1,7 +1,49 @@
+diff -ru ironrdp-server-0.13.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
+--- ironrdp-server-0.13.0/src/encoder/bitmap.rs	2006-07-24 04:21:28
++++ base/src/encoder/bitmap.rs	2026-10-13 22:44:41
+@@ -76,7 +76,9 @@
+                 compression_flags: Compression::BITMAP_COMPRESSION,
+                 compressed_data_header: Some(bitmap::CompressedDataHeader {
+                     main_body_size: cast_length!("main body size", len).map_err(BitmapEncodeError::Encode)?,
+-                    scan_width: u16::from(bitmap.width),
++                    // In bytes, as the FreeRDP server sends it and clients read it, although
++                    // MS-RDPBCGR 2.2.9.1.1.3.1.2.3 words it as pixels.
++                    scan_width: row_len,
+                     uncompressed_size: height * row_len,
+                 }),
+                 bitmap_data: &self.buffer[..len],
 diff -ru ironrdp-server-0.13.0/src/encoder/mod.rs base/src/encoder/mod.rs
 --- ironrdp-server-0.13.0/src/encoder/mod.rs	2006-07-24 04:21:28
-+++ base/src/encoder/mod.rs	2026-10-13 21:54:53
-@@ -569,12 +569,12 @@
++++ base/src/encoder/mod.rs	2026-10-13 22:44:41
+@@ -184,6 +184,18 @@
+ 
+     fn rgba_pointer(ptr: RGBAPointer) -> Result<UpdateFragmenter> {
+         let xor_mask = ptr.data;
++        // The AND mask is not optional (MS-RDPBCGR 2.2.9.1.1.4.4): 1 bpp, rows in the XOR
++        // mask's bottom-up order, each padded to 2 bytes. A set bit keeps the screen pixel,
++        // so it is set where the pointer is fully transparent.
++        let and_stride = usize::from(ptr.width).div_ceil(16) * 2;
++        let mut and_mask = vec![0u8; and_stride * usize::from(ptr.height)];
++        for (row, pixels) in xor_mask.chunks_exact(usize::from(ptr.width) * 4).enumerate() {
++            for (col, pixel) in pixels.chunks_exact(4).enumerate() {
++                if pixel[3] == 0 {
++                    and_mask[row * and_stride + col / 8] |= 0x80 >> (col % 8);
++                }
++            }
++        }
+ 
+         let hot_spot = Point16 {
+             x: ptr.hot_x,
+@@ -195,7 +207,7 @@
+             width: ptr.width,
+             height: ptr.height,
+             xor_mask: &xor_mask,
+-            and_mask: &[],
++            and_mask: &and_mask,
+         };
+         let ptr = PointerAttribute {
+             xor_bpp: 32,
+@@ -569,12 +581,12 @@
          let len = loop {
              match self
                  .remotefx
@@ -16,7 +58,7 @@ diff -ru ironrdp-server-0.13.0/src/encoder/mod.rs base/src/encoder/mod.rs
                      }
                      _ => Err(e).context("RemoteFX encode error")?,
                  },
-@@ -582,7 +582,15 @@
+@@ -582,7 +594,15 @@
              }
          };
  
@@ -35,7 +77,7 @@ diff -ru ironrdp-server-0.13.0/src/encoder/mod.rs base/src/encoder/mod.rs
  
 diff -ru ironrdp-server-0.13.0/src/server.rs base/src/server.rs
 --- ironrdp-server-0.13.0/src/server.rs	2006-07-24 04:21:28
-+++ base/src/server.rs	2026-10-13 21:54:53
++++ base/src/server.rs	2026-10-13 22:44:41
 @@ -47,6 +47,25 @@
  /// TCP listen backlog size for the RDP server socket.
  const LISTENER_BACKLOG: u32 = 1024;
