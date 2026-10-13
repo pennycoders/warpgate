@@ -3690,8 +3690,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-acceptor"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30885a3bdbd0fcf2b9aa27ae9298d8858b9e101c4ac795d3d47ff917efaee63f"
 dependencies = [
  "ironrdp-async",
  "ironrdp-connector",
