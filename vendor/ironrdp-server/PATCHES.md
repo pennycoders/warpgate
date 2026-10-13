@@ -19,6 +19,18 @@ is why this strikes some deployments and not others; see warp-tech/warpgate#2606
 carrying the headers has been built. It also drops a `* 2` from the adjacent buffer-resize
 `debug!`, which reported twice the size actually allocated.
 
+## Fast-path updates capped at the client's MaxRequestSize
+
+Upstream hands the update encoder the server's own `max_request_size` (8 MB) and never
+reads the client's Multifragment Update Capability Set, although MS-RDPBCGR 2.2.7.2.6
+makes the client's `MaxRequestSize` the size of its reassembly buffer. Jump Desktop sends
+65536 and drops the connection on the first full-screen bitmap update ("FastPath: Not
+enough space in the reassembly buffer"). `warpgate.patch` gives the encoder the smaller of
+both sides, keeping the server's when the client sends no such capability set or a zero
+size (`client_max_request_size` in `src/server.rs`).
+
+Upstream: Devolutions/IronRDP#2122, fixed in Devolutions/IronRDP#2123.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
