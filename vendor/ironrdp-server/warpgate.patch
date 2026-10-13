@@ -1,6 +1,6 @@
 diff -ru ironrdp-server-0.13.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.13.0/src/encoder/mod.rs	2026-09-18 20:36:51.130844525 +0200
-+++ base/src/encoder/mod.rs	2026-09-18 20:37:30.867676648 +0200
+--- ironrdp-server-0.13.0/src/encoder/mod.rs	2006-07-24 04:21:28
++++ base/src/encoder/mod.rs	2026-10-13 21:54:53
 @@ -569,12 +569,12 @@
          let len = loop {
              match self
@@ -33,3 +33,49 @@ diff -ru ironrdp-server-0.13.0/src/encoder/mod.rs base/src/encoder/mod.rs
      }
  }
  
+diff -ru ironrdp-server-0.13.0/src/server.rs base/src/server.rs
+--- ironrdp-server-0.13.0/src/server.rs	2006-07-24 04:21:28
++++ base/src/server.rs	2026-10-13 21:54:53
+@@ -47,6 +47,25 @@
+ /// TCP listen backlog size for the RDP server socket.
+ const LISTENER_BACKLOG: u32 = 1024;
+ 
++/// The Fast-Path Update size the client can reassemble, capped by the server's own.
++///
++/// A client's [MaxRequestSize] is the size of its reassembly buffer, which caps the largest
++/// fragmented Fast-Path Update it can take. A client that sends no Multifragment Update
++/// Capability Set, or a zero size, leaves the server's in place.
++///
++/// [MaxRequestSize]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/01717954-716a-424d-af35-28fb2b86df89
++fn client_max_request_size(server_max_request_size: u32, capabilities: &[CapabilitySet]) -> u32 {
++    capabilities
++        .iter()
++        .find_map(|capability| match capability {
++            CapabilitySet::MultiFragmentUpdate(capability) if capability.max_request_size != 0 => {
++                Some(capability.max_request_size)
++            }
++            _ => None,
++        })
++        .map_or(server_max_request_size, |client| client.min(server_max_request_size))
++}
++
+ /// Action to take after a client disconnects.
+ ///
+ /// Returned by [`ConnectionHandler::on_disconnected`] to control whether
+@@ -1396,6 +1415,7 @@
+ 
+         let mut update_codecs = UpdateEncoderCodecs::new();
+         let mut surface_flags = CmdFlags::empty();
++        let max_request_size = client_max_request_size(self.opts.max_request_size, &result.capabilities);
+         for c in result.capabilities {
+             match c {
+                 CapabilitySet::General(c) => {
+@@ -1480,7 +1500,7 @@
+         }
+ 
+         let desktop_size = self.display.lock().await.size().await;
+-        let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs, self.opts.max_request_size)
++        let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs, max_request_size)
+             .context("failed to initialize update encoder")?;
+ 
+         let state = self

@@ -47,6 +47,25 @@ use crate::{SoundServerFactory, builder, capabilities};
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
 
+/// The Fast-Path Update size the client can reassemble, capped by the server's own.
+///
+/// A client's [MaxRequestSize] is the size of its reassembly buffer, which caps the largest
+/// fragmented Fast-Path Update it can take. A client that sends no Multifragment Update
+/// Capability Set, or a zero size, leaves the server's in place.
+///
+/// [MaxRequestSize]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/01717954-716a-424d-af35-28fb2b86df89
+fn client_max_request_size(server_max_request_size: u32, capabilities: &[CapabilitySet]) -> u32 {
+    capabilities
+        .iter()
+        .find_map(|capability| match capability {
+            CapabilitySet::MultiFragmentUpdate(capability) if capability.max_request_size != 0 => {
+                Some(capability.max_request_size)
+            }
+            _ => None,
+        })
+        .map_or(server_max_request_size, |client| client.min(server_max_request_size))
+}
+
 /// Action to take after a client disconnects.
 ///
 /// Returned by [`ConnectionHandler::on_disconnected`] to control whether
@@ -1396,6 +1415,7 @@ impl RdpServer {
 
         let mut update_codecs = UpdateEncoderCodecs::new();
         let mut surface_flags = CmdFlags::empty();
+        let max_request_size = client_max_request_size(self.opts.max_request_size, &result.capabilities);
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
@@ -1480,7 +1500,7 @@ impl RdpServer {
         }
 
         let desktop_size = self.display.lock().await.size().await;
-        let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs, self.opts.max_request_size)
+        let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs, max_request_size)
             .context("failed to initialize update encoder")?;
 
         let state = self
