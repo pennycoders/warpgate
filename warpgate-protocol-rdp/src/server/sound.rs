@@ -4,7 +4,7 @@
 //! so blocks pass through unchanged. Blocks are held back until the viewer has accepted
 //! that format: the server rejects a block sent earlier, and ends the session with it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -22,8 +22,9 @@ use crate::client::pcm_format;
 #[derive(Debug, Default)]
 struct Shared {
     server: Mutex<Option<UnboundedSender<ServerEvent>>>,
-    /// The viewer accepted the format and the channel is streaming.
-    streaming: AtomicBool,
+    /// Channels on which the viewer accepted the format: the rdpsnd static channel and
+    /// AUDIO_PLAYBACK_DVC are both offered, and a viewer may negotiate either or both.
+    streaming: AtomicUsize,
 }
 
 /// Hands the target's sound to the viewer-facing server.
@@ -44,7 +45,7 @@ impl ViewerSound {
     /// Play one block of PCM. Dropped until the viewer has accepted the format, and when
     /// it never will (it declined sound, or did not open the channel at all).
     pub(super) fn play(&self, data: &[u8]) {
-        if !self.shared.streaming.load(Ordering::Acquire) {
+        if self.shared.streaming.load(Ordering::Acquire) == 0 {
             return;
         }
         // Milliseconds since the session began; the viewer uses it only to pace playback,
@@ -80,6 +81,7 @@ impl SoundServerFactory for ViewerSound {
         Box::new(Backend {
             formats: [pcm_format(DESKTOP_AUDIO_FORMAT)],
             shared: Arc::clone(&self.shared),
+            started: false,
         })
     }
 }
@@ -88,6 +90,7 @@ impl SoundServerFactory for ViewerSound {
 struct Backend {
     formats: [AudioFormat; 1],
     shared: Arc<Shared>,
+    started: bool,
 }
 
 impl RdpsndServerHandler for Backend {
@@ -105,12 +108,18 @@ impl RdpsndServerHandler for Backend {
 
     fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
         debug!(format = ?format.format(), "Viewer accepted audio");
-        self.shared.streaming.store(true, Ordering::Release);
+        if !self.started {
+            self.started = true;
+            self.shared.streaming.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(())
     }
 
     fn stop(&mut self) {
-        self.shared.streaming.store(false, Ordering::Release);
+        if self.started {
+            self.started = false;
+            self.shared.streaming.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -246,6 +255,85 @@ mod tests {
         drop(server);
         sound.play(&[0; 4]);
         assert!(waves(&mut rx).is_empty());
+    }
+
+    /// The static channel and AUDIO_PLAYBACK_DVC each get a backend; a viewer that negotiates
+    /// both keeps its sound until both are gone.
+    #[test]
+    fn sound_lasts_while_any_channel_is_negotiated() {
+        let (sound, mut rx) = viewer();
+        let mut on_static = RdpsndServer::new(sound.build_backend());
+        let mut on_dynamic = RdpsndServer::new(sound.build_backend());
+        negotiate(
+            &mut on_static,
+            vec![pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT)],
+        );
+        negotiate(
+            &mut on_dynamic,
+            vec![pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT)],
+        );
+
+        drop(on_static);
+        sound.play(&[1; 4]);
+        assert_eq!(waves(&mut rx).len(), 1);
+
+        drop(on_dynamic);
+        sound.play(&[2; 4]);
+        assert!(waves(&mut rx).is_empty());
+    }
+
+    /// A viewer that only opens AUDIO_PLAYBACK_DVC (Jump Desktop) negotiates through the
+    /// dynamic-channel wrapper and gets sound.
+    #[test]
+    fn a_viewer_on_the_dynamic_channel_gets_sound() {
+        use ironrdp::dvc::{DrdynvcClient, DrdynvcServer};
+        use ironrdp::rdpsnd::client::Rdpsnd;
+        use ironrdp::rdpsnd::dvc::{RdpsndDvcClient, RdpsndDvcServer};
+
+        #[derive(Debug)]
+        struct PcmOnly(Vec<ironrdp::rdpsnd::pdu::AudioFormat>);
+        impl ironrdp::rdpsnd::client::RdpsndClientHandler for PcmOnly {
+            fn get_formats(&self) -> &[ironrdp::rdpsnd::pdu::AudioFormat] {
+                &self.0
+            }
+            fn wave(&mut self, _: usize, _: u32, _: std::borrow::Cow<'_, [u8]>) {}
+            fn set_volume(&mut self, _: ironrdp::rdpsnd::pdu::VolumePdu) {}
+            fn set_pitch(&mut self, _: ironrdp::rdpsnd::pdu::PitchPdu) {}
+            fn close(&mut self) {}
+        }
+
+        let (sound, mut rx) = viewer();
+        let mut server = DrdynvcServer::new().with_dynamic_channel(RdpsndDvcServer::new(
+            RdpsndServer::new(sound.build_backend()),
+        ));
+        let mut client =
+            DrdynvcClient::new().with_dynamic_channel(RdpsndDvcClient::new(Rdpsnd::new(Box::new(
+                PcmOnly(vec![pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT)]),
+            ))));
+        let mut to_client = server.start().unwrap();
+        for _ in 0..16 {
+            if to_client.is_empty() {
+                break;
+            }
+            let mut to_server = Vec::new();
+            for message in to_client.drain(..) {
+                to_server.extend(
+                    client
+                        .process(&message.encode_unframed_pdu().unwrap())
+                        .unwrap(),
+                );
+            }
+            for message in to_server {
+                to_client.extend(
+                    server
+                        .process(&message.encode_unframed_pdu().unwrap())
+                        .unwrap(),
+                );
+            }
+        }
+
+        sound.play(&[3; 4]);
+        assert_eq!(waves(&mut rx).len(), 1);
     }
 
     #[test]

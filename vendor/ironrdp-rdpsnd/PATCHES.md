@@ -10,6 +10,13 @@ never reached the client.
 
 Drop this fork once Warpgate builds against an `ironrdp-rdpsnd` release with the fix.
 
+## Audio output over `AUDIO_PLAYBACK_DVC`
+
+Backport of IronRDP branch `feat/rdpsnd-dvc` (`dvc` module: `RdpsndDvcClient`,
+`RdpsndDvcServer`) and `RdpsndServer::is_ready` from IronRDP master. Some clients, Jump
+Desktop among them, take audio only on the dynamic channel and never open the `rdpsnd`
+static channel. Adds the `ironrdp-dvc` dependency.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is
 not in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.

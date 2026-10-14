@@ -8,12 +8,9 @@
 use std::borrow::Cow;
 
 use bytes::Bytes;
-use ironrdp::core::{Encode, EncodeResult, WriteCursor, ensure_size, impl_as_any};
-use ironrdp::dvc::{DvcClientProcessor, DvcEncode, DvcMessage, DvcProcessor};
-use ironrdp::pdu::{PduResult, encode_err};
 use ironrdp::rdpsnd::client::{Rdpsnd, RdpsndClientHandler};
+use ironrdp::rdpsnd::dvc::{AUDIO_PLAYBACK_DVC, RdpsndDvcClient};
 use ironrdp::rdpsnd::pdu::{AudioFormat, PitchPdu, VolumePdu, WaveFormat};
-use ironrdp::svc::SvcProcessor as _;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, warn};
@@ -32,68 +29,14 @@ pub const fn pcm_format(format: DesktopAudioFormat) -> AudioFormat {
     }
 }
 
-/// MS-RDPEA 2.1: the reliable audio output dynamic channel.
-pub const AUDIO_PLAYBACK_DVC: &str = "AUDIO_PLAYBACK_DVC";
-
-/// An audio PDU already encoded by [`Rdpsnd`].
-struct EncodedPdu(Vec<u8>);
-
-impl Encode for EncodedPdu {
-    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
-        ensure_size!(in: dst, size: self.size());
-        dst.write_slice(&self.0);
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "RdpsndPdu"
-    }
-
-    fn size(&self) -> usize {
-        self.0.len()
-    }
+/// The target's sound on `AUDIO_PLAYBACK_DVC`: the same PDUs and negotiation as the static
+/// channel.
+pub fn dynamic_audio(handler: AudioForwarder) -> RdpsndDvcClient {
+    RdpsndDvcClient::new(Rdpsnd::new(Box::new(AudioForwarder {
+        channel: AUDIO_PLAYBACK_DVC,
+        ..handler
+    })))
 }
-
-impl DvcEncode for EncodedPdu {}
-
-/// [`Rdpsnd`] on `AUDIO_PLAYBACK_DVC`: the same PDUs and negotiation as the static channel.
-pub struct DynamicAudio(Rdpsnd);
-
-impl DynamicAudio {
-    pub fn new(handler: AudioForwarder) -> Self {
-        Self(Rdpsnd::new(Box::new(AudioForwarder {
-            channel: AUDIO_PLAYBACK_DVC,
-            ..handler
-        })))
-    }
-}
-
-impl_as_any!(DynamicAudio);
-
-impl DvcProcessor for DynamicAudio {
-    fn channel_name(&self) -> &str {
-        AUDIO_PLAYBACK_DVC
-    }
-
-    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        // The server speaks first, with its formats.
-        Ok(Vec::new())
-    }
-
-    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        self.0
-            .process(payload)?
-            .into_iter()
-            .map(|message| {
-                let pdu = message.encode_unframed_pdu().map_err(|e| encode_err!(e))?;
-                let message: DvcMessage = Box::new(EncodedPdu(pdu));
-                Ok(message)
-            })
-            .collect()
-    }
-}
-
-impl DvcClientProcessor for DynamicAudio {}
 
 #[derive(Debug)]
 pub struct AudioForwarder {
@@ -180,6 +123,29 @@ mod tests {
 
     use super::AudioForwarder;
 
+    /// A server PDU already encoded, as a DVC message.
+    struct RawPdu(Vec<u8>);
+
+    impl ironrdp::core::Encode for RawPdu {
+        fn encode(
+            &self,
+            dst: &mut ironrdp::core::WriteCursor<'_>,
+        ) -> ironrdp::core::EncodeResult<()> {
+            dst.write_slice(&self.0);
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "RawPdu"
+        }
+
+        fn size(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    impl ironrdp::dvc::DvcEncode for RawPdu {}
+
     #[test]
     fn offers_16_bit_stereo_pcm_at_44_1_khz() {
         let (tx, _rx) = mpsc::channel(1);
@@ -256,12 +222,12 @@ mod tests {
         };
         use ironrdp::svc::{ChannelFlags, SvcProcessor as _};
 
-        use super::{AUDIO_PLAYBACK_DVC, DynamicAudio, pcm_format};
+        use super::{AUDIO_PLAYBACK_DVC, dynamic_audio, pcm_format};
 
         const ID: u32 = 5;
         let (tx, mut rx) = mpsc::channel(4);
         let mut drdynvc =
-            DrdynvcClient::new().with_dynamic_channel(DynamicAudio::new(AudioForwarder::new(tx)));
+            DrdynvcClient::new().with_dynamic_channel(dynamic_audio(AudioForwarder::new(tx)));
         let mut exchange = |pdu: DrdynvcServerPdu| -> Vec<DrdynvcClientPdu> {
             drdynvc
                 .process(&encode_vec(&pdu).unwrap())
@@ -274,7 +240,7 @@ mod tests {
                 .collect()
         };
         let audio = |pdu: ServerAudioOutputPdu<'_>| {
-            let message: DvcMessage = Box::new(super::EncodedPdu(encode_vec(&pdu).unwrap()));
+            let message: DvcMessage = Box::new(RawPdu(encode_vec(&pdu).unwrap()));
             let [svc] = encode_dvc_messages(ID, vec![message], ChannelFlags::empty())
                 .unwrap()
                 .try_into()

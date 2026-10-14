@@ -57,6 +57,9 @@ version = "2.11"
 version = "0.2"
 features = ["alloc"]
 
+[dependencies.ironrdp-dvc]
+version = "0.8"
+
 [dependencies.ironrdp-pdu]
 version = "0.9"
 features = ["alloc"]
