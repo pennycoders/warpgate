@@ -116,7 +116,6 @@ impl RdpsndServerHandler for Backend {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use ironrdp::core::{Decode as _, ReadCursor, encode_vec};
     use ironrdp::rdpsnd::pdu::{
         AudioFormatFlags, ClientAudioFormatPdu, ClientAudioOutputPdu, QualityMode, QualityModePdu,
