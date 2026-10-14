@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+use ironrdp::rdpsnd::pcm::PcmDecimator;
 use ironrdp::rdpsnd::pdu::AudioFormat;
 use ironrdp::rdpsnd::server::{NegotiatedFormat, RdpsndError};
 use ironrdp_server::{
@@ -12,22 +13,16 @@ use ironrdp_server::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
-use warpgate_core::{DESKTOP_AUDIO_FORMAT, DesktopAudioFormat};
+use warpgate_core::DESKTOP_AUDIO_FORMAT;
 
-use super::halve::Halver;
 use crate::client::pcm_format;
-
-const HALF_RATE: DesktopAudioFormat = DesktopAudioFormat {
-    samples_per_sec: DESKTOP_AUDIO_FORMAT.samples_per_sec / 2,
-    ..DESKTOP_AUDIO_FORMAT
-};
 
 #[derive(Debug, Default)]
 struct Shared {
     server: Mutex<Option<UnboundedSender<ServerEvent>>>,
     /// A viewer may negotiate both the rdpsnd static channel and AUDIO_PLAYBACK_DVC.
     streaming: AtomicUsize,
-    halver: Mutex<Option<Halver>>,
+    decimator: Mutex<Option<PcmDecimator>>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,12 +47,16 @@ impl ViewerSound {
         let ts = self.started.elapsed().as_millis() as u32;
         let data = match self
             .shared
-            .halver
+            .decimator
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_mut()
         {
-            Some(halver) => halver.process(data),
+            Some(decimator) => {
+                let mut out = Vec::new();
+                decimator.process(data, &mut out);
+                out
+            }
             None => data.to_vec(),
         };
         if let Some(server) = self
@@ -85,16 +84,23 @@ impl ServerEventSender for ViewerSound {
 impl SoundServerFactory for ViewerSound {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
         Box::new(Backend {
-            formats: [pcm_format(DESKTOP_AUDIO_FORMAT), pcm_format(HALF_RATE)],
+            formats: offered_formats(),
             shared: Arc::clone(&self.shared),
             started: false,
         })
     }
 }
 
+/// The target's format, then the same at half the rate.
+fn offered_formats() -> Vec<AudioFormat> {
+    let source = pcm_format(DESKTOP_AUDIO_FORMAT);
+    let half = PcmDecimator::output_format(&source, 2);
+    core::iter::once(source).chain(half).collect()
+}
+
 #[derive(Debug)]
 struct Backend {
-    formats: [AudioFormat; 2],
+    formats: Vec<AudioFormat>,
     shared: Arc<Shared>,
     started: bool,
 }
@@ -115,10 +121,10 @@ impl RdpsndServerHandler for Backend {
         debug!(format = ?format.format(), "Viewer accepted audio");
         *self
             .shared
-            .halver
+            .decimator
             .lock()
             .unwrap_or_else(PoisonError::into_inner) =
-            (*format.format() == pcm_format(HALF_RATE)).then(Halver::new);
+            PcmDecimator::new(&pcm_format(DESKTOP_AUDIO_FORMAT), format.format());
         if !self.started {
             self.started = true;
             self.shared.streaming.fetch_add(1, Ordering::AcqRel);
@@ -149,6 +155,14 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::ViewerSound;
+
+    fn half_rate() -> ironrdp::rdpsnd::pdu::AudioFormat {
+        ironrdp::rdpsnd::pcm::PcmDecimator::output_format(
+            &pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT),
+            2,
+        )
+        .expect("PCM halves")
+    }
     use crate::client::pcm_format;
 
     fn encode(pdu: ClientAudioOutputPdu) -> Vec<u8> {
@@ -168,10 +182,7 @@ mod tests {
         };
         assert_eq!(
             offer.formats,
-            vec![
-                pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT),
-                pcm_format(super::HALF_RATE)
-            ]
+            vec![pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT), half_rate()]
         );
         server
             .process(&encode(ClientAudioOutputPdu::AudioFormat(
@@ -240,10 +251,7 @@ mod tests {
         let mut server = RdpsndServer::new(sound.build_backend());
         negotiate(
             &mut server,
-            vec![
-                pcm_format(super::HALF_RATE),
-                pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT),
-            ],
+            vec![half_rate(), pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT)],
         );
         let block: Vec<u8> = (0..64).collect();
         sound.play(&block);
@@ -254,7 +262,7 @@ mod tests {
     fn a_viewer_that_takes_only_half_the_rate_gets_it_resampled() {
         let (sound, mut rx) = viewer();
         let mut server = RdpsndServer::new(sound.build_backend());
-        negotiate(&mut server, vec![pcm_format(super::HALF_RATE)]);
+        negotiate(&mut server, vec![half_rate()]);
         sound.play(&[0; 4 * 100]);
         let played = waves(&mut rx);
         assert_eq!(played[0].0.len(), 4 * 50);
