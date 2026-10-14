@@ -277,11 +277,15 @@ impl SvcProcessor for DrdynvcClient {
             DrdynvcServerPdu::Data(data) => {
                 let channel_id = data.channel_id();
 
-                let messages = self
-                    .dynamic_channels
-                    .get_by_channel_id_mut(channel_id)
-                    .ok_or_else(|| pdu_other_err!("access to non existing DVC channel"))?
-                    .process(data)?;
+                // A server may send on a channel before it reads the Create Response, so data
+                // can arrive for a channel this client refused (FreeRDP's RDPSND server sends
+                // its formats right after opening AUDIO_PLAYBACK_DVC), or for one that was just
+                // closed. Such data has no consumer; dropping it keeps the session alive.
+                let Some(channel) = self.dynamic_channels.get_by_channel_id_mut(channel_id) else {
+                    debug!(channel_id, "Dropping DVC data for a channel that is not open");
+                    return Ok(responses);
+                };
+                let messages = channel.process(data)?;
 
                 responses.extend(
                     encode_dvc_messages(channel_id, messages, ChannelFlags::empty()).map_err(|e| encode_err!(e))?,

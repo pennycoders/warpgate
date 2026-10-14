@@ -905,6 +905,36 @@ mod tests {
 
     use super::{GraphicsPipelineOutput, build_config, connector, encode_resized_keyframe};
 
+    /// GNOME Remote Desktop's sound server (FreeRDP's RDPSND) opens AUDIO_PLAYBACK_DVC and
+    /// sends its formats before it reads the answer. The client has no such channel, refuses
+    /// it, and must then ignore the formats rather than end the session.
+    #[test]
+    fn data_on_a_refused_dynamic_channel_does_not_end_the_session() {
+        use ironrdp::core::encode_vec;
+        use ironrdp::dvc::pdu::{
+            CapabilitiesRequestPdu, CapsVersion, CreateRequestPdu, DataPdu, DrdynvcDataPdu,
+            DrdynvcServerPdu,
+        };
+        use ironrdp::svc::SvcProcessor as _;
+
+        let mut drdynvc = ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+            ironrdp::displaycontrol::client::DisplayControlClient::new(|_caps| Ok(Vec::new())),
+        );
+        let mut process = |pdu: DrdynvcServerPdu| drdynvc.process(&encode_vec(&pdu).unwrap());
+        process(DrdynvcServerPdu::Capabilities(CapabilitiesRequestPdu::new(
+            CapsVersion::V3,
+            None,
+        )))
+        .unwrap();
+        process(DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            3,
+            "AUDIO_PLAYBACK_DVC".to_owned(),
+        )))
+        .unwrap();
+        let formats = DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(3, vec![7; 16])));
+        assert!(process(formats).unwrap().is_empty());
+    }
+
     #[test]
     fn the_target_plays_sound_only_when_the_option_is_on() {
         let mut options: warpgate_common::TargetRdpOptions =
