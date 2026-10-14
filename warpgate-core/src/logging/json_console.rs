@@ -28,14 +28,8 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        // Log warpgate events plus audit events (`audit` target). The env
-        // filter (e.g. `audit=info,warpgate=info`) already gates what reaches
-        // this layer and the text console layer prints audit events on that
-        // basis; mirror it here so the JSON console is not missing them.
+        // The env filter decides what reaches the console, as for the text layers.
         let target = event.metadata().target();
-        if !target.starts_with("warpgate") && target != "audit" {
-            return;
-        }
 
         // Collect span fields (same pattern as ValuesLogLayer)
         let mut values = SerializedRecordValues::new();
