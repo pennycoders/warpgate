@@ -3,5 +3,6 @@
 
 pub mod client;
 pub mod dvc;
+pub mod pcm;
 pub mod pdu;
 pub mod server;
