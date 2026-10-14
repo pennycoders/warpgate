@@ -1,0 +1,48 @@
+diff -ru ironrdp-rdpsnd-0.9.0/src/client.rs base/src/client.rs
+--- ironrdp-rdpsnd-0.9.0/src/client.rs	2026-10-14 13:07:10.987860900 +0300
++++ base/src/client.rs	2026-10-14 13:07:10.991170565 +0300
+@@ -130,7 +130,9 @@
+     }
+ 
+     pub fn training_confirm(&mut self, pdu: &TrainingPdu) -> PduResult<RdpsndSvcMessages> {
+-        let pack_size: EncodeResult<_> = cast_length!("wPackSize", pdu.data.len());
++        // MS-RDPEA 2.2.3.2: wPackSize echoes the Training PDU's wPackSize. Servers may check it (GNOME Remote
++        // Desktop ignores a mismatching confirm and never starts playback).
++        let pack_size: EncodeResult<_> = cast_length!("wPackSize", pdu.pack_size());
+         let pack_size = pack_size.map_err(|e| encode_err!(e))?;
+         let pdu = pdu::TrainingConfirmPdu {
+             timestamp: pdu.timestamp,
+diff -ru ironrdp-rdpsnd-0.9.0/src/pdu/mod.rs base/src/pdu/mod.rs
+--- ironrdp-rdpsnd-0.9.0/src/pdu/mod.rs	2026-10-14 13:07:10.988862191 +0300
++++ base/src/pdu/mod.rs	2026-10-14 13:07:10.992536898 +0300
+@@ -599,6 +599,16 @@
+     const FIXED_PART_SIZE: usize =
+         2 /* wTimeStamp */
+         + 2 /* wPackSize */;
++
++    /// The `wPackSize` of this PDU: the size of the whole PDU, header included, or 0 when it carries no data
++    /// (MS-RDPEA 2.2.3.1). The Training Confirm PDU echoes it (MS-RDPEA 2.2.3.2).
++    pub(crate) fn pack_size(&self) -> usize {
++        if self.data.is_empty() {
++            0
++        } else {
++            self.size() + ServerAudioOutputPdu::FIXED_PART_SIZE
++        }
++    }
+ }
+ 
+ impl Encode for TrainingPdu {
+@@ -606,12 +616,7 @@
+         ensure_size!(in: dst, size: self.size());
+ 
+         dst.write_u16(self.timestamp);
+-        let len = if self.data.is_empty() {
+-            0
+-        } else {
+-            self.size() + ServerAudioOutputPdu::FIXED_PART_SIZE
+-        };
+-        dst.write_u16(cast_length!("TrainingPdu::wPackSize", len)?);
++        dst.write_u16(cast_length!("TrainingPdu::wPackSize", self.pack_size())?);
+         dst.write_slice(&self.data);
+ 
+         Ok(())
