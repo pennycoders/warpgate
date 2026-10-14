@@ -1,7 +1,7 @@
-use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
+use ironrdp_core::{Decode as _, Encode, EncodeResult, ReadCursor, WriteCursor, encode_vec, ensure_size, impl_as_any};
 use ironrdp_pdu::gcc::ChannelName;
-use ironrdp_pdu::{PduResult, decode_err, pdu_other_err};
-use ironrdp_svc::{CompressionCondition, SvcMessage, SvcProcessor, SvcProcessorMessages, SvcServerProcessor};
+use ironrdp_pdu::{PduResult, decode_err, encode_err, pdu_other_err};
+use ironrdp_svc::{CompressionCondition, SvcEncode, SvcMessage, SvcProcessor, SvcProcessorMessages, SvcServerProcessor};
 use tracing::{debug, error};
 
 use crate::pdu::{self, ClientAudioFormatPdu, QualityMode};
@@ -209,7 +209,16 @@ impl RdpsndServer {
                 timestamp: 0,
                 data: data.into(),
             };
-            RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Wave(pdu).into()])
+            let encoded = encode_vec(&pdu::ServerAudioOutputPdu::Wave(pdu)).map_err(|e| encode_err!(e))?;
+            // The WaveInfo PDU (RDPSND header and 12 bytes, [2.2.3.3]) and the Wave PDU (the rest,
+            // [2.2.3.4]) are separate channel messages.
+            let (info, wave) = encoded
+                .split_at_checked(4 + 12)
+                .ok_or_else(|| pdu_other_err!("wave data shorter than WaveInfo Data prefix"))?;
+            RdpsndSvcMessages::new(vec![
+                EncodedPdu(info.to_vec()).into(),
+                EncodedPdu(wave.to_vec()).into(),
+            ])
         };
 
         self.block_no = self.block_no.overflowing_add(1).0;
@@ -387,6 +396,27 @@ impl SvcProcessor for RdpsndServer {
         Ok(vec![SvcMessage::from(pdu)])
     }
 }
+
+/// An RDPSND message already encoded.
+struct EncodedPdu(Vec<u8>);
+
+impl Encode for EncodedPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_slice(&self.0);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RdpsndPdu"
+    }
+
+    fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl SvcEncode for EncodedPdu {}
 
 impl Drop for RdpsndServer {
     fn drop(&mut self) {
