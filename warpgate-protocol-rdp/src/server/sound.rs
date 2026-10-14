@@ -173,6 +173,14 @@ mod tests {
         server: &mut RdpsndServer,
         viewer_formats: Vec<ironrdp::rdpsnd::pdu::AudioFormat>,
     ) {
+        negotiate_version(server, viewer_formats, Version::V8);
+    }
+
+    fn negotiate_version(
+        server: &mut RdpsndServer,
+        viewer_formats: Vec<ironrdp::rdpsnd::pdu::AudioFormat>,
+        version: Version,
+    ) {
         let offer = server.start().expect("start");
         let offer = offer[0].encode_unframed_pdu().expect("encodes");
         let ServerAudioOutputPdu::AudioFormat(offer) =
@@ -187,7 +195,7 @@ mod tests {
         server
             .process(&encode(ClientAudioOutputPdu::AudioFormat(
                 ClientAudioFormatPdu {
-                    version: Version::V8,
+                    version,
                     flags: AudioFormatFlags::ALIVE,
                     formats: viewer_formats,
                     volume_left: 0xFFFF,
@@ -197,11 +205,13 @@ mod tests {
                 },
             )))
             .expect("formats");
-        server
-            .process(&encode(ClientAudioOutputPdu::QualityMode(QualityModePdu {
-                quality_mode: QualityMode::High,
-            })))
-            .expect("quality mode");
+        if Version::V6 <= version {
+            server
+                .process(&encode(ClientAudioOutputPdu::QualityMode(QualityModePdu {
+                    quality_mode: QualityMode::High,
+                })))
+                .expect("quality mode");
+        }
         server
             .process(&encode(ClientAudioOutputPdu::TrainingConfirm(
                 TrainingConfirmPdu {
@@ -267,6 +277,30 @@ mod tests {
         let played = waves(&mut rx);
         assert_eq!(played[0].0.len(), 4 * 50);
         assert!(server.wave(played[0].0.clone(), played[0].1).is_ok());
+    }
+
+    /// Jump Desktop answers with version 5: each block goes as a WaveInfo PDU and a Wave PDU.
+    #[test]
+    fn pre_v8_viewers_get_wave_info_and_wave_as_two_messages() {
+        let (sound, _rx) = viewer();
+        let mut server = RdpsndServer::new(sound.build_backend());
+        negotiate_version(&mut server, vec![half_rate()], Version::V5);
+
+        let data: Vec<u8> = (1..=20).collect();
+        let messages: Vec<_> = server.wave(data.clone(), 0).expect("wave").into();
+        let [info, wave] = messages.as_slice() else {
+            panic!("expected two messages");
+        };
+        let info = info.encode_unframed_pdu().expect("encodes");
+        let wave = wave.encode_unframed_pdu().expect("encodes");
+
+        // SNDC_WAVE header, BodySize = 12 - 4 + n.
+        assert_eq!(info[0], 0x02);
+        assert_eq!(u16::from_le_bytes([info[2], info[3]]), 8 + 20);
+        assert_eq!(info.len(), 4 + 12);
+        assert_eq!(&info[12..], &data[..4]);
+        assert_eq!(&wave[..4], &[0; 4]);
+        assert_eq!(&wave[4..], &data[4..]);
     }
 
     #[test]
