@@ -3565,6 +3565,7 @@ dependencies = [
  "ironrdp-input",
  "ironrdp-pdu",
  "ironrdp-session",
+ "ironrdp-svc",
 ]
 
 [[package]]
