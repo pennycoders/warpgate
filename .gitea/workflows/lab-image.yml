@@ -10,7 +10,7 @@ on:
     branches: [main]
 
 env:
-  TAG: 0.30.0-beta.2-lab.6
+  TAG: 0.30.0-beta.2-lab.7
 
 jobs:
   image:
@@ -26,6 +26,7 @@ jobs:
             -e "s#^\# syntax=docker/dockerfile:#\# syntax=${REGISTRY}/dockerhub/docker/dockerfile:#" \
             -e "s#^FROM rust:#FROM ${REGISTRY}/dockerhub/library/rust:#" \
             -e "s#^FROM debian:#FROM ${REGISTRY}/dockerhub/library/debian:#" \
+            -e "s#^FROM gcr.io/#FROM ${REGISTRY}/gcr/#" \
             docker/Dockerfile
           grep -nE '^(# syntax|FROM)' docker/Dockerfile
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
