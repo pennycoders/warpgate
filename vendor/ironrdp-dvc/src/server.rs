@@ -292,13 +292,6 @@ impl SvcProcessor for DrdynvcServer {
                 debug!("Got DVC Create Response PDU: {create_resp:?}");
                 let id = create_resp.channel_id();
                 let c = self.channel_by_id(id).map_err(|e| decode_err!(e))?;
-                // Lab diagnostics (not for upstream): which dynamic channels a viewer accepts.
-                tracing::info!(
-                    target: "warpgate_protocol_rdp::diag",
-                    channel = c.processor.channel_name(),
-                    status = ?create_resp.creation_status(),
-                    "Viewer answered a dynamic channel"
-                );
                 if c.state != ChannelState::Creation {
                     return Err(pdu_other_err!("invalid channel state"));
                 }
