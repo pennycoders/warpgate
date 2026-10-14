@@ -60,6 +60,14 @@ async fn frame_bridge(
                 data,
             },
             DesktopEvent::Clipboard(text) => ServerInput::Clipboard(text),
+            DesktopEvent::Cursor { rect, data } => ServerInput::Cursor {
+                hot_x: rect.x,
+                hot_y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                data,
+            },
+            DesktopEvent::DefaultCursor => ServerInput::DefaultCursor,
             DesktopEvent::State(DesktopState::Disconnected) => {
                 let _ = server_in.send(ServerInput::Shutdown).await;
                 return;
