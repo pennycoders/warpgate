@@ -26,6 +26,7 @@ use ironrdp_pdu::{Action, PduResult, decode_err, mcs, nego, rdp};
 use ironrdp_rdpsnd as rdpsnd;
 use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor, server_encode_svc_messages};
 use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
+use rdpsnd::dvc::RdpsndDvcServer;
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpSocket;
@@ -711,6 +712,13 @@ impl RdpServer {
             dvc.with_dynamic_channel(EchoDvcBridge::new(echo_handle))
         };
 
+        // Clients that take audio only on AUDIO_PLAYBACK_DVC never open the rdpsnd static
+        // channel; offering both lets each client use the one it supports.
+        let dvc = match self.sound_factory.as_deref() {
+            Some(factory) => dvc.with_dynamic_channel(RdpsndDvcServer::new(RdpsndServer::new(factory.build_backend()))),
+            None => dvc,
+        };
+
         #[cfg(feature = "egfx")]
         let dvc = {
             let mut dvc = dvc;
@@ -1015,6 +1023,39 @@ impl RdpServer {
         Ok(())
     }
 
+    /// An RDPSND event encoded for AUDIO_PLAYBACK_DVC, when the client opened that channel
+    /// and accepted a format; `None` otherwise.
+    fn encode_rdpsnd_dvc(&mut self, event: RdpsndServerMessage, user_channel_id: u16) -> Result<Option<Vec<u8>>> {
+        let Some(drdynvc) = self.get_svc_processor::<dvc::DrdynvcServer>() else {
+            return Ok(None);
+        };
+        let Some(channel_id) = drdynvc.get_channel_id_by_type::<RdpsndDvcServer>() else {
+            return Ok(None);
+        };
+        if !drdynvc.is_channel_opened(channel_id) {
+            return Ok(None);
+        }
+        let Some(mut channel) = drdynvc.dvc_by_id_mut::<RdpsndDvcServer>(channel_id) else {
+            return Ok(None);
+        };
+        let rdpsnd = channel.processor_mut();
+        if !rdpsnd.inner().is_ready() {
+            return Ok(None);
+        }
+        let messages = match event {
+            RdpsndServerMessage::Wave(data, ts) => rdpsnd.wave(data, ts),
+            RdpsndServerMessage::SetVolume { left, right } => rdpsnd.set_volume(left, right),
+            RdpsndServerMessage::Close => rdpsnd.close_stream(),
+            RdpsndServerMessage::Error(_) => return Ok(None),
+        }
+        .context("failed to send rdpsnd event")?;
+        let messages = dvc::encode_dvc_messages(channel_id, messages, ChannelFlags::SHOW_PROTOCOL)?;
+        let drdynvc_channel_id = self
+            .get_channel_id_by_type::<dvc::DrdynvcServer>()
+            .context("DRDYNVC channel not found")?;
+        Ok(Some(server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?))
+    }
+
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&mut self) -> Option<&mut T> {
         self.static_channels
             .get_by_type_mut::<T>()
@@ -1129,6 +1170,22 @@ impl RdpServer {
                     self.set_credentials(Some(creds));
                 }
                 ServerEvent::Rdpsnd(s) => {
+                    // The rdpsnd static channel when the client negotiated it there, otherwise
+                    // AUDIO_PLAYBACK_DVC.
+                    let static_ready = self
+                        .get_svc_processor::<RdpsndServer>()
+                        .is_some_and(|rdpsnd| rdpsnd.is_ready());
+                    if !static_ready && !matches!(s, RdpsndServerMessage::Error(_)) {
+                        if matches!(s, RdpsndServerMessage::Wave(..)) && wave_skip > 0 {
+                            wave_skip -= 1;
+                            debug!("Dropping stale wave");
+                            continue;
+                        }
+                        if let Some(data) = self.encode_rdpsnd_dvc(s, user_channel_id)? {
+                            writer.write_all(&data).await?;
+                        }
+                        continue;
+                    }
                     let Some(rdpsnd) = self.get_svc_processor::<RdpsndServer>() else {
                         warn!("No rdpsnd channel, dropping event");
                         continue;

@@ -48,7 +48,7 @@ use warpgate_core::{
 };
 
 pub use self::audio::pcm_format;
-use self::audio::{AudioForwarder, DynamicAudio};
+use self::audio::{AudioForwarder, dynamic_audio};
 pub(crate) use self::logon::LogonWatcher;
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
 use crate::desktop_size::bound_desktop_size;
@@ -831,8 +831,7 @@ async fn connect(
     let mut drdynvc = DrdynvcClient::new()
         .with_dynamic_channel(DisplayControlClient::new(|_caps| Ok(Vec::new())));
     if let Some(events) = &audio {
-        drdynvc =
-            drdynvc.with_dynamic_channel(DynamicAudio::new(AudioForwarder::new(events.clone())));
+        drdynvc = drdynvc.with_dynamic_channel(dynamic_audio(AudioForwarder::new(events.clone())));
     }
     if config.support_dyn_vc_gfx_protocol {
         // With no H.264 decoder the client advertises only the non-AVC capability sets it

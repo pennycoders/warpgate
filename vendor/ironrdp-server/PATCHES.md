@@ -58,3 +58,11 @@ rounds up.
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
+
+## Audio output on `AUDIO_PLAYBACK_DVC` too
+
+With a sound factory, the server also offers `AUDIO_PLAYBACK_DVC` (`RdpsndDvcServer` from the
+vendored `ironrdp-rdpsnd`) next to the `rdpsnd` static channel, and sends each
+`ServerEvent::Rdpsnd` on the static channel when the client negotiated a format there,
+otherwise on the dynamic one. Jump Desktop takes audio only on the dynamic channel.
+
