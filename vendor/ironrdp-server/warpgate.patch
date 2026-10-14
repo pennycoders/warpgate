@@ -1,6 +1,21 @@
+diff -ru ironrdp-server-0.13.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
+--- ironrdp-server-0.13.0/src/encoder/bitmap.rs	2026-10-14 22:22:36.156670670 +0300
++++ base/src/encoder/bitmap.rs	2026-10-14 22:22:36.167018612 +0300
+@@ -47,7 +47,10 @@
+         BitmapUpdateData::encode_header(total, &mut cursor).map_err(BitmapEncodeError::Encode)?;
+ 
+         for (i, chunk) in chunks.enumerate() {
+-            let height = cast_int!("bitmap height", chunk.len() / stride).map_err(BitmapEncodeError::Encode)?;
++            // A sub-rectangle's data ends at its last pixel, not at a full stride, so the
++            // last row of the last chunk is short: round up or that row is lost.
++            let height =
++                cast_int!("bitmap height", chunk.len().div_ceil(stride)).map_err(BitmapEncodeError::Encode)?;
+             let i: u16 = cast_int!("chunk idx", i).map_err(BitmapEncodeError::Encode)?;
+             let top = bitmap.y + i * chunk_height;
+ 
 diff -ru ironrdp-server-0.13.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.13.0/src/encoder/mod.rs	2026-09-18 20:36:51.130844525 +0200
-+++ base/src/encoder/mod.rs	2026-09-18 20:37:30.867676648 +0200
+--- ironrdp-server-0.13.0/src/encoder/mod.rs	2026-10-14 22:22:36.156402668 +0300
++++ base/src/encoder/mod.rs	2026-10-14 22:22:36.166770234 +0300
 @@ -569,12 +569,12 @@
          let len = loop {
              match self
