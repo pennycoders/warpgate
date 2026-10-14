@@ -181,6 +181,11 @@ impl RdpsndServer {
         ]))
     }
 
+    /// The client accepted a format and waves can be sent.
+    pub fn is_ready(&self) -> bool {
+        self.format_no.is_some()
+    }
+
     pub fn wave(&mut self, data: Vec<u8>, ts: u32) -> PduResult<RdpsndSvcMessages> {
         let version = self.version()?;
         let format_no = self

@@ -3882,6 +3882,7 @@ version = "0.9.0"
 dependencies = [
  "bitflags 2.13.1",
  "ironrdp-core",
+ "ironrdp-dvc",
  "ironrdp-pdu",
  "ironrdp-svc",
  "tracing",
