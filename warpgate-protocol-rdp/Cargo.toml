@@ -18,6 +18,7 @@ ironrdp = { version = "0.17", features = [
     "input",
     "dvc",
     "displaycontrol",
+    "rdpdr",
     "rdpsnd",
     "svc",
 ] }
