@@ -3564,6 +3564,7 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
+ "ironrdp-rdpsnd",
  "ironrdp-session",
  "ironrdp-svc",
 ]
@@ -9533,6 +9534,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
+ "serde_json",
  "tokio",
  "tokio-openssl",
  "tokio-stream",
