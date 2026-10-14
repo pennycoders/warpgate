@@ -184,6 +184,18 @@ impl UpdateEncoder {
 
     fn rgba_pointer(ptr: RGBAPointer) -> Result<UpdateFragmenter> {
         let xor_mask = ptr.data;
+        // The AND mask is not optional (MS-RDPBCGR 2.2.9.1.1.4.4): 1 bpp, rows in the XOR
+        // mask's bottom-up order, each padded to 2 bytes. A set bit keeps the screen pixel,
+        // so it is set where the pointer is fully transparent.
+        let and_stride = usize::from(ptr.width).div_ceil(16) * 2;
+        let mut and_mask = vec![0u8; and_stride * usize::from(ptr.height)];
+        for (row, pixels) in xor_mask.chunks_exact(usize::from(ptr.width) * 4).enumerate() {
+            for (col, pixel) in pixels.chunks_exact(4).enumerate() {
+                if pixel[3] == 0 {
+                    and_mask[row * and_stride + col / 8] |= 0x80 >> (col % 8);
+                }
+            }
+        }
 
         let hot_spot = Point16 {
             x: ptr.hot_x,
@@ -195,7 +207,7 @@ impl UpdateEncoder {
             width: ptr.width,
             height: ptr.height,
             xor_mask: &xor_mask,
-            and_mask: &[],
+            and_mask: &and_mask,
         };
         let ptr = PointerAttribute {
             xor_bpp: 32,

@@ -19,6 +19,12 @@ is why this strikes some deployments and not others; see warp-tech/warpgate#2606
 carrying the headers has been built. It also drops a `* 2` from the adjacent buffer-resize
 `debug!`, which reported twice the size actually allocated.
 
+## Pointer AND mask
+
+`DisplayUpdate::RGBAPointer` went out with an empty AND mask, which MS-RDPBCGR
+2.2.9.1.1.4.4 does not allow; Jump Desktop rejects the update ("bad length for And mask").
+`src/encoder/mod.rs` sends a 1 bpp mask, set where the pointer is fully transparent.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
