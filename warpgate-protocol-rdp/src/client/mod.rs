@@ -46,8 +46,8 @@ use warpgate_core::{
     DesktopInput, DesktopRect, DesktopState, within_deadline,
 };
 
-use self::audio::AudioForwarder;
 pub use self::audio::pcm_format;
+use self::audio::{AudioForwarder, DynamicAudio};
 pub(crate) use self::logon::LogonWatcher;
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
 use crate::desktop_size::bound_desktop_size;
@@ -118,9 +118,7 @@ pub async fn run(
             options.verify_tls,
             options.tls_security,
             clipboard.backend(),
-            options
-                .audio_playback
-                .then(|| AudioForwarder::new(event_tx.clone())),
+            options.audio_playback.then(|| event_tx.clone()),
         ),
     )
     .await?;
@@ -779,7 +777,7 @@ async fn connect(
     verify_tls: bool,
     tls_security: warpgate_common::RdpTlsSecurity,
     clipboard: TextClipboard<ClientClipboardSink>,
-    audio: Option<AudioForwarder>,
+    audio: Option<Sender<DesktopEvent>>,
 ) -> Result<(ConnectionResult, Framed), DesktopConnectionError> {
     let tcp_stream = within_deadline(DESKTOP_CONNECT_TIMEOUT, async {
         TcpStream::connect((server_name.as_str(), port))
@@ -798,6 +796,10 @@ async fn connect(
     // reply with; `ActiveStage::encode_resize` drives the channel once it is ready.
     let mut drdynvc = DrdynvcClient::new()
         .with_dynamic_channel(DisplayControlClient::new(|_caps| Ok(Vec::new())));
+    if let Some(events) = &audio {
+        drdynvc =
+            drdynvc.with_dynamic_channel(DynamicAudio::new(AudioForwarder::new(events.clone())));
+    }
     if config.support_dyn_vc_gfx_protocol {
         // With no H.264 decoder the client advertises only the non-AVC capability sets it
         // can actually decode.
@@ -809,8 +811,9 @@ async fn connect(
     let mut connector = connector::ClientConnector::new(config, client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(CliprdrClient::new(Box::new(clipboard)));
-    if let Some(audio) = audio {
-        connector = connector.with_static_channel(Rdpsnd::new(Box::new(audio)));
+    if let Some(events) = audio {
+        connector =
+            connector.with_static_channel(Rdpsnd::new(Box::new(AudioForwarder::new(events))));
     }
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)

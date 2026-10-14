@@ -1,14 +1,22 @@
 //! Target-side audio output (MS-RDPEA): accept the target's sound as PCM in
 //! [`DESKTOP_AUDIO_FORMAT`] and hand each block to the session as a [`DesktopEvent::Audio`].
+//!
+//! The sound can arrive on the `rdpsnd` static channel or on the `AUDIO_PLAYBACK_DVC`
+//! dynamic channel; servers that have both (Windows, GNOME Remote Desktop) prefer the
+//! dynamic one.
 
 use std::borrow::Cow;
 
 use bytes::Bytes;
-use ironrdp::rdpsnd::client::RdpsndClientHandler;
+use ironrdp::core::{Encode, EncodeResult, WriteCursor, ensure_size, impl_as_any};
+use ironrdp::dvc::{DvcClientProcessor, DvcEncode, DvcMessage, DvcProcessor};
+use ironrdp::pdu::{PduResult, encode_err};
+use ironrdp::rdpsnd::client::{Rdpsnd, RdpsndClientHandler};
 use ironrdp::rdpsnd::pdu::{AudioFormat, PitchPdu, VolumePdu, WaveFormat};
+use ironrdp::svc::SvcProcessor as _;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use warpgate_core::{DESKTOP_AUDIO_FORMAT, DesktopAudioFormat, DesktopEvent};
 
 /// The format offered to the target, as an MS-RDPEA format descriptor.
@@ -24,11 +32,77 @@ pub const fn pcm_format(format: DesktopAudioFormat) -> AudioFormat {
     }
 }
 
+/// MS-RDPEA 2.1: the reliable audio output dynamic channel.
+pub const AUDIO_PLAYBACK_DVC: &str = "AUDIO_PLAYBACK_DVC";
+
+/// An audio PDU already encoded by [`Rdpsnd`].
+struct EncodedPdu(Vec<u8>);
+
+impl Encode for EncodedPdu {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_slice(&self.0);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RdpsndPdu"
+    }
+
+    fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl DvcEncode for EncodedPdu {}
+
+/// [`Rdpsnd`] on `AUDIO_PLAYBACK_DVC`: the same PDUs and negotiation as the static channel.
+pub struct DynamicAudio(Rdpsnd);
+
+impl DynamicAudio {
+    pub fn new(handler: AudioForwarder) -> Self {
+        Self(Rdpsnd::new(Box::new(AudioForwarder {
+            channel: AUDIO_PLAYBACK_DVC,
+            ..handler
+        })))
+    }
+}
+
+impl_as_any!(DynamicAudio);
+
+impl DvcProcessor for DynamicAudio {
+    fn channel_name(&self) -> &str {
+        AUDIO_PLAYBACK_DVC
+    }
+
+    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        // The server speaks first, with its formats.
+        Ok(Vec::new())
+    }
+
+    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        self.0
+            .process(payload)?
+            .into_iter()
+            .map(|message| {
+                let pdu = message.encode_unframed_pdu().map_err(|e| encode_err!(e))?;
+                let message: DvcMessage = Box::new(EncodedPdu(pdu));
+                Ok(message)
+            })
+            .collect()
+    }
+}
+
+impl DvcClientProcessor for DynamicAudio {}
+
 #[derive(Debug)]
 pub struct AudioForwarder {
     formats: [AudioFormat; 1],
     events: Sender<DesktopEvent>,
     dropped: u64,
+    /// The channel the sound arrives on, logged with the first block.
+    channel: &'static str,
+    playing: bool,
 }
 
 impl AudioForwarder {
@@ -37,6 +111,8 @@ impl AudioForwarder {
             formats: [pcm_format(DESKTOP_AUDIO_FORMAT)],
             events,
             dropped: 0,
+            channel: "rdpsnd",
+            playing: false,
         }
     }
 }
@@ -62,6 +138,10 @@ impl RdpsndClientHandler for AudioForwarder {
                 "Ignoring audio that is not whole sample frames"
             );
             return;
+        }
+        if !self.playing {
+            self.playing = true;
+            info!(channel = self.channel, "Playing the target's sound");
         }
         // Sound is the first thing worth dropping when the viewer falls behind: a late
         // block is useless, and waiting here would stall the target's whole session.
@@ -92,10 +172,11 @@ impl RdpsndClientHandler for AudioForwarder {
 mod tests {
     use std::borrow::Cow;
 
+    use ironrdp::dvc::DvcMessage;
     use ironrdp::rdpsnd::client::RdpsndClientHandler as _;
     use ironrdp::rdpsnd::pdu::WaveFormat;
     use tokio::sync::mpsc;
-    use warpgate_core::DesktopEvent;
+    use warpgate_core::{DESKTOP_AUDIO_FORMAT, DesktopEvent};
 
     use super::AudioForwarder;
 
@@ -154,6 +235,125 @@ mod tests {
         };
         assert_eq!(&data[..], &[1; 4]);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// The exchange a desktop runs on `AUDIO_PLAYBACK_DVC`, through IronRDP's DVC client:
+    /// the channel is accepted, only PCM is offered back, training is confirmed, and a
+    /// Wave2 block reaches the session.
+    #[test]
+    fn plays_sound_from_the_dynamic_channel() {
+        use std::borrow::Cow;
+
+        use ironrdp::core::{Decode as _, ReadCursor, encode_vec};
+        use ironrdp::dvc::pdu::{
+            CapabilitiesRequestPdu, CapsVersion, CreateRequestPdu, CreationStatus,
+            DrdynvcClientPdu, DrdynvcDataPdu, DrdynvcServerPdu,
+        };
+        use ironrdp::dvc::{DrdynvcClient, encode_dvc_messages};
+        use ironrdp::rdpsnd::pdu::{
+            ClientAudioOutputPdu, ServerAudioFormatPdu, ServerAudioOutputPdu, TrainingPdu, Version,
+            Wave2Pdu,
+        };
+        use ironrdp::svc::{ChannelFlags, SvcProcessor as _};
+
+        use super::{AUDIO_PLAYBACK_DVC, DynamicAudio, pcm_format};
+
+        const ID: u32 = 5;
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut drdynvc =
+            DrdynvcClient::new().with_dynamic_channel(DynamicAudio::new(AudioForwarder::new(tx)));
+        let mut exchange = |pdu: DrdynvcServerPdu| -> Vec<DrdynvcClientPdu> {
+            drdynvc
+                .process(&encode_vec(&pdu).unwrap())
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    let bytes = m.encode_unframed_pdu().unwrap();
+                    DrdynvcClientPdu::decode(&mut ReadCursor::new(&bytes)).unwrap()
+                })
+                .collect()
+        };
+        let audio = |pdu: ServerAudioOutputPdu<'_>| {
+            let message: DvcMessage = Box::new(super::EncodedPdu(encode_vec(&pdu).unwrap()));
+            let [svc] = encode_dvc_messages(ID, vec![message], ChannelFlags::empty())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let bytes = svc.encode_unframed_pdu().unwrap();
+            DrdynvcServerPdu::decode(&mut ReadCursor::new(&bytes)).unwrap()
+        };
+        let replies = |responses: Vec<DrdynvcClientPdu>| -> Vec<ClientAudioOutputPdu> {
+            responses
+                .into_iter()
+                .filter_map(|r| match r {
+                    DrdynvcClientPdu::Data(data) => {
+                        assert_eq!(data.channel_id(), ID);
+                        let DrdynvcDataPdu::Data(data) = data else {
+                            panic!("audio replies fit in one DVC PDU");
+                        };
+                        Some(
+                            ClientAudioOutputPdu::decode(&mut ReadCursor::new(data.data()))
+                                .unwrap(),
+                        )
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        exchange(DrdynvcServerPdu::Capabilities(CapabilitiesRequestPdu::new(
+            CapsVersion::V3,
+            None,
+        )));
+        let created = exchange(DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            ID,
+            AUDIO_PLAYBACK_DVC.to_owned(),
+        )));
+        assert!(matches!(
+            created.as_slice(),
+            [DrdynvcClientPdu::Create(r)] if r.creation_status() == CreationStatus::OK
+        ));
+
+        let pcm = pcm_format(DESKTOP_AUDIO_FORMAT);
+        let mut opus = pcm.clone();
+        opus.format = WaveFormat::OPUS;
+        let formats = replies(exchange(audio(ServerAudioOutputPdu::AudioFormat(
+            ServerAudioFormatPdu {
+                version: Version::V8,
+                formats: vec![opus, pcm.clone()],
+            },
+        ))));
+        assert!(matches!(
+            formats.first(),
+            Some(ClientAudioOutputPdu::AudioFormat(f)) if f.formats == vec![pcm.clone()]
+        ));
+
+        let training = replies(exchange(audio(ServerAudioOutputPdu::Training(
+            TrainingPdu {
+                timestamp: 3,
+                data: Vec::new(),
+            },
+        ))));
+        assert!(matches!(
+            training.as_slice(),
+            [ClientAudioOutputPdu::TrainingConfirm(c)] if c.timestamp == 3
+        ));
+
+        let confirmed = replies(exchange(audio(ServerAudioOutputPdu::Wave2(Wave2Pdu {
+            timestamp: 9,
+            format_no: 0,
+            block_no: 1,
+            audio_timestamp: 9,
+            data: Cow::Owned(vec![1, 2, 3, 4]),
+        }))));
+        assert!(matches!(
+            confirmed.as_slice(),
+            [ClientAudioOutputPdu::WaveConfirm(c)] if c.block_no == 1
+        ));
+        let Ok(DesktopEvent::Audio(data)) = rx.try_recv() else {
+            panic!("expected the block in the session");
+        };
+        assert_eq!(&data[..], &[1, 2, 3, 4]);
     }
 
     #[test]
