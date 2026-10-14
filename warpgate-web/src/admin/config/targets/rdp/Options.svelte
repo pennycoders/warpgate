@@ -112,3 +112,14 @@
     will significantly improve image quality, even if the client is connecting
     remotely. GNOME Remote Desktop and KDE KRDP require the graphics pipeline.
 </HelpText>
+
+<h4 class="mt-4">Sound</h4>
+<Input
+    type="switch"
+    label="Play the target's sound"
+    bind:checked={options.audioPlayback}
+/>
+<HelpText>
+    Plays sound from the target in native RDP clients. The web client stays
+    silent.
+</HelpText>

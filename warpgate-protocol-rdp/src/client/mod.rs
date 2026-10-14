@@ -4,6 +4,7 @@
 //! translates both directions into the shared [`DesktopEvent`]/[`DesktopInput`] vocabulary,
 //! so the web-desktop manager and the native RDP server front end both work unchanged.
 
+mod audio;
 mod input;
 mod logon;
 mod tls;
@@ -29,6 +30,7 @@ use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabi
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::pdu::rdp::headers::ShareDataPdu;
 use ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp::rdpsnd::client::Rdpsnd;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
@@ -44,6 +46,8 @@ use warpgate_core::{
     DesktopInput, DesktopRect, DesktopState, within_deadline,
 };
 
+use self::audio::AudioForwarder;
+pub use self::audio::pcm_format;
 pub(crate) use self::logon::LogonWatcher;
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
 use crate::desktop_size::bound_desktop_size;
@@ -114,6 +118,9 @@ pub async fn run(
             options.verify_tls,
             options.tls_security,
             clipboard.backend(),
+            options
+                .audio_playback
+                .then(|| AudioForwarder::new(event_tx.clone())),
         ),
     )
     .await?;
@@ -717,7 +724,9 @@ fn build_config(
         // server has nothing to log the session on with and shows its sign-in screen.
         autologon: !options.interactive_logon,
         credssp_credentialless: options.interactive_logon,
-        enable_audio_playback: false,
+        // Without the flag the target plays nothing; with it, its sound arrives on the
+        // audio output channel `connect` registers.
+        enable_audio_playback: options.audio_playback,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -770,6 +779,7 @@ async fn connect(
     verify_tls: bool,
     tls_security: warpgate_common::RdpTlsSecurity,
     clipboard: TextClipboard<ClientClipboardSink>,
+    audio: Option<AudioForwarder>,
 ) -> Result<(ConnectionResult, Framed), DesktopConnectionError> {
     let tcp_stream = within_deadline(DESKTOP_CONNECT_TIMEOUT, async {
         TcpStream::connect((server_name.as_str(), port))
@@ -799,6 +809,9 @@ async fn connect(
     let mut connector = connector::ClientConnector::new(config, client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(CliprdrClient::new(Box::new(clipboard)));
+    if let Some(audio) = audio {
+        connector = connector.with_static_channel(Rdpsnd::new(Box::new(audio)));
+    }
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
@@ -856,7 +869,16 @@ mod tests {
     use ironrdp::session::image::DecodedImage;
     use warpgate_core::{DesktopEvent, DesktopRect};
 
-    use super::{GraphicsPipelineOutput, connector, encode_resized_keyframe};
+    use super::{GraphicsPipelineOutput, build_config, connector, encode_resized_keyframe};
+
+    #[test]
+    fn the_target_plays_sound_only_when_the_option_is_on() {
+        let mut options: warpgate_common::TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        assert!(!build_config(&options, "pw", 1024, 768).enable_audio_playback);
+        options.audio_playback = true;
+        assert!(build_config(&options, "pw", 1024, 768).enable_audio_playback);
+    }
 
     #[test]
     fn unhandled_graphics_are_reported_once_per_codec() {
