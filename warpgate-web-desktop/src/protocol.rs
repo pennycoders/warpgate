@@ -215,8 +215,7 @@ pub const fn phase_for(state: DesktopState) -> Option<LiveSessionPhase> {
 }
 
 impl ServerMessage {
-    /// `None` for state changes, which are reported as a session phase instead, and for
-    /// sound, which the browser viewer does not play.
+    /// `None` for state changes, which are reported as a session phase instead.
     pub fn from_event(event: DesktopEvent) -> Option<Self> {
         Some(match event {
             DesktopEvent::State(_) | DesktopEvent::Audio(_) => return None,

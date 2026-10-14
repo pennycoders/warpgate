@@ -722,8 +722,6 @@ fn build_config(
         // server has nothing to log the session on with and shows its sign-in screen.
         autologon: !options.interactive_logon,
         credssp_credentialless: options.interactive_logon,
-        // Without the flag the target plays nothing; with it, its sound arrives on the
-        // audio output channel `connect` registers.
         enable_audio_playback: options.audio_playback,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,
@@ -873,9 +871,6 @@ mod tests {
 
     use super::{GraphicsPipelineOutput, build_config, connector, encode_resized_keyframe};
 
-    /// GNOME Remote Desktop's sound server (FreeRDP's RDPSND) opens AUDIO_PLAYBACK_DVC and
-    /// sends its formats before it reads the answer. The client has no such channel, refuses
-    /// it, and must then ignore the formats rather than end the session.
     #[test]
     fn data_on_a_refused_dynamic_channel_does_not_end_the_session() {
         use ironrdp::core::encode_vec;
