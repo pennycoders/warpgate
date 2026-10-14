@@ -18,6 +18,7 @@ ironrdp = { version = "0.17", features = [
     "input",
     "dvc",
     "displaycontrol",
+    "svc",
 ] }
 ironrdp-egfx = "0.3"
 ironrdp-server = "0.13"

@@ -858,6 +858,35 @@ mod tests {
 
     use super::{GraphicsPipelineOutput, connector, encode_resized_keyframe};
 
+    /// FreeRDP's sound server (GNOME Remote Desktop) opens AUDIO_PLAYBACK_DVC and sends its
+    /// formats before it reads the answer, so data can arrive on a channel the client refused.
+    #[test]
+    fn data_on_a_refused_dynamic_channel_does_not_end_the_session() {
+        use ironrdp::core::encode_vec;
+        use ironrdp::dvc::pdu::{
+            CapabilitiesRequestPdu, CapsVersion, CreateRequestPdu, DataPdu, DrdynvcDataPdu,
+            DrdynvcServerPdu,
+        };
+        use ironrdp::svc::SvcProcessor as _;
+
+        let mut drdynvc = ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+            ironrdp::displaycontrol::client::DisplayControlClient::new(|_caps| Ok(Vec::new())),
+        );
+        let mut process = |pdu: DrdynvcServerPdu| drdynvc.process(&encode_vec(&pdu).unwrap());
+        process(DrdynvcServerPdu::Capabilities(CapabilitiesRequestPdu::new(
+            CapsVersion::V3,
+            None,
+        )))
+        .unwrap();
+        process(DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            3,
+            "AUDIO_PLAYBACK_DVC".to_owned(),
+        )))
+        .unwrap();
+        let formats = DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(3, vec![7; 16])));
+        assert!(process(formats).unwrap().is_empty());
+    }
+
     #[test]
     fn unhandled_graphics_are_reported_once_per_codec() {
         use ironrdp::pdu::geometry::ExclusiveRectangle;
