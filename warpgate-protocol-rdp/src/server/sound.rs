@@ -79,52 +79,16 @@ impl ServerEventSender for ViewerSound {
 impl SoundServerFactory for ViewerSound {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
         Box::new(Backend {
-            formats: diagnostic_formats(),
+            formats: [pcm_format(DESKTOP_AUDIO_FORMAT)],
             shared: Arc::clone(&self.shared),
             started: false,
         })
     }
 }
 
-/// Lab diagnostics (not for upstream): a broad menu, so the viewer's reply shows what it
-/// can play. Only PCM in DESKTOP_AUDIO_FORMAT is ever streamed.
-fn diagnostic_formats() -> Vec<AudioFormat> {
-    use ironrdp::rdpsnd::pdu::WaveFormat;
-    let fmt = |format, n_channels: u16, rate: u32, bits: u16| AudioFormat {
-        format,
-        n_channels,
-        n_samples_per_sec: rate,
-        n_avg_bytes_per_sec: rate * u32::from(n_channels) * u32::from(bits / 8),
-        n_block_align: n_channels * (bits / 8),
-        bits_per_sample: bits,
-        data: None,
-    };
-    let mut formats = vec![pcm_format(DESKTOP_AUDIO_FORMAT)];
-    for rate in [48_000, 44_100, 22_050, 11_025, 8_000] {
-        for channels in [2, 1] {
-            let f = fmt(WaveFormat::PCM, channels, rate, 16);
-            if !formats.contains(&f) {
-                formats.push(f);
-            }
-        }
-    }
-    for rate in [44_100, 22_050, 8_000] {
-        formats.push(fmt(WaveFormat::ALAW, 2, rate, 8));
-        formats.push(fmt(WaveFormat::MULAW, 2, rate, 8));
-    }
-    let mut aac = fmt(WaveFormat::AAC_MS, 2, 44_100, 16);
-    aac.n_avg_bytes_per_sec = 12_000;
-    aac.n_block_align = 4;
-    formats.push(aac);
-    let mut opus = fmt(WaveFormat::OPUS, 2, 48_000, 16);
-    opus.n_avg_bytes_per_sec = 12_000;
-    formats.push(opus);
-    formats
-}
-
 #[derive(Debug)]
 struct Backend {
-    formats: Vec<AudioFormat>,
+    formats: [AudioFormat; 1],
     shared: Arc<Shared>,
     started: bool,
 }
@@ -138,9 +102,8 @@ impl RdpsndServerHandler for Backend {
         &mut self,
         common: &'a [NegotiatedFormat],
     ) -> Option<&'a NegotiatedFormat> {
-        // Only the format the target sends is streamed.
-        let pcm = pcm_format(DESKTOP_AUDIO_FORMAT);
-        common.iter().find(|f| *f.format() == pcm)
+        // Only one format is offered, so any common format is that one.
+        common.first()
     }
 
     fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
