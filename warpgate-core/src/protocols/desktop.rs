@@ -129,8 +129,7 @@ impl DesktopEvent {
     }
 }
 
-/// The one format desktop sound travels in: uncompressed PCM that every RDP client and
-/// server supports, so the gateway passes it through without transcoding.
+/// The PCM format desktop sound is relayed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopAudioFormat {
     pub channels: u16,
@@ -139,7 +138,6 @@ pub struct DesktopAudioFormat {
 }
 
 impl DesktopAudioFormat {
-    /// Bytes per sample frame (one sample for every channel).
     pub const fn block_align(self) -> u16 {
         self.channels * (self.bits_per_sample / 8)
     }
@@ -149,7 +147,6 @@ impl DesktopAudioFormat {
     }
 }
 
-/// 16-bit stereo at 44.1 kHz.
 pub const DESKTOP_AUDIO_FORMAT: DesktopAudioFormat = DesktopAudioFormat {
     channels: 2,
     samples_per_sec: 44_100,

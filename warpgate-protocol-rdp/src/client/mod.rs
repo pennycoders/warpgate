@@ -722,8 +722,6 @@ fn build_config(
         // server has nothing to log the session on with and shows its sign-in screen.
         autologon: !options.interactive_logon,
         credssp_credentialless: options.interactive_logon,
-        // Without the flag the target plays nothing; with it, its sound arrives on the
-        // audio output channel `connect` registers.
         enable_audio_playback: options.audio_playback,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,
