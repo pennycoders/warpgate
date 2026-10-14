@@ -328,15 +328,20 @@ mod tests {
             Some(ClientAudioOutputPdu::AudioFormat(f)) if f.formats == vec![pcm.clone()]
         ));
 
-        let training = replies(exchange(audio(ServerAudioOutputPdu::Training(
-            TrainingPdu {
-                timestamp: 3,
-                data: Vec::new(),
-            },
-        ))));
+        // GNOME Remote Desktop rejects a confirm whose wPackSize is not the Training PDU's
+        // own (the size of the whole PDU, MS-RDPEA 2.2.3.2) and never starts playback.
+        let training = TrainingPdu {
+            timestamp: 3,
+            data: vec![0xAB; 32],
+        };
+        let training_size = encode_vec(&ServerAudioOutputPdu::Training(training.clone()))
+            .unwrap()
+            .len();
+        let confirm = replies(exchange(audio(ServerAudioOutputPdu::Training(training))));
         assert!(matches!(
-            training.as_slice(),
-            [ClientAudioOutputPdu::TrainingConfirm(c)] if c.timestamp == 3
+            confirm.as_slice(),
+            [ClientAudioOutputPdu::TrainingConfirm(c)]
+                if c.timestamp == 3 && usize::from(c.pack_size) == training_size
         ));
 
         let confirmed = replies(exchange(audio(ServerAudioOutputPdu::Wave2(Wave2Pdu {
