@@ -1,6 +1,6 @@
 diff -ruN ironrdp-rdpsnd-0.9.0/src/client.rs base/src/client.rs
---- ironrdp-rdpsnd-0.9.0/src/client.rs	2026-10-14 16:12:21.484630402 +0300
-+++ base/src/client.rs	2026-10-14 16:12:21.488872657 +0300
+--- ironrdp-rdpsnd-0.9.0/src/client.rs	2026-10-14 16:52:27.308243687 +0300
++++ base/src/client.rs	2026-10-14 16:52:27.312844386 +0300
 @@ -130,7 +130,9 @@
      }
  
@@ -14,7 +14,7 @@ diff -ruN ironrdp-rdpsnd-0.9.0/src/client.rs base/src/client.rs
              timestamp: pdu.timestamp,
 diff -ruN ironrdp-rdpsnd-0.9.0/src/dvc.rs base/src/dvc.rs
 --- ironrdp-rdpsnd-0.9.0/src/dvc.rs	1970-01-01 02:00:00.000000000 +0200
-+++ base/src/dvc.rs	2026-10-14 16:12:21.488611073 +0300
++++ base/src/dvc.rs	2026-10-14 16:52:27.312569550 +0300
 @@ -0,0 +1,145 @@
 +//! RDPSND over a dynamic virtual channel.
 +//!
@@ -162,8 +162,8 @@ diff -ruN ironrdp-rdpsnd-0.9.0/src/dvc.rs base/src/dvc.rs
 +
 +impl DvcServerProcessor for RdpsndDvcServer {}
 diff -ruN ironrdp-rdpsnd-0.9.0/src/lib.rs base/src/lib.rs
---- ironrdp-rdpsnd-0.9.0/src/lib.rs	2026-10-14 16:12:21.484999444 +0300
-+++ base/src/lib.rs	2026-10-14 16:12:21.489132657 +0300
+--- ironrdp-rdpsnd-0.9.0/src/lib.rs	2026-10-14 16:52:27.308617481 +0300
++++ base/src/lib.rs	2026-10-14 16:52:27.313099387 +0300
 @@ -2,5 +2,7 @@
  #![doc(html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg")]
  
@@ -174,7 +174,7 @@ diff -ruN ironrdp-rdpsnd-0.9.0/src/lib.rs base/src/lib.rs
  pub mod server;
 diff -ruN ironrdp-rdpsnd-0.9.0/src/pcm.rs base/src/pcm.rs
 --- ironrdp-rdpsnd-0.9.0/src/pcm.rs	1970-01-01 02:00:00.000000000 +0200
-+++ base/src/pcm.rs	2026-10-14 16:12:21.489386658 +0300
++++ base/src/pcm.rs	2026-10-14 16:52:27.313392764 +0300
 @@ -0,0 +1,159 @@
 +//! Sample-rate reduction for 16-bit PCM.
 +//!
@@ -336,8 +336,8 @@ diff -ruN ironrdp-rdpsnd-0.9.0/src/pcm.rs base/src/pcm.rs
 +    }
 +}
 diff -ruN ironrdp-rdpsnd-0.9.0/src/pdu/mod.rs base/src/pdu/mod.rs
---- ironrdp-rdpsnd-0.9.0/src/pdu/mod.rs	2026-10-14 16:12:21.486078404 +0300
-+++ base/src/pdu/mod.rs	2026-10-14 16:12:21.490129242 +0300
+--- ironrdp-rdpsnd-0.9.0/src/pdu/mod.rs	2026-10-14 16:52:27.309950157 +0300
++++ base/src/pdu/mod.rs	2026-10-14 16:52:27.314101853 +0300
 @@ -599,6 +599,16 @@
      const FIXED_PART_SIZE: usize =
          2 /* wTimeStamp */
@@ -370,8 +370,19 @@ diff -ruN ironrdp-rdpsnd-0.9.0/src/pdu/mod.rs base/src/pdu/mod.rs
  
          Ok(())
 diff -ruN ironrdp-rdpsnd-0.9.0/src/server.rs base/src/server.rs
---- ironrdp-rdpsnd-0.9.0/src/server.rs	2026-10-14 16:12:21.485424403 +0300
-+++ base/src/server.rs	2026-10-14 16:12:21.489694491 +0300
+--- ironrdp-rdpsnd-0.9.0/src/server.rs	2026-10-14 16:52:27.309063943 +0300
++++ base/src/server.rs	2026-10-14 16:52:27.313668391 +0300
+@@ -1,7 +1,7 @@
+-use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
++use ironrdp_core::{Decode as _, Encode, EncodeResult, ReadCursor, WriteCursor, encode_vec, ensure_size, impl_as_any};
+ use ironrdp_pdu::gcc::ChannelName;
+-use ironrdp_pdu::{PduResult, decode_err, pdu_other_err};
+-use ironrdp_svc::{CompressionCondition, SvcMessage, SvcProcessor, SvcProcessorMessages, SvcServerProcessor};
++use ironrdp_pdu::{PduResult, decode_err, encode_err, pdu_other_err};
++use ironrdp_svc::{CompressionCondition, SvcEncode, SvcMessage, SvcProcessor, SvcProcessorMessages, SvcServerProcessor};
+ use tracing::{debug, error};
+ 
+ use crate::pdu::{self, ClientAudioFormatPdu, QualityMode};
 @@ -181,6 +181,11 @@
          ]))
      }
@@ -384,3 +395,49 @@ diff -ruN ironrdp-rdpsnd-0.9.0/src/server.rs base/src/server.rs
      pub fn wave(&mut self, data: Vec<u8>, ts: u32) -> PduResult<RdpsndSvcMessages> {
          let version = self.version()?;
          let format_no = self
+@@ -204,7 +209,16 @@
+                 timestamp: 0,
+                 data: data.into(),
+             };
+-            RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Wave(pdu).into()])
++            let encoded = encode_vec(&pdu::ServerAudioOutputPdu::Wave(pdu)).map_err(|e| encode_err!(e))?;
++            // The WaveInfo PDU (RDPSND header and 12 bytes, [2.2.3.3]) and the Wave PDU (the rest,
++            // [2.2.3.4]) are separate channel messages.
++            let (info, wave) = encoded
++                .split_at_checked(4 + 12)
++                .ok_or_else(|| pdu_other_err!("wave data shorter than WaveInfo Data prefix"))?;
++            RdpsndSvcMessages::new(vec![
++                EncodedPdu(info.to_vec()).into(),
++                EncodedPdu(wave.to_vec()).into(),
++            ])
+         };
+ 
+         self.block_no = self.block_no.overflowing_add(1).0;
+@@ -383,6 +397,27 @@
+     }
+ }
+ 
++/// An RDPSND message already encoded.
++struct EncodedPdu(Vec<u8>);
++
++impl Encode for EncodedPdu {
++    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
++        ensure_size!(in: dst, size: self.size());
++        dst.write_slice(&self.0);
++        Ok(())
++    }
++
++    fn name(&self) -> &'static str {
++        "RdpsndPdu"
++    }
++
++    fn size(&self) -> usize {
++        self.0.len()
++    }
++}
++
++impl SvcEncode for EncodedPdu {}
++
+ impl Drop for RdpsndServer {
+     fn drop(&mut self) {
+         self.handler.stop();

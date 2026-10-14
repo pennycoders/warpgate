@@ -24,6 +24,13 @@ Jump Desktop on macOS accepts only 22.05 kHz audio; viewers that take only half 
 target's rate get the stream through it. Formats compare with `==` here, as 0.9.0 has no
 `AudioFormat::matches_for_negotiation` and negotiates by equality.
 
+## Pre-v8 clients get the WaveInfo PDU and the Wave PDU as two messages
+
+0.9.0 sent a client below version 8 the WaveInfo PDU and the Wave PDU (MS-RDPEA 2.2.3.3
+and 2.2.3.4) in one channel message; such clients read the second as its own message, so
+Jump Desktop on macOS (version 5) played nothing. The encoded message is now split into
+the two, as IronRDP master sends them (its WavePdu/WaveDataPdu rework).
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is
 not in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
