@@ -1,9 +1,4 @@
-//! Target-side audio output (MS-RDPEA): accept the target's sound as PCM in
-//! [`DESKTOP_AUDIO_FORMAT`] and hand each block to the session as a [`DesktopEvent::Audio`].
-//!
-//! The sound can arrive on the `rdpsnd` static channel or on the `AUDIO_PLAYBACK_DVC`
-//! dynamic channel; servers that have both (Windows, GNOME Remote Desktop) prefer the
-//! dynamic one.
+//! The target's sound (MS-RDPEA), on the `rdpsnd` static channel or `AUDIO_PLAYBACK_DVC`.
 
 use std::borrow::Cow;
 
@@ -16,7 +11,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, warn};
 use warpgate_core::{DESKTOP_AUDIO_FORMAT, DesktopAudioFormat, DesktopEvent};
 
-/// The format offered to the target, as an MS-RDPEA format descriptor.
 pub const fn pcm_format(format: DesktopAudioFormat) -> AudioFormat {
     AudioFormat {
         format: WaveFormat::PCM,
@@ -29,8 +23,6 @@ pub const fn pcm_format(format: DesktopAudioFormat) -> AudioFormat {
     }
 }
 
-/// The target's sound on `AUDIO_PLAYBACK_DVC`: the same PDUs and negotiation as the static
-/// channel.
 pub fn dynamic_audio(handler: AudioForwarder) -> RdpsndDvcClient {
     RdpsndDvcClient::new(Rdpsnd::new(Box::new(AudioForwarder {
         channel: AUDIO_PLAYBACK_DVC,
@@ -43,7 +35,6 @@ pub struct AudioForwarder {
     formats: [AudioFormat; 1],
     events: Sender<DesktopEvent>,
     dropped: u64,
-    /// The channel the sound arrives on, logged with the first block.
     channel: &'static str,
     playing: bool,
 }
@@ -66,12 +57,10 @@ impl RdpsndClientHandler for AudioForwarder {
     }
 
     fn wave(&mut self, format_no: usize, _ts: u32, data: Cow<'_, [u8]>) {
-        // Only one format is offered, so the target can only pick that one.
         if format_no != 0 {
             warn!(format_no, "Ignoring audio in a format that was not offered");
             return;
         }
-        // A block that does not end on a sample frame would shift every later sample.
         if !data
             .len()
             .is_multiple_of(usize::from(DESKTOP_AUDIO_FORMAT.block_align()))
@@ -86,8 +75,7 @@ impl RdpsndClientHandler for AudioForwarder {
             self.playing = true;
             info!(channel = self.channel, "Playing the target's sound");
         }
-        // Sound is the first thing worth dropping when the viewer falls behind: a late
-        // block is useless, and waiting here would stall the target's whole session.
+        // A late block is useless, and waiting would stall the whole target session.
         match self
             .events
             .try_send(DesktopEvent::Audio(Bytes::copy_from_slice(&data)))
@@ -103,7 +91,6 @@ impl RdpsndClientHandler for AudioForwarder {
         }
     }
 
-    // The viewer's own volume control applies; the target's is not forwarded.
     fn set_volume(&mut self, _volume: VolumePdu) {}
 
     fn set_pitch(&mut self, _pitch: PitchPdu) {}
@@ -123,7 +110,6 @@ mod tests {
 
     use super::AudioForwarder;
 
-    /// A server PDU already encoded, as a DVC message.
     struct RawPdu(Vec<u8>);
 
     impl ironrdp::core::Encode for RawPdu {
@@ -203,9 +189,6 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// The exchange a desktop runs on `AUDIO_PLAYBACK_DVC`, through IronRDP's DVC client:
-    /// the channel is accepted, only PCM is offered back, training is confirmed, and a
-    /// Wave2 block reaches the session.
     #[test]
     fn plays_sound_from_the_dynamic_channel() {
         use std::borrow::Cow;
@@ -294,8 +277,7 @@ mod tests {
             Some(ClientAudioOutputPdu::AudioFormat(f)) if f.formats == vec![pcm.clone()]
         ));
 
-        // GNOME Remote Desktop rejects a confirm whose wPackSize is not the Training PDU's
-        // own (the size of the whole PDU, MS-RDPEA 2.2.3.2) and never starts playback.
+        // GNOME Remote Desktop needs wPackSize echoed (MS-RDPEA 2.2.3.2).
         let training = TrainingPdu {
             timestamp: 3,
             data: vec![0xAB; 32],

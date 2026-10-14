@@ -144,7 +144,6 @@ where
         .with_credential_validator(Some(validator))
         .with_cliprdr_factory(Some(Box::new(clipboard)))
         // Offered to every viewer: the target is not known yet when channels are joined.
-        // Sound flows only from targets with `audio_playback` on.
         .with_sound_factory(Some(Box::new(sound)))
         .build();
 

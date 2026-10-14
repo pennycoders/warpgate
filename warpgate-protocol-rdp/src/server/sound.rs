@@ -1,8 +1,5 @@
-//! Viewer-side audio output (MS-RDPEA): play the target's sound on the viewer.
-//!
-//! The viewer is offered only [`DESKTOP_AUDIO_FORMAT`], the format the target is asked for,
-//! so blocks pass through unchanged. Blocks are held back until the viewer has accepted
-//! that format: the server rejects a block sent earlier, and ends the session with it.
+//! The target's sound for the viewer (MS-RDPEA), relayed unchanged, or at half the rate to
+//! viewers that cannot play the target's (Jump Desktop on macOS).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -15,19 +12,24 @@ use ironrdp_server::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
-use warpgate_core::DESKTOP_AUDIO_FORMAT;
+use warpgate_core::{DESKTOP_AUDIO_FORMAT, DesktopAudioFormat};
 
+use super::halve::Halver;
 use crate::client::pcm_format;
+
+const HALF_RATE: DesktopAudioFormat = DesktopAudioFormat {
+    samples_per_sec: DESKTOP_AUDIO_FORMAT.samples_per_sec / 2,
+    ..DESKTOP_AUDIO_FORMAT
+};
 
 #[derive(Debug, Default)]
 struct Shared {
     server: Mutex<Option<UnboundedSender<ServerEvent>>>,
-    /// Channels on which the viewer accepted the format: the rdpsnd static channel and
-    /// AUDIO_PLAYBACK_DVC are both offered, and a viewer may negotiate either or both.
+    /// A viewer may negotiate both the rdpsnd static channel and AUDIO_PLAYBACK_DVC.
     streaming: AtomicUsize,
+    halver: Mutex<Option<Halver>>,
 }
 
-/// Hands the target's sound to the viewer-facing server.
 #[derive(Debug, Clone)]
 pub(super) struct ViewerSound {
     shared: Arc<Shared>,
@@ -42,15 +44,22 @@ impl ViewerSound {
         }
     }
 
-    /// Play one block of PCM. Dropped until the viewer has accepted the format, and when
-    /// it never will (it declined sound, or did not open the channel at all).
     pub(super) fn play(&self, data: &[u8]) {
+        // The server ends the session on a block sent before a format is agreed.
         if self.shared.streaming.load(Ordering::Acquire) == 0 {
             return;
         }
-        // Milliseconds since the session began; the viewer uses it only to pace playback,
-        // so wrapping after ~49 days is harmless.
         let ts = self.started.elapsed().as_millis() as u32;
+        let data = match self
+            .shared
+            .halver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(halver) => halver.process(data),
+            None => data.to_vec(),
+        };
         if let Some(server) = self
             .shared
             .server
@@ -58,10 +67,7 @@ impl ViewerSound {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
         {
-            let _ = server.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
-                data.to_vec(),
-                ts,
-            )));
+            let _ = server.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, ts)));
         }
     }
 }
@@ -79,7 +85,7 @@ impl ServerEventSender for ViewerSound {
 impl SoundServerFactory for ViewerSound {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
         Box::new(Backend {
-            formats: [pcm_format(DESKTOP_AUDIO_FORMAT)],
+            formats: [pcm_format(DESKTOP_AUDIO_FORMAT), pcm_format(HALF_RATE)],
             shared: Arc::clone(&self.shared),
             started: false,
         })
@@ -88,7 +94,7 @@ impl SoundServerFactory for ViewerSound {
 
 #[derive(Debug)]
 struct Backend {
-    formats: [AudioFormat; 1],
+    formats: [AudioFormat; 2],
     shared: Arc<Shared>,
     started: bool,
 }
@@ -102,12 +108,17 @@ impl RdpsndServerHandler for Backend {
         &mut self,
         common: &'a [NegotiatedFormat],
     ) -> Option<&'a NegotiatedFormat> {
-        // Only one format is offered, so any common format is that one.
         common.first()
     }
 
     fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
         debug!(format = ?format.format(), "Viewer accepted audio");
+        *self
+            .shared
+            .halver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            (*format.format() == pcm_format(HALF_RATE)).then(Halver::new);
         if !self.started {
             self.started = true;
             self.shared.streaming.fetch_add(1, Ordering::AcqRel);
@@ -144,7 +155,6 @@ mod tests {
         encode_vec(&pdu).expect("encodes")
     }
 
-    /// Drive a real server channel through the viewer's side of the negotiation.
     fn negotiate(
         server: &mut RdpsndServer,
         viewer_formats: Vec<ironrdp::rdpsnd::pdu::AudioFormat>,
@@ -158,7 +168,10 @@ mod tests {
         };
         assert_eq!(
             offer.formats,
-            vec![pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT)]
+            vec![
+                pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT),
+                pcm_format(super::HALF_RATE)
+            ]
         );
         server
             .process(&encode(ClientAudioOutputPdu::AudioFormat(
@@ -218,7 +231,33 @@ mod tests {
         let played = waves(&mut rx);
         assert_eq!(played.len(), 1);
         assert_eq!(played[0].0, vec![1, 2, 3, 4]);
-        // The server can now encode it: the viewer's format index is known.
+        assert!(server.wave(played[0].0.clone(), played[0].1).is_ok());
+    }
+
+    #[test]
+    fn the_targets_rate_is_preferred_and_passed_through() {
+        let (sound, mut rx) = viewer();
+        let mut server = RdpsndServer::new(sound.build_backend());
+        negotiate(
+            &mut server,
+            vec![
+                pcm_format(super::HALF_RATE),
+                pcm_format(warpgate_core::DESKTOP_AUDIO_FORMAT),
+            ],
+        );
+        let block: Vec<u8> = (0..64).collect();
+        sound.play(&block);
+        assert_eq!(waves(&mut rx)[0].0, block);
+    }
+
+    #[test]
+    fn a_viewer_that_takes_only_half_the_rate_gets_it_resampled() {
+        let (sound, mut rx) = viewer();
+        let mut server = RdpsndServer::new(sound.build_backend());
+        negotiate(&mut server, vec![pcm_format(super::HALF_RATE)]);
+        sound.play(&[0; 4 * 100]);
+        let played = waves(&mut rx);
+        assert_eq!(played[0].0.len(), 4 * 50);
         assert!(server.wave(played[0].0.clone(), played[0].1).is_ok());
     }
 
@@ -257,8 +296,6 @@ mod tests {
         assert!(waves(&mut rx).is_empty());
     }
 
-    /// The static channel and AUDIO_PLAYBACK_DVC each get a backend; a viewer that negotiates
-    /// both keeps its sound until both are gone.
     #[test]
     fn sound_lasts_while_any_channel_is_negotiated() {
         let (sound, mut rx) = viewer();
@@ -282,8 +319,6 @@ mod tests {
         assert!(waves(&mut rx).is_empty());
     }
 
-    /// A viewer that only opens AUDIO_PLAYBACK_DVC (Jump Desktop) negotiates through the
-    /// dynamic-channel wrapper and gets sound.
     #[test]
     fn a_viewer_on_the_dynamic_channel_gets_sound() {
         use ironrdp::dvc::{DrdynvcClient, DrdynvcServer};
@@ -355,7 +390,6 @@ mod tests {
     #[test]
     fn plays_nothing_before_the_server_is_running() {
         let sound = ViewerSound::new();
-        // No sender yet and nothing negotiated: must not panic.
         sound.play(&[0; 4]);
     }
 
