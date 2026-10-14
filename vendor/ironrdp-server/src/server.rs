@@ -475,6 +475,8 @@ pub struct RdpServer {
 #[derive(Debug)]
 pub enum ServerEvent {
     Quit(String),
+    /// Disconnect the active client with a `ServerSetErrorInfoPdu` carrying the given reason.
+    Disconnect(ErrorInfo),
     Clipboard(ClipboardMessage),
     Rdpsnd(RdpsndServerMessage),
     Echo(EchoServerMessage),
@@ -1077,6 +1079,7 @@ impl RdpServer {
         &mut self,
         events: &mut Vec<ServerEvent>,
         writer: &mut impl FramedWrite,
+        io_channel_id: u16,
         user_channel_id: u16,
         message_channel_id: Option<u16>,
     ) -> Result<RunState> {
@@ -1101,6 +1104,13 @@ impl RdpServer {
             match event {
                 ServerEvent::Quit(reason) => {
                     debug!("Got quit event: {reason}");
+                    return Ok(RunState::Disconnect);
+                }
+                ServerEvent::Disconnect(error) => {
+                    debug!(?error, "Got disconnect event");
+                    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error));
+                    let data = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)?;
+                    writer.write_all(&data).await?;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::GetLocalAddr(tx) => {
@@ -1237,6 +1247,7 @@ impl RdpServer {
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
+        let mut ultimatum_writer = writer.clone();
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let s = Rc::new(Mutex::new(self));
 
@@ -1312,7 +1323,13 @@ impl RdpServer {
                 }
                 let mut this = this.lock().await;
                 match this
-                    .dispatch_server_events(&mut events, &mut event_writer, user_channel_id, message_channel_id)
+                    .dispatch_server_events(
+                        &mut events,
+                        &mut event_writer,
+                        io_channel_id,
+                        user_channel_id,
+                        message_channel_id,
+                    )
                     .await?
                 {
                     RunState::Continue => continue,
@@ -1321,13 +1338,22 @@ impl RdpServer {
             }
         };
 
-        let state = tokio::select!(
-            state = dispatch_pdu => state,
-            state = dispatch_display => state,
-            state = dispatch_events => state,
+        let (state, server_initiated) = tokio::select!(
+            state = dispatch_pdu => (state, false),
+            state = dispatch_display => (state, true),
+            state = dispatch_events => (state, true),
         );
 
         debug!("End of client loop: {state:?}");
+        if server_initiated && matches!(state, Ok(RunState::Disconnect)) {
+            let ultimatum = mcs::McsMessage::DisconnectProviderUltimatum(mcs::DisconnectProviderUltimatum::from_reason(
+                mcs::DisconnectReason::ProviderInitiated,
+            ));
+            let data = encode_vec(&X224(ultimatum))?;
+            if let Err(error) = ultimatum_writer.write_all(&data).await {
+                debug!(%error, "Could not send the disconnect ultimatum");
+            }
+        }
         state
     }
 
@@ -1805,6 +1831,32 @@ async fn deactivate_all(
     let msg = encode_vec(&X224(pdu))?;
     writer.write_all(&msg).await?;
     Ok(())
+}
+
+fn encode_share_data_pdu(
+    share_data_pdu: rdp::headers::ShareDataPdu,
+    pdu_source: u16,
+    io_channel_id: u16,
+    user_channel_id: u16,
+) -> Result<Vec<u8>> {
+    let header = rdp::headers::ShareDataHeader {
+        share_data_pdu,
+        stream_priority: rdp::headers::StreamPriority::Medium,
+        compression_flags: rdp::headers::CompressionFlags::empty(),
+        compression_type: rdp::client_info::CompressionType::K8,
+    };
+    let pdu = rdp::headers::ShareControlHeader {
+        share_id: 0,
+        pdu_source,
+        share_control_pdu: ShareControlPdu::Data(header),
+    };
+    let user_data = encode_vec(&pdu)?.into();
+    let mcs_pdu = SendDataIndication {
+        initiator_id: user_channel_id,
+        channel_id: io_channel_id,
+        user_data,
+    };
+    Ok(encode_vec(&X224(mcs_pdu))?)
 }
 
 /// Send a `ServerSetErrorInfoPdu(ServerDeniedConnection)` to the client, then return.

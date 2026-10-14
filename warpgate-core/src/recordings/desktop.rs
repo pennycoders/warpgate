@@ -426,7 +426,8 @@ impl DesktopRecorder {
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::Bell
-            | DesktopEvent::Error(_) => return Ok(()),
+            | DesktopEvent::Error(_)
+            | DesktopEvent::Ended(_) => return Ok(()),
         }
 
         self.maybe_keyframe(&mut st, time).await?;

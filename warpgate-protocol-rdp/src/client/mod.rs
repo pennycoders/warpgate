@@ -29,8 +29,11 @@ use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabi
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::pdu::rdp::headers::ShareDataPdu;
 use ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ServerSetErrorInfoPdu};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp::session::{
+    ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason,
+};
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::pdu::{Codec1Type, GfxPdu};
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
@@ -40,8 +43,8 @@ use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, un
 use tracing::{debug, warn};
 use warpgate_common::{RdpTargetAuth, RdpTargetCompression, SecretResolver, TargetRdpOptions};
 use warpgate_core::{
-    DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopConnectionError, DesktopEvent,
-    DesktopInput, DesktopRect, DesktopState, within_deadline,
+    DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopConnectionError, DesktopEndReason,
+    DesktopEvent, DesktopInput, DesktopRect, DesktopState, within_deadline,
 };
 
 pub(crate) use self::logon::LogonWatcher;
@@ -493,7 +496,7 @@ async fn process_outputs(
     event_tx: &Sender<DesktopEvent>,
     abort_rx: &mut UnboundedReceiver<()>,
 ) -> Result<bool, Aborted> {
-    let mut terminate = false;
+    let mut end = None;
     for out in &outputs {
         match out {
             ActiveStageOutput::ResponseFrame(frame) => {
@@ -501,7 +504,7 @@ async fn process_outputs(
                     return Err(Aborted);
                 }
             }
-            ActiveStageOutput::Terminate(_) => terminate = true,
+            ActiveStageOutput::Terminate(reason) => end = Some(end_reason(reason)),
             _ => {}
         }
     }
@@ -517,7 +520,40 @@ async fn process_outputs(
             send_event(event_tx, abort_rx, event).await?;
         }
     }
-    Ok(terminate)
+    let Some(end) = end else {
+        return Ok(false);
+    };
+    send_event(event_tx, abort_rx, DesktopEvent::Ended(end)).await?;
+    Ok(true)
+}
+
+fn end_reason(reason: &GracefulDisconnectReason) -> DesktopEndReason {
+    match reason {
+        GracefulDisconnectReason::ErrorInfo(info) => DesktopEndReason {
+            message: error_info_text(*info),
+            rdp_error_info: ironrdp::core::encode_vec(&ServerSetErrorInfoPdu(*info))
+                .ok()
+                .and_then(|code| <[u8; 4]>::try_from(code).ok())
+                .map(u32::from_le_bytes),
+        },
+        GracefulDisconnectReason::ServerInitiated => DesktopEndReason {
+            message: "The remote desktop ended the session.".to_owned(),
+            rdp_error_info: None,
+        },
+        other => DesktopEndReason {
+            message: other.description(),
+            rdp_error_info: None,
+        },
+    }
+}
+
+fn error_info_text(info: ErrorInfo) -> String {
+    match info {
+        ErrorInfo::ProtocolIndependentCode(code) => code.description().to_owned(),
+        ErrorInfo::ProtocolIndependentLicensingCode(code) => code.description().to_owned(),
+        ErrorInfo::ProtocolIndependentConnectionBrokerCode(code) => code.description().to_owned(),
+        ErrorInfo::RdpSpecificCode(code) => code.description().to_owned(),
+    }
 }
 
 /// Tell the viewer the size of `image` if it changed since the viewer was last told, then
@@ -857,6 +893,58 @@ mod tests {
     use warpgate_core::{DesktopEvent, DesktopRect};
 
     use super::{GraphicsPipelineOutput, connector, encode_resized_keyframe};
+
+    #[test]
+    fn a_target_error_info_reaches_the_viewer_with_its_code() {
+        use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+        use ironrdp::session::GracefulDisconnectReason;
+
+        let code = ProtocolIndependentCode::DisconnectedByOtherconnection;
+        let end = super::end_reason(&GracefulDisconnectReason::ErrorInfo(
+            ErrorInfo::ProtocolIndependentCode(code),
+        ));
+        assert_eq!(end.rdp_error_info, Some(5));
+        assert_eq!(end.message, code.description());
+    }
+
+    /// The code the viewer side decodes is the error info the target sent, for every kind.
+    #[test]
+    fn every_kind_of_error_info_survives_the_trip_to_the_viewer() {
+        use ironrdp::core::decode;
+        use ironrdp::pdu::rdp::server_error_info::{
+            ErrorInfo, ProtocolIndependentCode, ProtocolIndependentConnectionBrokerCode,
+            ProtocolIndependentLicensingCode, RdpSpecificCode, ServerSetErrorInfoPdu,
+        };
+        use ironrdp::session::GracefulDisconnectReason;
+
+        for info in [
+            ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::LogoffByUser),
+            ErrorInfo::ProtocolIndependentLicensingCode(ProtocolIndependentLicensingCode::Internal),
+            ErrorInfo::ProtocolIndependentConnectionBrokerCode(
+                ProtocolIndependentConnectionBrokerCode::DestinationNotFound,
+            ),
+            ErrorInfo::RdpSpecificCode(RdpSpecificCode::UnknownPduType2),
+        ] {
+            let code = super::end_reason(&GracefulDisconnectReason::ErrorInfo(info))
+                .rdp_error_info
+                .unwrap();
+            let pdu: ServerSetErrorInfoPdu = decode(&code.to_le_bytes()).unwrap();
+            assert_eq!(pdu.0, info);
+        }
+    }
+
+    #[test]
+    fn a_target_ending_without_error_info_still_has_a_reason() {
+        use ironrdp::session::GracefulDisconnectReason;
+
+        let end = super::end_reason(&GracefulDisconnectReason::ServerInitiated);
+        assert_eq!(end.rdp_error_info, None);
+        assert!(!end.message.is_empty());
+
+        let end = super::end_reason(&GracefulDisconnectReason::Other("channel purged".into()));
+        assert_eq!(end.rdp_error_info, None);
+        assert_eq!(end.message, "channel purged");
+    }
 
     #[test]
     fn unhandled_graphics_are_reported_once_per_codec() {

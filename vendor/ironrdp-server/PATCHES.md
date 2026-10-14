@@ -19,6 +19,15 @@ is why this strikes some deployments and not others; see warp-tech/warpgate#2606
 carrying the headers has been built. It also drops a `* 2` from the adjacent buffer-resize
 `debug!`, which reported twice the size actually allocated.
 
+## Disconnecting the client with a reason
+
+Upstream 0.13.0 ends a connection the server side closes (`ServerEvent::Quit`, or the
+display's update stream ending) by dropping the socket, so the client sees a transport error
+instead of a disconnection. The fork backports upstream's `ServerEvent::Disconnect(ErrorInfo)`,
+which sends the client a Set Error Info PDU first, and ends every server-initiated
+disconnection with an MCS Disconnect Provider Ultimatum (`src/server.rs`). Warpgate uses it
+to pass the target's reason for ending a session on to the viewer.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
