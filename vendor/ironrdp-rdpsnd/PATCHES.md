@@ -17,6 +17,13 @@ Backport of IronRDP branch `feat/rdpsnd-dvc` (`dvc` module: `RdpsndDvcClient`,
 Desktop among them, take audio only on the dynamic channel and never open the `rdpsnd`
 static channel. Adds the `ironrdp-dvc` dependency.
 
+## Sample-rate reduction for 16-bit PCM
+
+Backport of IronRDP branch `feature/rdpsnd-pcm-decimation` (`pcm` module, `PcmDecimator`).
+Jump Desktop on macOS accepts only 22.05 kHz audio; viewers that take only half the
+target's rate get the stream through it. Formats compare with `==` here, as 0.9.0 has no
+`AudioFormat::matches_for_negotiation` and negotiates by equality.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is
 not in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
