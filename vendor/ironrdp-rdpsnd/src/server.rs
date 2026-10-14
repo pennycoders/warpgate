@@ -294,6 +294,8 @@ impl SvcProcessor for RdpsndServer {
 
     fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
         let pdu = pdu::ClientAudioOutputPdu::decode(&mut ReadCursor::new(payload)).map_err(|e| decode_err!(e))?;
+        // Lab diagnostics (not for upstream): the viewer's side of the negotiation.
+        tracing::info!(target: "warpgate_protocol_rdp::diag", state = ?self.state, pdu = ?pdu, "Viewer audio PDU");
         debug!(?pdu);
         let msg = match self.state {
             RdpsndState::WaitingForClientFormats => {
@@ -336,6 +338,7 @@ impl SvcProcessor for RdpsndServer {
                 let common = negotiate_formats(self.handler.get_formats(), &client_format.formats);
                 self.state = RdpsndState::Ready;
                 if common.is_empty() {
+                    tracing::info!(target: "warpgate_protocol_rdp::diag", "No audio format in common with the viewer");
                     debug!("No audio format in common with the client; audio disabled");
                 } else if let Some(chosen) = self.handler.choose_format(&common) {
                     // `chosen` borrows `common` (a local), not `self`, so the
@@ -374,6 +377,7 @@ impl SvcProcessor for RdpsndServer {
     }
 
     fn start(&mut self) -> PduResult<Vec<SvcMessage>> {
+        tracing::info!(target: "warpgate_protocol_rdp::diag", "Offering audio formats to the viewer");
         if self.state != RdpsndState::Start {
             error!("Attempted to start rdpsnd channel in invalid state");
         }
