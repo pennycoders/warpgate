@@ -215,11 +215,14 @@ pub const fn phase_for(state: DesktopState) -> Option<LiveSessionPhase> {
 }
 
 impl ServerMessage {
-    /// `None` for state changes, which are reported as a session phase instead.
+    /// `None` for state changes, which are reported as a session phase instead, and for
+    /// sound, which the browser viewer does not play.
     pub fn from_event(event: DesktopEvent) -> Option<Self> {
         Some(match event {
             // The browser shows its own cursor.
-            DesktopEvent::State(_) | DesktopEvent::DefaultCursor => return None,
+            DesktopEvent::State(_) | DesktopEvent::DefaultCursor | DesktopEvent::Audio(_) => {
+                return None;
+            }
             DesktopEvent::Resize { width, height } => Self::Resize { width, height },
             DesktopEvent::RawImage { rect, data } => Self::RawImage {
                 rect: rect.into(),
@@ -246,5 +249,20 @@ impl ServerMessage {
             DesktopEvent::Bell => Self::Bell,
             DesktopEvent::Error(message) => Self::Error { message },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use warpgate_core::DesktopEvent;
+
+    use super::ServerMessage;
+
+    #[test]
+    fn sound_is_not_sent_to_the_browser() {
+        assert!(
+            ServerMessage::from_event(DesktopEvent::Audio(Bytes::from_static(&[0; 4]))).is_none()
+        );
     }
 }

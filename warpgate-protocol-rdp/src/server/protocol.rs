@@ -40,6 +40,8 @@ pub enum Input {
     },
     /// The target asked for the viewer's own default pointer.
     DefaultCursor,
+    /// A block of the target's sound (PCM in [`warpgate_core::DESKTOP_AUDIO_FORMAT`]).
+    Audio(Bytes),
     Shutdown,
 }
 

@@ -10,7 +10,7 @@ on:
     branches: [main]
 
 env:
-  TAG: 0.30.0-beta.1-lab.5
+  TAG: 0.30.0-beta.2-lab.6
 
 jobs:
   image:

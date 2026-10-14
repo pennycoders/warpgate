@@ -427,6 +427,7 @@ impl DesktopRecorder {
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::Bell
+            | DesktopEvent::Audio(_)
             | DesktopEvent::Error(_) => return Ok(()),
         }
 

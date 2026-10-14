@@ -253,6 +253,7 @@ impl Framebuffer {
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::Bell
+            | DesktopEvent::Audio(_)
             | DesktopEvent::Error(_) => {}
         }
     }
@@ -495,6 +496,7 @@ mod tests {
             height: 1,
         });
         fb.apply(&DesktopEvent::Bell);
+        fb.apply(&DesktopEvent::Audio(bytes::Bytes::from_static(&[0; 4])));
         fb.apply(&DesktopEvent::Error("boom".into()));
         assert_eq!(fb.size(), (1, 1));
     }
