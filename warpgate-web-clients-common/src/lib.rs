@@ -298,7 +298,8 @@ pub async fn register_provisional_web_client_session(
     Ok(server_handle)
 }
 
-/// `connect` connects to target and relays until the backend is done
+/// `connect` connects to target and relays until the backend is done, returning why the
+/// target ended the session when it said so
 pub async fn run_web_client_lifecycle<S, M, O, E, Fut>(
     session: &Arc<S>,
     registry: ClientManager<S>,
@@ -311,7 +312,7 @@ pub async fn run_web_client_lifecycle<S, M, O, E, Fut>(
     M: Sheddable + From<SessionPhase>,
     O: Send + Sync,
     E: Display + UserFacingReason,
-    Fut: Future<Output = Result<(), E>>,
+    Fut: Future<Output = Result<Option<String>, E>>,
 {
     let _cancel_on_exit = session.cancellation().clone().drop_guard();
     let cancel = session.cancellation();
@@ -326,6 +327,7 @@ pub async fn run_web_client_lifecycle<S, M, O, E, Fut>(
                 Err(error) if !cancel.is_cancelled() => {
                     (CloseReason::Error, Some(error.user_facing_reason()))
                 }
+                Ok(message) if !cancel.is_cancelled() => (CloseReason::Disconnected, message),
                 // The backend ended because we told it to.
                 _ => (CloseReason::Disconnected, None),
             }

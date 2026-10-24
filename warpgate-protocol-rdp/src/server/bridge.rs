@@ -43,6 +43,7 @@ async fn frame_bridge(
         tx
     });
 
+    let mut end = None;
     while let Some(event) = event_rx.recv().await {
         if let Some(record_tx) = &record_tx {
             // Best-effort: recording must never stall the live path, so drop under overload.
@@ -70,8 +71,17 @@ async fn frame_bridge(
             DesktopEvent::DefaultCursor => ServerInput::DefaultCursor,
             DesktopEvent::Audio(data) => ServerInput::Audio(data),
             DesktopEvent::State(DesktopState::Disconnected) => {
-                let _ = server_in.send(ServerInput::Shutdown).await;
+                let shutdown = match end {
+                    Some(code) => ServerInput::Disconnect(code),
+                    None => ServerInput::Shutdown,
+                };
+                let _ = server_in.send(shutdown).await;
                 return;
+            }
+            DesktopEvent::Ended(reason) => {
+                info!(message = %reason.message, code = ?reason.rdp_error_info, "RDP target ended the session");
+                end = reason.rdp_error_info;
+                continue;
             }
             DesktopEvent::Error(message) => {
                 warn!(%message, "RDP target reported an error");
@@ -132,10 +142,10 @@ pub(super) async fn connect_backend(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use tokio::sync::mpsc;
-    use warpgate_core::{DesktopEvent, DesktopState};
+    use tokio::sync::mpsc::{self, channel};
+    use warpgate_core::{DesktopEndReason, DesktopEvent, DesktopState};
 
-    use super::frame_bridge;
+    use super::{ServerInput, frame_bridge};
     use crate::server::protocol::Input;
 
     #[tokio::test]
@@ -164,5 +174,46 @@ mod tests {
             matches!(server_rx.recv().await, Some(Input::Audio(data)) if data[..] == [1, 2, 3, 4])
         );
         assert!(matches!(server_rx.recv().await, Some(Input::Shutdown)));
+    }
+
+    async fn shutdown_after(events: Vec<DesktopEvent>) -> ServerInput {
+        let (event_tx, event_rx) = channel(8);
+        let (server_in, mut server_rx) = channel(8);
+        for event in events {
+            event_tx.send(event).await.unwrap();
+        }
+        event_tx
+            .send(DesktopEvent::State(DesktopState::Disconnected))
+            .await
+            .unwrap();
+        frame_bridge(event_rx, server_in, None).await;
+        server_rx.recv().await.unwrap()
+    }
+
+    fn ended(rdp_error_info: Option<u32>) -> DesktopEvent {
+        DesktopEvent::Ended(DesktopEndReason {
+            message: "ended".into(),
+            rdp_error_info,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_target_reason_ends_the_viewer_session() {
+        assert!(matches!(
+            shutdown_after(vec![ended(Some(5))]).await,
+            ServerInput::Disconnect(5)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_target_that_gives_no_code_still_shuts_the_viewer_session() {
+        assert!(matches!(
+            shutdown_after(vec![ended(None)]).await,
+            ServerInput::Shutdown
+        ));
+        assert!(matches!(
+            shutdown_after(vec![]).await,
+            ServerInput::Shutdown
+        ));
     }
 }

@@ -11,13 +11,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use ironrdp::core::decode;
 use ironrdp::displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+use ironrdp::pdu::rdp::server_error_info::ServerSetErrorInfoPdu;
 use ironrdp_server::tokio_rustls::TlsAcceptor;
 use ironrdp_server::tokio_rustls::rustls::ServerConfig as TlsServerConfig;
 use ironrdp_server::{
     BitmapUpdate, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
     DesktopSize, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RGBAPointer, RdpServer,
-    RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
+    RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -99,20 +101,10 @@ where
 
     let clipboard = ViewerClipboard::new(out_tx.clone());
     let sound = ViewerSound::new();
-
-    let router = tokio::spawn(
-        route_input(
-            in_rx,
-            frame_tx,
-            DisplayRouteState {
-                size: Arc::clone(&size),
-                out: out_tx.clone(),
-            },
-            clipboard.clone(),
-            sound.clone(),
-        )
-        .in_current_span(),
-    );
+    let display_route = DisplayRouteState {
+        size: Arc::clone(&size),
+        out: out_tx.clone(),
+    };
 
     let display = DisplayHandler {
         size,
@@ -142,10 +134,22 @@ where
         // viewer's requested resolution and pins the session to `size()`'s seed.
         .with_honor_client_desktop_size(true)
         .with_credential_validator(Some(validator))
-        .with_cliprdr_factory(Some(Box::new(clipboard)))
+        .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
         // Offered to every viewer: the target is not known yet when channels are joined.
-        .with_sound_factory(Some(Box::new(sound)))
+        .with_sound_factory(Some(Box::new(sound.clone())))
         .build();
+
+    let router = tokio::spawn(
+        route_input(
+            in_rx,
+            frame_tx,
+            display_route,
+            clipboard,
+            sound,
+            server.event_sender().clone(),
+        )
+        .in_current_span(),
+    );
 
     if let Err(error) = server.run_connection(stream).await {
         // A session-level error (e.g. viewer disconnect) is not a failure of the gateway:
@@ -194,6 +198,7 @@ async fn route_input(
     display: DisplayRouteState,
     clipboard: ViewerClipboard,
     sound: ViewerSound,
+    server_events: mpsc::UnboundedSender<ServerEvent>,
 ) {
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -250,6 +255,17 @@ async fn route_input(
             }
             Input::Audio(data) => sound.play(&data),
             Input::Shutdown => break,
+            Input::Disconnect(code) => {
+                match decode::<ServerSetErrorInfoPdu>(&code.to_le_bytes()) {
+                    Ok(pdu) if server_events.send(ServerEvent::Disconnect(pdu.0)).is_ok() => {
+                        // Ending the display before the server has sent the reason would
+                        // close the session without it.
+                        frame_tx.closed().await;
+                    }
+                    _ => warn!(code, "Could not pass the disconnect reason to the viewer"),
+                }
+                break;
+            }
         }
     }
 }
@@ -714,6 +730,106 @@ mod desktop_size_tests {
         );
         assert_eq!(display.size().await, size(1920, 1080));
         assert!(events.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_server::{DesktopSize, DisplayUpdate, ServerEvent};
+    use tokio::sync::{Mutex, mpsc};
+
+    use super::{DisplayRouteState, Input, ViewerClipboard, ViewerSound, route_input};
+
+    struct Router {
+        input: mpsc::Sender<Input>,
+        events: mpsc::UnboundedReceiver<ServerEvent>,
+        frames: mpsc::Receiver<DisplayUpdate>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn router() -> Router {
+        let (input, rx) = mpsc::channel(4);
+        let (frame_tx, frames) = mpsc::channel(4);
+        let (out, _) = mpsc::unbounded_channel();
+        let (server_events, events) = mpsc::unbounded_channel();
+        let display = DisplayRouteState {
+            size: Arc::new(Mutex::new(DesktopSize {
+                width: 800,
+                height: 600,
+            })),
+            out: out.clone(),
+        };
+        let task = tokio::spawn(route_input(
+            rx,
+            frame_tx,
+            display,
+            ViewerClipboard::new(out),
+            ViewerSound::new(),
+            server_events,
+        ));
+        Router {
+            input,
+            events,
+            frames,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_viewer_is_told_why_and_the_display_outlives_the_reason() {
+        let mut router = router();
+        router.input.send(Input::Disconnect(5)).await.unwrap();
+
+        assert!(matches!(
+            router.events.recv().await,
+            Some(ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::DisconnectedByOtherconnection
+            )))
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !router.task.is_finished(),
+            "the display must stay open until the server has ended the session"
+        );
+
+        drop(router.frames);
+        tokio::time::timeout(Duration::from_secs(5), router.task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_code_still_ends_the_session() {
+        let mut router = router();
+        router
+            .input
+            .send(Input::Disconnect(0xDEAD_BEEF))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), router.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(router.events.try_recv().is_err());
+        drop(router.frames);
+    }
+
+    #[tokio::test]
+    async fn a_plain_shutdown_sends_no_reason() {
+        let mut router = router();
+        router.input.send(Input::Shutdown).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), router.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(router.events.try_recv().is_err());
     }
 }
 

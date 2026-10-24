@@ -1,7 +1,7 @@
-diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/active_stage.rs
---- ironrdp-session-0.11.0/src/active_stage.rs	2006-07-24 02:21:28.000000000 +0100
-+++ base/src/active_stage.rs	2026-09-23 00:40:54.718470852 +0100
-@@ -3,14 +3,16 @@
+diff -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/active_stage.rs
+--- ironrdp-session-0.11.0/src/active_stage.rs	2026-10-14 22:51:38.124665669 +0300
++++ base/src/active_stage.rs	2026-10-14 22:51:38.132389877 +0300
+@@ -3,14 +3,17 @@
  use ironrdp_bulk::BulkCompressor;
  use ironrdp_core::{ReadCursor, WriteBuf};
  use ironrdp_displaycontrol::client::DisplayControlClient;
@@ -16,11 +16,12 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
  use ironrdp_pdu::rdp::client_info::CompressionType as PduCompressionType;
  use ironrdp_pdu::rdp::headers::ShareDataPdu;
  use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
++use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 +use ironrdp_pdu::rdp::session_info::SaveSessionInfoPdu;
  use ironrdp_pdu::slow_path::{self, GraphicsUpdateType};
  use ironrdp_pdu::{Action, mcs};
  use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
-@@ -34,6 +36,7 @@
+@@ -34,6 +37,7 @@
      x224_processor: x224::Processor,
      fast_path_processor: fast_path::Processor,
      enable_server_pointer: bool,
@@ -28,7 +29,7 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
  }
  
  /// Builder for [`ActiveStage`].
-@@ -104,6 +107,7 @@
+@@ -104,6 +108,7 @@
              x224_processor,
              fast_path_processor,
              enable_server_pointer,
@@ -36,7 +37,7 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
          }
      }
  }
-@@ -124,15 +128,19 @@
+@@ -124,15 +129,19 @@
              return Ok(Vec::new());
          }
  
@@ -63,7 +64,7 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
  
          // If pointer rendering is disabled - we can skip the rest
          if !self.enable_server_pointer {
-@@ -197,6 +205,28 @@
+@@ -197,6 +206,28 @@
                      }
                  }
  
@@ -92,7 +93,7 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
                  (stage_outputs, processor_updates)
              }
          };
-@@ -222,6 +252,23 @@
+@@ -222,6 +253,23 @@
              }
          }
  
@@ -116,7 +117,7 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
          Ok(stage_outputs)
      }
  
-@@ -229,10 +276,11 @@
+@@ -229,10 +277,11 @@
          self.fast_path_processor = processor;
      }
  
@@ -129,7 +130,7 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
      }
  
      pub fn set_enable_server_pointer(&mut self, enable_server_pointer: bool) {
-@@ -270,6 +318,10 @@
+@@ -270,6 +319,10 @@
          self.x224_processor.get_dvc::<T>()
      }
  
@@ -140,7 +141,7 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
      pub fn get_dvc_by_channel_id(&mut self, channel_id: u32) -> Option<&DynamicVirtualChannel> {
          self.x224_processor.get_dvc_by_channel_id(channel_id)
      }
-@@ -369,6 +421,10 @@
+@@ -369,6 +422,10 @@
      ///
      /// [\[MS-RDPBCGR\] 2.2.14.1.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/228ffc5c-b60c-4d3e-9781-ac613f822fdf
      AutoDetect(AutoDetectRequest),
@@ -151,7 +152,16 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
  }
  
  impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
-@@ -392,6 +448,7 @@
+@@ -384,7 +441,7 @@
+                         mcs::DisconnectReason::UserRequested => GracefulDisconnectReason::UserInitiated,
+                         other => GracefulDisconnectReason::Other(other.description().to_owned()),
+                     },
+-                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::Other(info.description()),
++                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::ErrorInfo(info),
+                 };
+ 
+                 Ok(Self::Terminate(desc))
+@@ -392,6 +449,7 @@
              x224::ProcessorOutput::DeactivateAll => Ok(Self::DeactivateAll),
              x224::ProcessorOutput::MultitransportRequest(pdu) => Ok(Self::MultitransportRequest(pdu)),
              x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
@@ -159,7 +169,24 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
              // GraphicsUpdate and PointerUpdate are consumed in ActiveStage::process()
              // before reaching this conversion.
              x224::ProcessorOutput::GraphicsUpdate(_) | x224::ProcessorOutput::PointerUpdate(_) => Err(
-@@ -467,3 +524,57 @@
+@@ -407,6 +465,8 @@
+ pub enum GracefulDisconnectReason {
+     UserInitiated,
+     ServerInitiated,
++    /// The server explained the disconnection with a Set Error Info PDU.
++    ErrorInfo(ErrorInfo),
+     Other(String),
+ }
+ 
+@@ -415,6 +475,7 @@
+         match self {
+             GracefulDisconnectReason::UserInitiated => "user initiated disconnect".to_owned(),
+             GracefulDisconnectReason::ServerInitiated => "server initiated disconnect".to_owned(),
++            GracefulDisconnectReason::ErrorInfo(info) => info.description(),
+             GracefulDisconnectReason::Other(description) => description.clone(),
+         }
+     }
+@@ -467,3 +528,57 @@
      let pointer = slow_path::decode_slow_path_pointer(&mut src).map_err(SessionError::decode)?;
      fast_path_processor.process_pointer_update(image, pointer)
  }
@@ -217,9 +244,9 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/active_stage.rs base/src/acti
 +    }
 +    Ok(dirty)
 +}
-diff '--color=auto' -ru ironrdp-session-0.11.0/src/fast_path.rs base/src/fast_path.rs
---- ironrdp-session-0.11.0/src/fast_path.rs	2006-07-24 02:21:28.000000000 +0100
-+++ base/src/fast_path.rs	2026-09-23 00:40:54.718571425 +0100
+diff -ru ironrdp-session-0.11.0/src/fast_path.rs base/src/fast_path.rs
+--- ironrdp-session-0.11.0/src/fast_path.rs	2026-10-14 22:51:38.122812733 +0300
++++ base/src/fast_path.rs	2026-10-14 22:51:38.131156780 +0300
 @@ -21,6 +21,32 @@
  use crate::pointer::PointerCache;
  use crate::{SessionError, SessionErrorExt as _, SessionResult, custom_err, reason_err, rfx};
@@ -387,9 +414,9 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/fast_path.rs base/src/fast_pa
                      }
                  }
              };
-diff '--color=auto' -ru ironrdp-session-0.11.0/src/image.rs base/src/image.rs
---- ironrdp-session-0.11.0/src/image.rs	2006-07-24 02:21:28.000000000 +0100
-+++ base/src/image.rs	2026-09-23 00:40:54.718799374 +0100
+diff -ru ironrdp-session-0.11.0/src/image.rs base/src/image.rs
+--- ironrdp-session-0.11.0/src/image.rs	2026-10-14 22:51:38.122364395 +0300
++++ base/src/image.rs	2026-10-14 22:51:38.130882319 +0300
 @@ -8,7 +8,7 @@
  use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
  use tracing::{debug, trace};
@@ -459,9 +486,9 @@ diff '--color=auto' -ru ironrdp-session-0.11.0/src/image.rs base/src/image.rs
      pub(crate) fn apply_rgba32(
          &mut self,
          rgba32: &[u8],
-diff '--color=auto' -ru ironrdp-session-0.11.0/src/x224/mod.rs base/src/x224/mod.rs
---- ironrdp-session-0.11.0/src/x224/mod.rs	2006-07-24 02:21:28.000000000 +0100
-+++ base/src/x224/mod.rs	2026-09-23 00:40:54.718735460 +0100
+diff -ru ironrdp-session-0.11.0/src/x224/mod.rs base/src/x224/mod.rs
+--- ironrdp-session-0.11.0/src/x224/mod.rs	2026-10-14 22:51:38.123844452 +0300
++++ base/src/x224/mod.rs	2026-10-14 22:51:38.131851538 +0300
 @@ -1,10 +1,11 @@
  use ironrdp_core::{WriteBuf, decode};
 -use ironrdp_dvc::{DrdynvcClient, DvcProcessor, DynamicVirtualChannel};

@@ -215,11 +215,15 @@ pub const fn phase_for(state: DesktopState) -> Option<LiveSessionPhase> {
 }
 
 impl ServerMessage {
-    /// `None` for state changes, which are reported as a session phase instead.
+    /// `None` for state changes and the end of the session, which are reported as a session
+    /// phase instead.
     pub fn from_event(event: DesktopEvent) -> Option<Self> {
         Some(match event {
             // The browser shows its own cursor.
-            DesktopEvent::State(_) | DesktopEvent::DefaultCursor | DesktopEvent::Audio(_) => {
+            DesktopEvent::State(_)
+            | DesktopEvent::Ended(_)
+            | DesktopEvent::DefaultCursor
+            | DesktopEvent::Audio(_) => {
                 return None;
             }
             DesktopEvent::Resize { width, height } => Self::Resize { width, height },
@@ -254,7 +258,7 @@ impl ServerMessage {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use warpgate_core::DesktopEvent;
+    use warpgate_core::{DesktopEndReason, DesktopEvent};
 
     use super::ServerMessage;
 
@@ -263,5 +267,15 @@ mod tests {
         assert!(
             ServerMessage::from_event(DesktopEvent::Audio(Bytes::from_static(&[0; 4]))).is_none()
         );
+    }
+
+    /// The end reaches the browser as the session's closing phase, not as a message.
+    #[test]
+    fn the_end_of_the_session_is_not_a_frame_message() {
+        let ended = DesktopEvent::Ended(DesktopEndReason {
+            message: "Another user connected to the server.".into(),
+            rdp_error_info: Some(5),
+        });
+        assert!(ServerMessage::from_event(ended).is_none());
     }
 }
