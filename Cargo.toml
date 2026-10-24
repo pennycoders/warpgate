@@ -41,6 +41,7 @@ exclude = [
     "vendor/ironrdp-egfx",
     "vendor/ironrdp-graphics",
     "vendor/ironrdp-pdu",
+    "vendor/ironrdp-rdpsnd",
     "vendor/ironrdp-server",
     "vendor/ironrdp-session",
     "vendor/picky",
@@ -61,6 +62,7 @@ ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
 ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 ironrdp-pdu = { path = "vendor/ironrdp-pdu" }
+ironrdp-rdpsnd = { path = "vendor/ironrdp-rdpsnd" }
 ironrdp-server = { path = "vendor/ironrdp-server" }
 ironrdp-session = { path = "vendor/ironrdp-session" }
 picky = { path = "vendor/picky" }

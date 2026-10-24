@@ -4,6 +4,7 @@
 //! translates both directions into the shared [`DesktopEvent`]/[`DesktopInput`] vocabulary,
 //! so the web-desktop manager and the native RDP server front end both work unchanged.
 
+mod audio;
 mod input;
 mod logon;
 mod tls;
@@ -31,6 +32,9 @@ use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabi
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::pdu::rdp::headers::ShareDataPdu;
 use ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp::rdpdr::Rdpdr;
+use ironrdp::rdpdr::backend::noop::NoopRdpdrBackend;
+use ironrdp::rdpsnd::client::Rdpsnd;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
@@ -46,6 +50,8 @@ use warpgate_core::{
     DesktopInput, DesktopRect, DesktopState, check_desktop_size, within_deadline,
 };
 
+pub use self::audio::pcm_format;
+use self::audio::{AudioForwarder, dynamic_audio};
 pub(crate) use self::logon::LogonWatcher;
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
 use crate::desktop_size::bound_desktop_size;
@@ -117,6 +123,7 @@ pub async fn run(
             options.tls_security,
             options.kdc_url.clone().filter(|url| !url.is_empty()),
             clipboard.backend(),
+            options.audio_playback.then(|| event_tx.clone()),
         ),
     )
     .await?;
@@ -752,7 +759,7 @@ fn build_config(
         // server has nothing to log the session on with and shows its sign-in screen.
         autologon: !options.interactive_logon,
         credssp_credentialless: options.interactive_logon,
-        enable_audio_playback: false,
+        enable_audio_playback: options.audio_playback,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -800,6 +807,41 @@ impl GraphicsPipelineHandler for GraphicsPipelineOutput {
     }
 }
 
+fn target_connector(
+    config: connector::Config,
+    client_addr: std::net::SocketAddr,
+    clipboard: TextClipboard<ClientClipboardSink>,
+    audio: Option<Sender<DesktopEvent>>,
+) -> connector::ClientConnector {
+    // Advertise the Display Control DVC so viewer-driven resolution changes can be pushed
+    // to the target mid-session (MS-RDPEDISP). The capabilities callback has nothing to
+    // reply with; `ActiveStage::encode_resize` drives the channel once it is ready.
+    let mut drdynvc = DrdynvcClient::new()
+        .with_dynamic_channel(DisplayControlClient::new(|_caps| Ok(Vec::new())));
+    if let Some(events) = &audio {
+        drdynvc = drdynvc.with_dynamic_channel(dynamic_audio(AudioForwarder::new(events.clone())));
+    }
+    if config.support_dyn_vc_gfx_protocol {
+        // With no H.264 decoder the client advertises only the non-AVC capability sets it
+        // can actually decode.
+        drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(
+            Box::new(GraphicsPipelineOutput::default()),
+            None,
+        ));
+    }
+    let mut connector = connector::ClientConnector::new(config, client_addr)
+        .with_static_channel(drdynvc)
+        .with_static_channel(CliprdrClient::new(Box::new(clipboard)));
+    if let Some(events) = audio {
+        // Windows starts sound only once the client has set up device redirection.
+        let computer_name = connector.config.client_name.clone();
+        connector = connector
+            .with_static_channel(Rdpsnd::new(Box::new(AudioForwarder::new(events))))
+            .with_static_channel(Rdpdr::new(Box::new(NoopRdpdrBackend), computer_name));
+    }
+    connector
+}
+
 async fn connect(
     config: connector::Config,
     server_name: String,
@@ -808,6 +850,7 @@ async fn connect(
     tls_security: warpgate_common::RdpTlsSecurity,
     kdc_url: Option<String>,
     clipboard: TextClipboard<ClientClipboardSink>,
+    audio: Option<Sender<DesktopEvent>>,
 ) -> Result<(ConnectionResult, Framed), DesktopConnectionError> {
     // Without a Kerberos config IronRDP runs CredSSP over NTLM only.
     let kerberos_config = kdc_url
@@ -827,22 +870,7 @@ async fn connect(
         .map_err(DesktopConnectionError::Io)?;
 
     let mut framed = TokioFramed::new(tcp_stream);
-    // Advertise the Display Control DVC so viewer-driven resolution changes can be pushed
-    // to the target mid-session (MS-RDPEDISP). The capabilities callback has nothing to
-    // reply with; `ActiveStage::encode_resize` drives the channel once it is ready.
-    let mut drdynvc = DrdynvcClient::new()
-        .with_dynamic_channel(DisplayControlClient::new(|_caps| Ok(Vec::new())));
-    if config.support_dyn_vc_gfx_protocol {
-        // With no H.264 decoder the client advertises only the non-AVC capability sets it
-        // can actually decode.
-        drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(
-            Box::new(GraphicsPipelineOutput::default()),
-            None,
-        ));
-    }
-    let mut connector = connector::ClientConnector::new(config, client_addr)
-        .with_static_channel(drdynvc)
-        .with_static_channel(CliprdrClient::new(Box::new(clipboard)));
+    let mut connector = target_connector(config, client_addr, clipboard, audio);
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
@@ -904,7 +932,72 @@ mod tests {
     use ironrdp::session::image::DecodedImage;
     use warpgate_core::{DesktopEvent, DesktopRect};
 
-    use super::{GraphicsPipelineOutput, connector, encode_resized_keyframe};
+    use super::{GraphicsPipelineOutput, build_config, connector, encode_resized_keyframe};
+
+    #[test]
+    fn the_target_plays_sound_only_when_the_option_is_on() {
+        let mut options: warpgate_common::TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        assert!(!build_config(&options, "pw", 1024, 768).enable_audio_playback);
+        options.audio_playback = true;
+        assert!(build_config(&options, "pw", 1024, 768).enable_audio_playback);
+    }
+
+    /// FreeRDP's sound server (GNOME Remote Desktop) opens AUDIO_PLAYBACK_DVC and sends its
+    /// formats before it reads the answer, so data can arrive on a channel the client refused.
+    #[test]
+    fn data_on_a_refused_dynamic_channel_does_not_end_the_session() {
+        use ironrdp::core::encode_vec;
+        use ironrdp::dvc::pdu::{
+            CapabilitiesRequestPdu, CapsVersion, CreateRequestPdu, DataPdu, DrdynvcDataPdu,
+            DrdynvcServerPdu,
+        };
+        use ironrdp::svc::SvcProcessor as _;
+
+        let mut drdynvc = ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+            ironrdp::displaycontrol::client::DisplayControlClient::new(|_caps| Ok(Vec::new())),
+        );
+        let mut process = |pdu: DrdynvcServerPdu| drdynvc.process(&encode_vec(&pdu).unwrap());
+        process(DrdynvcServerPdu::Capabilities(CapabilitiesRequestPdu::new(
+            CapsVersion::V3,
+            None,
+        )))
+        .unwrap();
+        process(DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            3,
+            "AUDIO_PLAYBACK_DVC".to_owned(),
+        )))
+        .unwrap();
+        let formats = DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(3, vec![7; 16])));
+        assert!(process(formats).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sound_comes_with_device_redirection_for_windows() {
+        use ironrdp::rdpdr::Rdpdr;
+        use ironrdp::rdpsnd::client::Rdpsnd;
+
+        let options: warpgate_common::TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        let channels = |audio: Option<tokio::sync::mpsc::Sender<DesktopEvent>>| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let clipboard = crate::clipboard::Clipboard::deferred(super::ClientClipboardSink(tx));
+            let connector = super::target_connector(
+                build_config(&options, "pw", 1024, 768),
+                "127.0.0.1:1".parse().unwrap(),
+                clipboard.backend(),
+                audio,
+            );
+            (
+                connector.static_channels.get_by_type::<Rdpsnd>().is_some(),
+                connector.static_channels.get_by_type::<Rdpdr>().is_some(),
+            )
+        };
+
+        assert_eq!(channels(None), (false, false));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert_eq!(channels(Some(tx)), (true, true));
+    }
 
     #[test]
     fn unhandled_graphics_are_reported_once_per_codec() {

@@ -40,6 +40,7 @@ pub enum Input {
     },
     /// The target asked for the viewer's own default pointer.
     DefaultCursor,
+    Audio(Bytes),
     Shutdown,
 }
 

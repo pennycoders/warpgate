@@ -28,6 +28,7 @@ use warpgate_desktop_ui::DEFAULT_SIZE;
 
 use super::clipboard::ViewerClipboard;
 use super::protocol::{AuthVerdict, Event, Input};
+use super::sound::ViewerSound;
 use crate::desktop_size::bound_desktop_size;
 #[cfg(test)]
 use crate::desktop_size::{MAX_DESKTOP_DIM, MAX_FRAME_BYTES, MIN_DESKTOP_DIM};
@@ -97,6 +98,7 @@ where
     }));
 
     let clipboard = ViewerClipboard::new(out_tx.clone());
+    let sound = ViewerSound::new();
 
     let router = tokio::spawn(
         route_input(
@@ -107,6 +109,7 @@ where
                 out: out_tx.clone(),
             },
             clipboard.clone(),
+            sound.clone(),
         )
         .in_current_span(),
     );
@@ -140,6 +143,8 @@ where
         .with_honor_client_desktop_size(true)
         .with_credential_validator(Some(validator))
         .with_cliprdr_factory(Some(Box::new(clipboard)))
+        // Offered to every viewer: the target is not known yet when channels are joined.
+        .with_sound_factory(Some(Box::new(sound)))
         .build();
 
     if let Err(error) = server.run_connection(stream).await {
@@ -188,6 +193,7 @@ async fn route_input(
     frame_tx: mpsc::Sender<DisplayUpdate>,
     display: DisplayRouteState,
     clipboard: ViewerClipboard,
+    sound: ViewerSound,
 ) {
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -242,6 +248,7 @@ async fn route_input(
                     break;
                 }
             }
+            Input::Audio(data) => sound.play(&data),
             Input::Shutdown => break,
         }
     }

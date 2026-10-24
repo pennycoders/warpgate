@@ -18,6 +18,9 @@ ironrdp = { version = "0.17", features = [
     "input",
     "dvc",
     "displaycontrol",
+    "rdpdr",
+    "rdpsnd",
+    "svc",
 ] }
 ironrdp-egfx = "0.3"
 ironrdp-server = "0.13"
@@ -54,6 +57,7 @@ warpgate-tls = { path = "../warpgate-tls" }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
