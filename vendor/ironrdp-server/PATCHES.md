@@ -40,6 +40,12 @@ Desktop drew every bitmap at a quarter of its width and rejected widths whose qu
 not a multiple of 4 ("bad width - must be divisible by 4"). `src/encoder/bitmap.rs` sends
 the row length in bytes.
 
+## Pointer AND mask
+
+`DisplayUpdate::RGBAPointer` went out with an empty AND mask, which MS-RDPBCGR
+2.2.9.1.1.4.4 does not allow; Jump Desktop rejects the update ("bad length for And mask").
+`src/encoder/mod.rs` sends a 1 bpp mask, set where the pointer is fully transparent.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
