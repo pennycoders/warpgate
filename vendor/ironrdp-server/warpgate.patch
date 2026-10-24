@@ -1,7 +1,19 @@
 diff -ru ironrdp-server-0.13.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
 --- ironrdp-server-0.13.0/src/encoder/bitmap.rs	2006-07-24 01:21:28.000000000 +0000
-+++ base/src/encoder/bitmap.rs	2026-10-14 20:24:58.218580785 +0000
-@@ -76,7 +76,9 @@
++++ base/src/encoder/bitmap.rs	2026-10-14 20:24:58.318579623 +0000
+@@ -47,7 +47,10 @@
+         BitmapUpdateData::encode_header(total, &mut cursor).map_err(BitmapEncodeError::Encode)?;
+ 
+         for (i, chunk) in chunks.enumerate() {
+-            let height = cast_int!("bitmap height", chunk.len() / stride).map_err(BitmapEncodeError::Encode)?;
++            // A sub-rectangle's data ends at its last pixel, not at a full stride, so the
++            // last row of the last chunk is short: round up or that row is lost.
++            let height =
++                cast_int!("bitmap height", chunk.len().div_ceil(stride)).map_err(BitmapEncodeError::Encode)?;
+             let i: u16 = cast_int!("chunk idx", i).map_err(BitmapEncodeError::Encode)?;
+             let top = bitmap.y + i * chunk_height;
+ 
+@@ -76,7 +79,9 @@
                  compression_flags: Compression::BITMAP_COMPRESSION,
                  compressed_data_header: Some(bitmap::CompressedDataHeader {
                      main_body_size: cast_length!("main body size", len).map_err(BitmapEncodeError::Encode)?,

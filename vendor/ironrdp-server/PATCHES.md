@@ -46,6 +46,15 @@ the row length in bytes.
 2.2.9.1.1.4.4 does not allow; Jump Desktop rejects the update ("bad length for And mask").
 `src/encoder/mod.rs` sends a 1 bpp mask, set where the pointer is fully transparent.
 
+## Last row of a sub-rectangle
+
+`BitmapUpdate::sub` slices a changed region out of the frame with the frame's stride, so
+its data ends at the region's last pixel, short of a full stride. The legacy bitmap
+encoder counted rows as `len / stride`, which drops that last row: every region narrower
+than the screen went out one row short and one row high, leaving a stale row behind
+(horizontal lines in Jump Desktop while the screen changes). `src/encoder/bitmap.rs`
+rounds up.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
