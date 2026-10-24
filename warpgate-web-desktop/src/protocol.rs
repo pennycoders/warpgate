@@ -218,7 +218,8 @@ impl ServerMessage {
     /// `None` for state changes, which are reported as a session phase instead.
     pub fn from_event(event: DesktopEvent) -> Option<Self> {
         Some(match event {
-            DesktopEvent::State(_) => return None,
+            // The browser shows its own cursor.
+            DesktopEvent::State(_) | DesktopEvent::DefaultCursor => return None,
             DesktopEvent::Resize { width, height } => Self::Resize { width, height },
             DesktopEvent::RawImage { rect, data } => Self::RawImage {
                 rect: rect.into(),

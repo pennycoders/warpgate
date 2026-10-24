@@ -24,6 +24,7 @@ use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::graphics::pointer::DecodedPointer;
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
@@ -514,13 +515,44 @@ async fn process_outputs(
     report_size(image, reported_size, None, event_tx, abort_rx).await?;
 
     for out in outputs {
-        if let ActiveStageOutput::GraphicsUpdate(region) = out
-            && let Some(event) = encode_region(image, &region)
-        {
+        let event = match out {
+            ActiveStageOutput::GraphicsUpdate(region) => encode_region(image, &region),
+            ActiveStageOutput::PointerBitmap(pointer) => Some(cursor_event(&pointer)),
+            ActiveStageOutput::PointerHidden => Some(DesktopEvent::Cursor {
+                rect: DesktopRect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                data: Bytes::new(),
+            }),
+            ActiveStageOutput::PointerDefault => Some(DesktopEvent::DefaultCursor),
+            _ => None,
+        };
+        if let Some(event) = event {
             send_event(event_tx, abort_rx, event).await?;
         }
     }
     Ok(terminate)
+}
+
+/// A target pointer as a cursor event: the decoded pointer is RGBA with straight alpha,
+/// the event carries BGRA with the hotspot as the rectangle's origin.
+fn cursor_event(pointer: &DecodedPointer) -> DesktopEvent {
+    let mut data = pointer.bitmap_data.clone();
+    for pixel in data.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    DesktopEvent::Cursor {
+        rect: DesktopRect {
+            x: pointer.hotspot_x,
+            y: pointer.hotspot_y,
+            width: pointer.width,
+            height: pointer.height,
+        },
+        data: Bytes::from(data),
+    }
 }
 
 /// Tell the viewer the size of `image` if it changed since the viewer was last told, then
@@ -725,8 +757,10 @@ fn build_config(
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
         compression_type: None,
-        enable_server_pointer: false,
-        pointer_software_rendering: true,
+        // The target's pointer reaches the viewer as cursor events, drawn by the viewer
+        // itself, rather than painted into the framebuffer.
+        enable_server_pointer: true,
+        pointer_software_rendering: false,
         desktop_scale_factor: 0,
         multitransport_flags: None,
         // `connect` registers the Graphics Pipeline channel from this flag: advertising
@@ -922,5 +956,27 @@ mod tests {
                 data,
             }) if data.len() == 4 * 3 * 4 && data.iter().skip(3).step_by(4).all(|alpha| *alpha == 255)
         ));
+    }
+
+    #[test]
+    fn a_target_pointer_becomes_a_bgra_cursor_at_its_hotspot() {
+        use ironrdp::graphics::pointer::DecodedPointer;
+
+        let pointer = DecodedPointer {
+            width: 2,
+            height: 1,
+            hotspot_x: 1,
+            hotspot_y: 0,
+            bitmap_data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let DesktopEvent::Cursor { rect, data } = super::cursor_event(&pointer) else {
+            panic!("expected a cursor event");
+        };
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (1, 0, 2, 1),
+            "the rectangle's origin is the hotspot"
+        );
+        assert_eq!(&data[..], &[3, 2, 1, 4, 7, 6, 5, 8]);
     }
 }
