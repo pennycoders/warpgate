@@ -28,6 +28,18 @@ Desktop drew every bitmap at a quarter of its width and rejected widths whose qu
 not a multiple of 4 ("bad width - must be divisible by 4"). `src/encoder/bitmap.rs` sends
 the row length in bytes.
 
+## Bitmap widths that are not a multiple of 4 pixels
+
+Upstream `BitmapEncoder::encode` refuses a rectangle whose width is not a multiple of 4 pixels
+(`Width must be a multiple of 4`), and the error ends the connection. A target desktop of such a
+width, as after a viewer resizes or reconnects at a new size, ends the session at its first
+frame on the bitmap path.
+
+`warpgate.patch` pads each row to the next multiple of 4 pixels with copies of its last pixel
+and declares the padded width, while the destination rectangle keeps the real width, so the
+client clips the padding. The scan width above is that of the padded row. xrdp sends its bitmap
+updates the same way (`libxrdp_send_bitmap` in `libxrdp/libxrdp.c`).
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
