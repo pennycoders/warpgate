@@ -23,7 +23,7 @@ ironrdp = { version = "0.17", features = [
     "svc",
 ] }
 ironrdp-egfx = "0.3"
-ironrdp-server = "0.13"
+ironrdp-server = { version = "0.13", features = ["egfx"] }
 ironrdp-tokio = "0.10"
 libz-sys = { version = "1", features = ["static"] } # winscard (via sspi) links C zlib
 openssl = { version = "0.10", optional = true, features = ["vendored"] }

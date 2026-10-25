@@ -3794,6 +3794,7 @@ dependencies = [
  "ironrdp-displaycontrol",
  "ironrdp-dvc",
  "ironrdp-echo",
+ "ironrdp-egfx",
  "ironrdp-graphics",
  "ironrdp-pdu",
  "ironrdp-rdpsnd",

@@ -827,6 +827,10 @@ pub struct RdpConfig {
 
     #[serde(default)]
     pub key: String,
+
+    /// Offer native viewers the Graphics Pipeline (MS-RDPEGFX), which resizes without a reactivation.
+    #[serde(default = "_default_false")]
+    pub graphics_pipeline: bool,
 }
 
 impl Default for RdpConfig {
@@ -839,6 +843,7 @@ impl Default for RdpConfig {
             external_host: None,
             certificate: "".into(),
             key: "".into(),
+            graphics_pipeline: false,
         }
     }
 }
