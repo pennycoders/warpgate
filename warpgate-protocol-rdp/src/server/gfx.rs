@@ -3,8 +3,13 @@
 //! A resize then reaches the viewer as a ResetGraphics with a new surface instead of a
 //! deactivation-reactivation. Windows App needs that: after a reactivation it keeps
 //! drawing at the size it connected with.
+//!
+//! The output keeps the viewer's shape: a desktop of another shape (a target that keeps its
+//! own size) is centred in it between black bars, since Windows App stretches the output to
+//! its screen.
 
 use std::num::{NonZeroU16, NonZeroUsize};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -27,17 +32,26 @@ use tracing::{debug, warn};
 /// Past this many pending rectangles they are sent as their bounding box.
 const MAX_TILES: usize = 16;
 
+/// The largest output side a letterbox may grow to; past it the desktop is sent as it is.
+const MAX_OUTPUT: u32 = 8192;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Signal {
     Ready,
     Acknowledged,
     Closed,
+    /// The viewer's screen changed shape.
+    Viewer,
 }
 
 struct Shared {
     events: Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>,
     pipeline: Mutex<Option<GfxServerHandle>>,
     signals: mpsc::UnboundedSender<Signal>,
+    /// The viewer's screen size.
+    viewer: Mutex<Option<DesktopSize>>,
+    /// Where the desktop sits in the output, as `x << 16 | y`.
+    origin: AtomicU32,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -46,6 +60,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[derive(Clone)]
 pub(super) struct GraphicsFactory(Arc<Shared>);
+
+impl GraphicsFactory {
+    /// Records the viewer's screen size, which the output keeps the shape of.
+    pub(super) fn set_viewer(&self, size: DesktopSize) {
+        let changed = lock(&self.0.viewer).replace(size) != Some(size);
+        if changed {
+            let _ = self.0.signals.send(Signal::Viewer);
+        }
+    }
+
+    /// Maps a point on the viewer's output to the desktop.
+    pub(super) fn to_desktop(&self, x: u16, y: u16) -> (u16, u16) {
+        let origin = self.0.origin.load(Ordering::Relaxed);
+        let (left, top) = (
+            u16::try_from(origin >> 16).unwrap_or(0),
+            u16::try_from(origin & 0xffff).unwrap_or(0),
+        );
+        (x.saturating_sub(left), y.saturating_sub(top))
+    }
+}
 
 impl ServerEventSender for GraphicsFactory {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
@@ -97,6 +131,10 @@ pub(super) struct ViewerGraphics {
     size: DesktopSize,
     /// BGRA rows of `size`.
     canvas: Vec<u8>,
+    /// The viewer's output: the desktop letterboxed to the viewer's shape.
+    output: DesktopSize,
+    /// Where the desktop sits in `output`.
+    origin: (u16, u16),
     surface: Option<u16>,
     encoder: ClearCodecEncoder,
     dirty: Vec<ExclusiveRectangle>,
@@ -117,10 +155,14 @@ impl ViewerGraphics {
                 events: Mutex::default(),
                 pipeline: Mutex::default(),
                 signals: signals_tx,
+                viewer: Mutex::default(),
+                origin: AtomicU32::new(0),
             }),
             signals,
             size: empty,
             canvas: Vec::new(),
+            output: empty,
+            origin: (0, 0),
             surface: None,
             encoder: ClearCodecEncoder::new(),
             dirty: Vec::new(),
@@ -149,6 +191,10 @@ impl ViewerGraphics {
                 Vec::new()
             }
             Signal::Closed => self.close(size),
+            Signal::Viewer => {
+                self.reshape();
+                Vec::new()
+            }
         }
     }
 
@@ -180,7 +226,13 @@ impl ViewerGraphics {
             return false;
         }
         if rect.right > rect.left && rect.bottom > rect.top {
-            self.dirty.push(rect);
+            let (left, top) = self.origin;
+            self.dirty.push(ExclusiveRectangle {
+                left: rect.left + left,
+                top: rect.top + top,
+                right: rect.right + left,
+                bottom: rect.bottom + top,
+            });
         }
         self.flush();
         true
@@ -192,11 +244,16 @@ impl ViewerGraphics {
         if self.surface.is_none() {
             return false;
         }
-        if let Some(pipeline) = self.pipeline() {
-            self.surface = reset(&mut lock(&pipeline), size);
-        }
-        self.flush();
+        self.reset();
         true
+    }
+
+    /// Letterboxes the desktop to the viewer's new shape, if that moves it.
+    fn reshape(&mut self) {
+        let before = (self.output, self.origin);
+        if self.surface.is_some() && self.layout() != before {
+            self.reset();
+        }
     }
 
     fn open(&mut self, size: DesktopSize) {
@@ -204,18 +261,35 @@ impl ViewerGraphics {
         self.committed = size;
         // A (re)negotiation starts the viewer's ClearCodec state from scratch.
         self.encoder = ClearCodecEncoder::new();
+        self.reset();
+    }
+
+    /// Resets the viewer's graphics to the letterboxed output and sends all of it.
+    fn reset(&mut self) {
+        self.layout();
         let Some(pipeline) = self.pipeline() else {
             return;
         };
-        self.surface = reset(&mut lock(&pipeline), size);
+        self.surface = reset(&mut lock(&pipeline), self.output);
+        let (left, top) = self.origin;
+        self.shared
+            .origin
+            .store(u32::from(left) << 16 | u32::from(top), Ordering::Relaxed);
         self.dirty = vec![self.full()];
         self.flush();
+    }
+
+    fn layout(&mut self) -> (DesktopSize, (u16, u16)) {
+        let viewer = *lock(&self.shared.viewer);
+        (self.output, self.origin) = letterbox(self.size, viewer);
+        (self.output, self.origin)
     }
 
     fn close(&mut self, size: DesktopSize) -> Vec<DisplayUpdate> {
         if self.surface.take().is_none() {
             return Vec::new();
         }
+        self.shared.origin.store(0, Ordering::Relaxed);
         self.dirty.clear();
         self.fit(size);
         let resize = (size != self.committed).then_some(DisplayUpdate::Resize(size));
@@ -316,8 +390,8 @@ impl ViewerGraphics {
         ExclusiveRectangle {
             left: 0,
             top: 0,
-            right: self.size.width,
-            bottom: self.size.height,
+            right: self.output.width,
+            bottom: self.output.height,
         }
     }
 
@@ -325,15 +399,32 @@ impl ViewerGraphics {
         (usize::from(y) * usize::from(self.size.width) + usize::from(x)) * 4
     }
 
+    /// The output's pixels in `rect`: the desktop's, black around it.
     fn pixels(&self, rect: &ExclusiveRectangle) -> Vec<u8> {
-        let columns = usize::from(rect.right - rect.left) * 4;
-        (rect.top..rect.bottom)
-            .flat_map(|y| {
-                let at = self.offset(rect.left, y);
-                self.canvas.get(at..at + columns).unwrap_or_default()
-            })
-            .copied()
-            .collect()
+        let (left, top) = self.origin;
+        let width = usize::from(rect.right - rect.left);
+        let mut out = vec![0; width * usize::from(rect.bottom - rect.top) * 4];
+        let from = rect.left.max(left);
+        let to = rect.right.min(left + self.size.width);
+        if from >= to {
+            return out;
+        }
+        let columns = usize::from(to - from) * 4;
+        let into = usize::from(from - rect.left) * 4;
+        for (row, y) in (rect.top..rect.bottom).enumerate() {
+            let Some(y) = y.checked_sub(top).filter(|y| *y < self.size.height) else {
+                continue;
+            };
+            let at = self.offset(from - left, y);
+            let start = row * width * 4 + into;
+            if let (Some(src), Some(dst)) = (
+                self.canvas.get(at..at + columns),
+                out.get_mut(start..start + columns),
+            ) {
+                dst.copy_from_slice(src);
+            }
+        }
+        out
     }
 }
 
@@ -352,6 +443,41 @@ fn reset(pipeline: &mut GraphicsPipelineServer, size: DesktopSize) -> Option<u16
     let surface = pipeline.create_surface(size.width, size.height)?;
     pipeline.map_surface_to_output(surface, 0, 0);
     Some(surface)
+}
+
+/// The output for `desktop` on a viewer of `viewer`'s shape, and where the desktop sits in it:
+/// the smallest size of that shape around the desktop, which is centred in it.
+fn letterbox(desktop: DesktopSize, viewer: Option<DesktopSize>) -> (DesktopSize, (u16, u16)) {
+    let as_is = (desktop, (0, 0));
+    let Some(viewer) = viewer.filter(|v| v.width > 0 && v.height > 0) else {
+        return as_is;
+    };
+    let (width, height) = (u32::from(desktop.width), u32::from(desktop.height));
+    let (shape_width, shape_height) = (u32::from(viewer.width), u32::from(viewer.height));
+    let (output_width, output_height) = if width * shape_height >= height * shape_width {
+        (width, (width * shape_height).div_ceil(shape_width))
+    } else {
+        ((height * shape_width).div_ceil(shape_height), height)
+    };
+    let (Ok(output_width), Ok(output_height)) = (
+        u16::try_from(output_width.min(MAX_OUTPUT + 1)),
+        u16::try_from(output_height.min(MAX_OUTPUT + 1)),
+    ) else {
+        return as_is;
+    };
+    if u32::from(output_width.max(output_height)) > MAX_OUTPUT {
+        return as_is;
+    }
+    (
+        DesktopSize {
+            width: output_width,
+            height: output_height,
+        },
+        (
+            (output_width - desktop.width) / 2,
+            (output_height - desktop.height) / 2,
+        ),
+    )
 }
 
 fn union(a: &ExclusiveRectangle, b: &ExclusiveRectangle) -> ExclusiveRectangle {
@@ -707,6 +833,98 @@ mod tests {
         assert_eq!(
             &graphics.canvas[(7 * 16 + 14) * 4..(7 * 16 + 16) * 4],
             &patch[16..24]
+        );
+    }
+
+    /// The viewer, told its screen size, gets the desktop centred in an output of its shape.
+    fn letterboxed(screen: DesktopSize, desktop: DesktopSize) -> (Viewer, GraphicsFactory) {
+        let mut viewer = Viewer::new();
+        let factory = viewer.graphics.factory();
+        factory.set_viewer(screen);
+        assert_eq!(viewer.signals(), [Signal::Viewer]);
+        assert!(viewer.graphics.handle(Signal::Viewer, desktop).is_empty());
+        (viewer, factory)
+    }
+
+    #[test]
+    fn a_desktop_of_another_shape_is_centred_between_black_bars() {
+        let (mut viewer, factory) = letterboxed(size(8, 16), size(16, 8));
+        let desktop = pixels(16, 8, 0);
+        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
+        viewer.open(size(16, 8));
+
+        let reset = viewer.resets.last().unwrap();
+        assert_eq!((reset.width, reset.height), (16, 32));
+        let mut screen = vec![0; 16 * 32 * 4];
+        screen[12 * 16 * 4..20 * 16 * 4].copy_from_slice(&desktop);
+        assert_eq!(viewer.bgr(), bgr(&screen));
+        assert_eq!(factory.to_desktop(5, 13), (5, 1));
+        assert_eq!(factory.to_desktop(5, 3), (5, 0));
+    }
+
+    #[test]
+    fn a_frame_lands_inside_the_bars() {
+        let (mut viewer, _) = letterboxed(size(8, 16), size(16, 8));
+        let mut desktop = pixels(16, 8, 0);
+        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
+        viewer.open(size(16, 8));
+        viewer.acknowledge();
+
+        let patch = pixels(5, 3, 99);
+        assert!(viewer.graphics.frame(size(16, 8), 6, 2, 5, 3, &patch));
+        viewer.deliver();
+
+        for (row, src) in patch.chunks_exact(5 * 4).enumerate() {
+            let at = ((2 + row) * 16 + 6) * 4;
+            desktop[at..at + src.len()].copy_from_slice(src);
+        }
+        let mut screen = vec![0; 16 * 32 * 4];
+        screen[12 * 16 * 4..20 * 16 * 4].copy_from_slice(&desktop);
+        assert_eq!(viewer.bgr(), bgr(&screen));
+    }
+
+    #[test]
+    fn a_viewer_turned_to_the_desktop_shape_gets_it_without_bars() {
+        let (mut viewer, factory) = letterboxed(size(8, 16), size(16, 8));
+        let desktop = pixels(16, 8, 0);
+        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
+        viewer.open(size(16, 8));
+        viewer.acknowledge();
+
+        factory.set_viewer(size(32, 16));
+        assert_eq!(viewer.signals(), [Signal::Acknowledged, Signal::Viewer]);
+        assert!(
+            viewer
+                .graphics
+                .handle(Signal::Viewer, size(16, 8))
+                .is_empty()
+        );
+        viewer.deliver();
+
+        let reset = viewer.resets.last().unwrap();
+        assert_eq!((reset.width, reset.height), (16, 8));
+        assert_eq!(viewer.bgr(), bgr(&desktop));
+        assert_eq!(factory.to_desktop(5, 3), (5, 3));
+    }
+
+    #[test]
+    fn the_output_is_the_smallest_of_the_viewers_shape_around_the_desktop() {
+        assert_eq!(
+            letterbox(size(1440, 900), Some(size(560, 1058))),
+            (size(1440, 2721), (0, 910))
+        );
+        assert_eq!(
+            letterbox(size(560, 1058), Some(size(1058, 560))),
+            (size(1999, 1058), (719, 0))
+        );
+        assert_eq!(
+            letterbox(size(560, 1058), Some(size(560, 1058))),
+            (size(560, 1058), (0, 0))
+        );
+        assert_eq!(letterbox(size(560, 1058), None), (size(560, 1058), (0, 0)));
+        assert_eq!(
+            letterbox(size(8000, 100), Some(size(100, 8000))),
+            (size(8000, 100), (0, 0))
         );
     }
 }

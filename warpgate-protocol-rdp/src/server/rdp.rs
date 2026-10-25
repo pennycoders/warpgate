@@ -31,7 +31,7 @@ use warpgate_core::{DesktopInput, Scancode};
 use warpgate_desktop_ui::DEFAULT_SIZE;
 
 use super::clipboard::ViewerClipboard;
-use super::gfx::{Signal, ViewerGraphics};
+use super::gfx::{GraphicsFactory, Signal, ViewerGraphics};
 use super::protocol::{AuthVerdict, Event, Input};
 use super::sound::ViewerSound;
 use crate::desktop_size::bound_desktop_size;
@@ -127,12 +127,14 @@ where
         initial_size_negotiated: false,
         updates: Arc::new(Mutex::new(frame_rx)),
         out: out_tx.clone(),
+        graphics: graphics.as_ref().map(ViewerGraphics::factory),
     };
     let input = InputHandler {
         out: out_tx.clone(),
         x: 0,
         y: 0,
         buttons: 0,
+        graphics: graphics.as_ref().map(ViewerGraphics::factory),
     };
     let validator: Arc<dyn CredentialValidator> = Arc::new(Validator {
         out: out_tx.clone(),
@@ -432,6 +434,8 @@ struct DisplayHandler {
     // one-shot receiver would fail the second connection with "already taken".
     updates: Arc<Mutex<mpsc::Receiver<DisplayUpdate>>>,
     out: mpsc::UnboundedSender<Event>,
+    /// Told the viewer's screen size, which the pipeline's output keeps the shape of.
+    graphics: Option<GraphicsFactory>,
 }
 
 #[async_trait::async_trait]
@@ -464,6 +468,9 @@ impl RdpServerDisplay for DisplayHandler {
         self.initial_size_negotiated = true;
         let size = clamp_desktop_size(client_size);
         debug!(?client_size, adopted = ?size, "initial viewer size negotiated");
+        if let Some(graphics) = &self.graphics {
+            graphics.set_viewer(size);
+        }
         *self.size.lock().await = size;
         let _ = self.out.send(Event::Size {
             width: size.width,
@@ -484,6 +491,9 @@ impl RdpServerDisplay for DisplayHandler {
         let Some(size) = primary_monitor_size(&layout) else {
             return;
         };
+        if let Some(graphics) = &self.graphics {
+            graphics.set_viewer(size);
+        }
         // ironrdp-server calls this from `spawn_blocking`, never on the runtime thread, which
         // is what makes blocking on the lock legal here.
         if *self.size.blocking_lock() == size {
@@ -552,6 +562,8 @@ struct InputHandler {
     x: u16,
     y: u16,
     buttons: u8,
+    /// Maps the viewer's pointer from the pipeline's letterboxed output to the desktop.
+    graphics: Option<GraphicsFactory>,
 }
 
 impl InputHandler {
@@ -604,8 +616,10 @@ impl RdpServerInputHandler for InputHandler {
     fn mouse(&mut self, event: MouseEvent) {
         match event {
             MouseEvent::Move { x, y } => {
-                self.x = x;
-                self.y = y;
+                (self.x, self.y) = self
+                    .graphics
+                    .as_ref()
+                    .map_or((x, y), |graphics| graphics.to_desktop(x, y));
                 self.emit_pointer();
             }
             MouseEvent::LeftPressed => self.set_button(0, true),
@@ -742,6 +756,7 @@ mod desktop_size_tests {
             initial_size_negotiated,
             updates: Arc::new(Mutex::new(rx)),
             out,
+            graphics: None,
         };
         (display, events)
     }
