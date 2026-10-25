@@ -1,7 +1,47 @@
-diff -ru ironrdp-acceptor-0.10.0/src/connection.rs base/src/connection.rs
---- ironrdp-acceptor-0.10.0/src/connection.rs	2026-10-14 22:22:46.006877139 +0300
-+++ base/src/connection.rs	2026-10-14 22:22:46.017947005 +0300
-@@ -758,7 +758,7 @@
+diff --color -ru ironrdp-acceptor-0.10.0/src/connection.rs base/src/connection.rs
+--- ironrdp-acceptor-0.10.0/src/connection.rs	2026-10-25 23:57:33.291397679 +0200
++++ base/src/connection.rs	2026-10-25 23:57:46.166386387 +0200
+@@ -290,6 +290,7 @@
+     BasicSettingsSendResponse {
+         requested_protocol: SecurityProtocol,
+         protocol: SecurityProtocol,
++        rdp_version: gcc::RdpVersion,
+         early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
+         channels: Vec<(u16, Option<gcc::ChannelDef>)>,
+     },
+@@ -510,6 +511,7 @@
+                 debug!(message = ?settings_initial, "Received");
+ 
+                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
++                let rdp_version = common_rdp_version(gcc_blocks.core.version);
+                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
+                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
+@@ -585,6 +587,7 @@
+                     AcceptorState::BasicSettingsSendResponse {
+                         requested_protocol,
+                         protocol,
++                        rdp_version,
+                         early_capability,
+                         channels,
+                     },
+@@ -594,6 +597,7 @@
+             AcceptorState::BasicSettingsSendResponse {
+                 requested_protocol,
+                 protocol,
++                rdp_version,
+                 early_capability,
+                 channels,
+             } => {
+@@ -606,6 +610,7 @@
+                     self.io_channel_id,
+                     channel_ids.clone(),
+                     requested_protocol,
++                    rdp_version,
+                     skip_channel_join,
+                     self.message_channel_id,
+                 );
+@@ -758,7 +763,7 @@
                      pdu_source: self.io_channel_id,
                      share_control_pdu: ShareControlPdu::ServerDemandActive(rdp::capability_sets::ServerDemandActive {
                          pdu: rdp::capability_sets::DemandActive {
@@ -10,7 +50,7 @@ diff -ru ironrdp-acceptor-0.10.0/src/connection.rs base/src/connection.rs
                              capability_sets: self.server_capabilities.clone(),
                          },
                      }),
-@@ -845,6 +845,16 @@
+@@ -845,6 +850,16 @@
  
                          let ShareControlPdu::ClientConfirmActive(confirm) = capabilities_confirm.share_control_pdu
                          else {
@@ -27,3 +67,50 @@ diff -ru ironrdp-acceptor-0.10.0/src/connection.rs base/src/connection.rs
                              return Err(ConnectorError::general("expected client confirm active"));
                          };
  
+@@ -902,16 +917,23 @@
+     }
+ }
+ 
++/// The RDP version both sides speak (MS-RDPBCGR 2.2.1.4.2): the client's, up to the newest this
++/// server knows, as the FreeRDP server answers.
++fn common_rdp_version(client: gcc::RdpVersion) -> gcc::RdpVersion {
++    gcc::RdpVersion(u32::from(client).min(u32::from(gcc::RdpVersion::V10_12)))
++}
++
+ fn create_gcc_blocks(
+     io_channel: u16,
+     channel_ids: Vec<u16>,
+     requested: SecurityProtocol,
++    rdp_version: gcc::RdpVersion,
+     skip_channel_join: bool,
+     message_channel_id: Option<u16>,
+ ) -> gcc::ServerGccBlocks {
+     gcc::ServerGccBlocks {
+         core: gcc::ServerCoreData {
+-            version: gcc::RdpVersion::V5_PLUS,
++            version: rdp_version,
+             optional_data: gcc::ServerCoreOptionalData {
+                 client_requested_protocols: Some(requested),
+                 early_capability_flags: skip_channel_join
+@@ -929,3 +951,21 @@
+         multi_transport_channel: None,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn server_answers_with_the_clients_rdp_version_up_to_the_newest_it_knows() {
++        assert_eq!(common_rdp_version(gcc::RdpVersion::V5_PLUS), gcc::RdpVersion::V5_PLUS);
++        assert_eq!(common_rdp_version(gcc::RdpVersion::V10_7), gcc::RdpVersion::V10_7);
++        assert_eq!(common_rdp_version(gcc::RdpVersion(0x0008_0013)), gcc::RdpVersion::V10_12);
++    }
++
++    #[test]
++    fn server_core_data_carries_the_common_rdp_version() {
++        let blocks = create_gcc_blocks(1003, vec![], SecurityProtocol::SSL, gcc::RdpVersion::V10_7, false, None);
++        assert_eq!(blocks.core.version, gcc::RdpVersion::V10_7);
++    }
++}
