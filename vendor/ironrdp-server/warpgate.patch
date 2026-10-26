@@ -1,3 +1,23 @@
+diff -ru ironrdp-server-0.13.0/src/capabilities.rs base/src/capabilities.rs
+--- ironrdp-server-0.13.0/src/capabilities.rs	2026-10-26 03:36:08.896583328 +0200
++++ base/src/capabilities.rs	2026-10-26 03:36:08.898995728 +0200
+@@ -1,4 +1,4 @@
+-use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
++use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags, MajorPlatformType, MinorPlatformType};
+ 
+ use crate::{DesktopSize, RdpServerOptions};
+ 
+@@ -18,6 +18,10 @@
+ 
+ fn general_capabilities() -> capability_sets::General {
+     capability_sets::General {
++        // The platform Windows and xrdp report. Windows App on iOS turns a session with the
++        // device only on servers it takes for Windows 8.1 or later.
++        major_platform_type: MajorPlatformType::WINDOWS,
++        minor_platform_type: MinorPlatformType::WINDOWS_NT,
+         extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED,
+         // Advertise that the server handles `SuppressOutput` and
+         // `RefreshRectangle` (per MS-RDPBCGR 2.2.7.1.1) — spec-compliant
 diff -ru ironrdp-server-0.13.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
 --- ironrdp-server-0.13.0/src/encoder/bitmap.rs	2006-07-24 01:21:28.000000000 +0000
 +++ base/src/encoder/bitmap.rs	2026-10-24 18:43:08.204449326 +0000

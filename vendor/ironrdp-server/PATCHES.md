@@ -86,3 +86,10 @@ updates the same way (`libxrdp_send_bitmap` in `libxrdp/libxrdp.c`).
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
+
+## A Windows NT platform in the General capability set
+
+Upstream leaves the server's platform unspecified. Windows and xrdp report Windows NT
+(`OSMAJORTYPE_WINDOWS`, `OSMINORTYPE_WINDOWS_NT`), and Windows App on iOS turns a session with
+the device only on servers it takes for Windows 8.1 or later. The fork reports Windows NT
+(`general_capabilities` in `src/capabilities.rs`).
