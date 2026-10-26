@@ -19,3 +19,6 @@ reqwest_12 = { workspace = true }
 rustify = { version = "0.6", default-features = false, features = ["reqwest"] }
 vaultrs = { version = "0.7", default-features = false }
 warpgate-common = { path = "../warpgate-common" }
+
+[dev-dependencies]
+rustls.workspace = true
