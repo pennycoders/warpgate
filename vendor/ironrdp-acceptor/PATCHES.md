@@ -29,3 +29,7 @@ sends. Windows and the FreeRDP server answer with the client's version, up to th
 know. Windows App on iOS changes the session's orientation only with servers from Windows 8.1
 on, and against Warpgate it sends no Display Control layout when the device rotates. The fork
 answers like FreeRDP, up to RDP 10.12 (`common_rdp_version` in `src/connection.rs`).
+
+A Windows 11 host also sets `EDGE_ACTIONS_SUPPORTED_V2` in its early capabilities (with
+`SKIP_CHANNELJOIN_SUPPORTED` when asked); the RDP version alone does not make Windows App turn
+the session. The fork sets the edge actions for RDP 10 clients (`server_early_capabilities`).

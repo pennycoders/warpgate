@@ -923,6 +923,21 @@ fn common_rdp_version(client: gcc::RdpVersion) -> gcc::RdpVersion {
     gcc::RdpVersion(u32::from(client).min(u32::from(gcc::RdpVersion::V10_12)))
 }
 
+/// The server's early capabilities. From RDP 10 on, the edge actions a Windows 10 host reserves:
+/// Windows App on iOS turns a session with the device only when the server says so.
+fn server_early_capabilities(
+    rdp_version: gcc::RdpVersion,
+    skip_channel_join: bool,
+) -> Option<gcc::ServerEarlyCapabilityFlags> {
+    let mut flags = gcc::ServerEarlyCapabilityFlags::empty();
+    flags.set(
+        gcc::ServerEarlyCapabilityFlags::EDGE_ACTIONS_SUPPORTED_V2,
+        u32::from(rdp_version) >= u32::from(gcc::RdpVersion::V10),
+    );
+    flags.set(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED, skip_channel_join);
+    (!flags.is_empty()).then_some(flags)
+}
+
 fn create_gcc_blocks(
     io_channel: u16,
     channel_ids: Vec<u16>,
@@ -936,8 +951,7 @@ fn create_gcc_blocks(
             version: rdp_version,
             optional_data: gcc::ServerCoreOptionalData {
                 client_requested_protocols: Some(requested),
-                early_capability_flags: skip_channel_join
-                    .then_some(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED),
+                early_capability_flags: server_early_capabilities(rdp_version, skip_channel_join),
             },
         },
         security: gcc::ServerSecurityData::no_security(),
@@ -967,5 +981,28 @@ mod tests {
     fn server_core_data_carries_the_common_rdp_version() {
         let blocks = create_gcc_blocks(1003, vec![], SecurityProtocol::SSL, gcc::RdpVersion::V10_7, false, None);
         assert_eq!(blocks.core.version, gcc::RdpVersion::V10_7);
+    }
+
+    #[test]
+    fn an_rdp_10_server_reserves_the_windows_10_edge_actions() {
+        use gcc::ServerEarlyCapabilityFlags as Flags;
+
+        let flags = |version, skip| {
+            create_gcc_blocks(1003, vec![], SecurityProtocol::SSL, version, skip, None)
+                .core
+                .optional_data
+                .early_capability_flags
+        };
+        // oracle: reference capture 2026-10-26, Windows 11 26100 Server Core Data
+        assert_eq!(
+            flags(gcc::RdpVersion::V10_12, true),
+            Some(Flags::EDGE_ACTIONS_SUPPORTED_V2 | Flags::SKIP_CHANNELJOIN_SUPPORTED)
+        );
+        assert_eq!(flags(gcc::RdpVersion::V10, false), Some(Flags::EDGE_ACTIONS_SUPPORTED_V2));
+        assert_eq!(flags(gcc::RdpVersion::V5_PLUS, false), None);
+        assert_eq!(
+            flags(gcc::RdpVersion::V5_PLUS, true),
+            Some(Flags::SKIP_CHANNELJOIN_SUPPORTED)
+        );
     }
 }
