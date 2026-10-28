@@ -219,10 +219,12 @@ impl ServerMessage {
     /// phase instead.
     pub fn from_event(event: DesktopEvent) -> Option<Self> {
         Some(match event {
-            // The browser shows its own cursor.
+            // The browser client doesn't draw the target's cursor shape, so there is nothing
+            // to tell it when the cursor reverts or hides.
             DesktopEvent::State(_)
             | DesktopEvent::Ended(_)
-            | DesktopEvent::DefaultCursor
+            | DesktopEvent::CursorDefault
+            | DesktopEvent::CursorHidden
             | DesktopEvent::Audio(_) => {
                 return None;
             }

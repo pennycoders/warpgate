@@ -85,7 +85,9 @@ updates the same way (`libxrdp_send_bitmap` in `libxrdp/libxrdp.c`).
 
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
-in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
+in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same
+goes for its `zstd-safe = "8.2"` requirement (upstream pins `7.2`); the streaming API the
+code uses is unchanged between the two.
 
 ## A Windows NT platform in the General capability set
 

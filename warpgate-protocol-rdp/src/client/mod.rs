@@ -527,17 +527,11 @@ async fn process_outputs(
     for out in outputs {
         let event = match out {
             ActiveStageOutput::GraphicsUpdate(region) => encode_region(image, &region),
-            ActiveStageOutput::PointerBitmap(pointer) => Some(cursor_event(&pointer)),
-            ActiveStageOutput::PointerHidden => Some(DesktopEvent::Cursor {
-                rect: DesktopRect {
-                    x: 0,
-                    y: 0,
-                    width: 0,
-                    height: 0,
-                },
-                data: Bytes::new(),
-            }),
-            ActiveStageOutput::PointerDefault => Some(DesktopEvent::DefaultCursor),
+            ActiveStageOutput::PointerBitmap(pointer) => encode_pointer(&pointer),
+            ActiveStageOutput::PointerDefault => Some(DesktopEvent::CursorDefault),
+            ActiveStageOutput::PointerHidden => Some(DesktopEvent::CursorHidden),
+            // The viewer owns the pointer position; warping it to wherever the target last
+            // put its own would fight the user's mouse.
             _ => None,
         };
         if let Some(event) = event {
@@ -577,24 +571,6 @@ fn error_info_text(info: ErrorInfo) -> String {
         ErrorInfo::ProtocolIndependentLicensingCode(code) => code.description().to_owned(),
         ErrorInfo::ProtocolIndependentConnectionBrokerCode(code) => code.description().to_owned(),
         ErrorInfo::RdpSpecificCode(code) => code.description().to_owned(),
-    }
-}
-
-/// A target pointer as a cursor event: the decoded pointer is RGBA with straight alpha,
-/// the event carries BGRA with the hotspot as the rectangle's origin.
-fn cursor_event(pointer: &DecodedPointer) -> DesktopEvent {
-    let mut data = pointer.bitmap_data.clone();
-    for pixel in data.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
-    }
-    DesktopEvent::Cursor {
-        rect: DesktopRect {
-            x: pointer.hotspot_x,
-            y: pointer.hotspot_y,
-            width: pointer.width,
-            height: pointer.height,
-        },
-        data: Bytes::from(data),
     }
 }
 
@@ -689,6 +665,34 @@ fn encode_region(image: &DecodedImage, region: &InclusiveRectangle) -> Option<De
             y: top as u16,
             width: w as u16,
             height: h as u16,
+        },
+        data: Bytes::from(data),
+    })
+}
+
+/// Build the cursor shape update for a pointer bitmap. `None` for a degenerate or short
+/// bitmap rather than panicking downstream; a zero-sized pointer is how RDP hides one.
+fn encode_pointer(pointer: &DecodedPointer) -> Option<DesktopEvent> {
+    if pointer.width == 0 || pointer.height == 0 {
+        return Some(DesktopEvent::CursorHidden);
+    }
+    let len = usize::from(pointer.width) * usize::from(pointer.height) * 4;
+    if pointer.bitmap_data.len() != len {
+        return None;
+    }
+
+    // The decoder yields non-premultiplied RGBA for an accelerated target.
+    let mut data = Vec::with_capacity(len);
+    for px in pointer.bitmap_data.as_chunks::<4>().0 {
+        data.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+
+    Some(DesktopEvent::Cursor {
+        rect: DesktopRect {
+            x: pointer.hotspot_x.min(pointer.width - 1),
+            y: pointer.hotspot_y.min(pointer.height - 1),
+            width: pointer.width,
+            height: pointer.height,
         },
         data: Bytes::from(data),
     })
@@ -800,8 +804,9 @@ fn build_config(
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
         compression_type: None,
-        // The target's pointer reaches the viewer as cursor events, drawn by the viewer
-        // itself, rather than painted into the framebuffer.
+        // The target's pointer is relayed to the viewer as shape updates and never drawn into
+        // the framebuffer: software rendering would paint a second cursor under the viewer's
+        // own, and into recordings.
         enable_server_pointer: true,
         pointer_software_rendering: false,
         desktop_scale_factor: 0,
@@ -965,10 +970,13 @@ fn connector_error(step: &'static str, error: connector::ConnectorError) -> Desk
 #[cfg(test)]
 mod tests {
     use ironrdp::graphics::image_processing::PixelFormat;
+    use ironrdp::graphics::pointer::DecodedPointer;
     use ironrdp::session::image::DecodedImage;
     use warpgate_core::{DesktopEvent, DesktopRect};
 
-    use super::{GraphicsPipelineOutput, build_config, connector, encode_resized_keyframe};
+    use super::{
+        GraphicsPipelineOutput, build_config, connector, encode_pointer, encode_resized_keyframe,
+    };
 
     #[test]
     fn the_target_plays_sound_only_when_the_option_is_on() {
@@ -1139,25 +1147,55 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_target_pointer_becomes_a_bgra_cursor_at_its_hotspot() {
-        use ironrdp::graphics::pointer::DecodedPointer;
-
-        let pointer = DecodedPointer {
-            width: 2,
-            height: 1,
+    fn pointer(width: u16, height: u16, bitmap_data: Vec<u8>) -> DecodedPointer {
+        DecodedPointer {
+            width,
+            height,
             hotspot_x: 1,
             hotspot_y: 0,
-            bitmap_data: vec![1, 2, 3, 4, 5, 6, 7, 8],
-        };
-        let DesktopEvent::Cursor { rect, data } = super::cursor_event(&pointer) else {
-            panic!("expected a cursor event");
-        };
-        assert_eq!(
-            (rect.x, rect.y, rect.width, rect.height),
-            (1, 0, 2, 1),
-            "the rectangle's origin is the hotspot"
-        );
-        assert_eq!(&data[..], &[3, 2, 1, 4, 7, 6, 5, 8]);
+            bitmap_data,
+        }
+    }
+
+    #[test]
+    fn pointer_bitmap_becomes_a_bgra_cursor_with_its_hotspot() {
+        let event = encode_pointer(&pointer(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]));
+
+        assert!(matches!(
+            event,
+            Some(DesktopEvent::Cursor {
+                rect: DesktopRect {
+                    x: 1,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                },
+                data,
+            }) if data[..] == [3, 2, 1, 4, 7, 6, 5, 8]
+        ));
+    }
+
+    #[test]
+    fn hotspot_outside_the_pointer_is_clamped() {
+        let mut decoded = pointer(1, 1, vec![0; 4]);
+        decoded.hotspot_x = 40;
+        decoded.hotspot_y = 40;
+
+        assert!(matches!(
+            encode_pointer(&decoded),
+            Some(DesktopEvent::Cursor {
+                rect: DesktopRect { x: 0, y: 0, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_pointer_hides_the_cursor_and_short_one_is_dropped() {
+        assert!(matches!(
+            encode_pointer(&DecodedPointer::new_invisible()),
+            Some(DesktopEvent::CursorHidden)
+        ));
+        assert!(encode_pointer(&pointer(2, 2, vec![0; 4])).is_none());
     }
 }

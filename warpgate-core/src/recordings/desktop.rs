@@ -423,7 +423,8 @@ impl DesktopRecorder {
             // Cursor isn't composited into the framebuffer (server renders the pointer into
             // it); non-visual events carry no pixels.
             DesktopEvent::Cursor { .. }
-            | DesktopEvent::DefaultCursor
+            | DesktopEvent::CursorDefault
+            | DesktopEvent::CursorHidden
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::Bell

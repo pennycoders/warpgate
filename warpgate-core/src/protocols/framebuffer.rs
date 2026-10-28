@@ -255,7 +255,8 @@ impl Framebuffer {
                 );
             }
             DesktopEvent::Cursor { .. }
-            | DesktopEvent::DefaultCursor
+            | DesktopEvent::CursorDefault
+            | DesktopEvent::CursorHidden
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::Bell
