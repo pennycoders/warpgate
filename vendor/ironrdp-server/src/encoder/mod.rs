@@ -8,9 +8,10 @@ use ironrdp_pdu::encode_vec;
 use ironrdp_pdu::fast_path::UpdateCode;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::pointer::{
-    CachedPointerAttribute, ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute,
+    CachedPointerAttribute, ColorPointerAttribute, LargePointerAttribute, Point16, PointerAttribute,
+    PointerPositionAttribute,
 };
-use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits};
+use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits, LargePointerSupportFlags};
 use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
 use tracing::{debug, warn};
 
@@ -18,7 +19,7 @@ use self::bitmap::BitmapEncoder;
 use self::rfx::RfxEncoder;
 use super::BitmapUpdate;
 use crate::macros::time_warn;
-use crate::{ColorPointer, DisplayUpdate, Framebuffer, RGBAPointer};
+use crate::{ColorPointer, DisplayUpdate, Framebuffer, LargePointer, RGBAPointer};
 
 mod bitmap;
 mod fast_path;
@@ -111,6 +112,18 @@ pub(crate) struct UpdateEncoder {
     /// oversized bitmaps into strips that fit within the limit when sent as
     /// uncompressed surface commands.
     max_request_size: usize,
+    /// Client's advertised New Pointer Update cache size (MS-RDPBCGR 2.2.7.1.5
+    /// `pointerCacheSize`). Zero means the client did not advertise support for the
+    /// New Pointer Update; `RGBAPointer`/`LargePointer` then go out as the default pointer
+    /// and `CachedPointer` is skipped, rather than sending a PDU the client did not agree to
+    /// accept.
+    pointer_cache_size: u16,
+    /// Client's advertised Large Pointer Capability Set flags (MS-RDPBCGR 2.2.7.2.7).
+    /// Empty when the client didn't send this capability set at all. Governs both the
+    /// pointer size ceiling for `RGBAPointer` (32x32 with no flags, 96x96 with
+    /// `UP_TO_96X96_PIXELS`) and whether the dedicated `LargePointer` update, up to
+    /// 384x384, is usable at all (`UP_TO_384X384_PIXELS`).
+    large_pointer_flags: LargePointerSupportFlags,
 }
 
 impl fmt::Debug for UpdateEncoder {
@@ -163,7 +176,79 @@ impl UpdateEncoder {
             framebuffer: None,
             bitmap_updater: Some(bitmap_updater),
             max_request_size: usize::try_from(max_request_size).context("max_request_size")?,
+            pointer_cache_size: 0,
+            large_pointer_flags: LargePointerSupportFlags::empty(),
         })
+    }
+
+    /// The client's negotiated New Pointer Update cache size (MS-RDPBCGR 2.2.7.1.5) and
+    /// Large Pointer Capability Set flags (2.2.7.2.7). Without them, the client gets only
+    /// its default pointer.
+    pub(crate) fn with_pointer_capabilities(
+        mut self,
+        pointer_cache_size: u16,
+        large_pointer_flags: LargePointerSupportFlags,
+    ) -> Self {
+        self.pointer_cache_size = pointer_cache_size;
+        self.large_pointer_flags = large_pointer_flags;
+        self
+    }
+
+    /// Whether a `width`x`height` pointer shape fits the Color/New Pointer Update
+    /// ceiling: 96x96 if the client's Large Pointer Capability Set includes
+    /// `UP_TO_96X96_PIXELS` (MS-RDPBCGR 2.2.9.1.1.4.4's width/height field docs; New
+    /// Pointer Update carries the same `ColorPointerAttribute` internally, so the same
+    /// ceiling applies to both), 32x32 otherwise. Shapes above this ceiling need the
+    /// dedicated Large Pointer Update instead (see `large_pointer_update_supported`).
+    fn color_or_new_pointer_size_ok(&self, width: u16, height: u16) -> bool {
+        let max = if self
+            .large_pointer_flags
+            .contains(LargePointerSupportFlags::UP_TO_96X96_PIXELS)
+        {
+            96
+        } else {
+            32
+        };
+        width <= max && height <= max
+    }
+
+    /// Whether the client negotiated the dedicated Fast-Path Large Pointer Update
+    /// itself. Per MS-RDPBCGR 2.2.7.2.7, only `UP_TO_384X384_PIXELS` unlocks this PDU;
+    /// `UP_TO_96X96_PIXELS` alone only raises the Color/New Pointer Update ceiling and
+    /// does not enable it.
+    fn large_pointer_update_supported(&self) -> bool {
+        self.large_pointer_flags
+            .contains(LargePointerSupportFlags::UP_TO_384X384_PIXELS)
+    }
+
+    /// Warpgate fork: the update a pointer shape goes out as. Within the client's
+    /// Color/New Pointer ceiling it is a New Pointer Update; above it, a Large Pointer
+    /// Update when the client takes those (up to 384x384). A shape the client can't take
+    /// either way becomes its default pointer rather than being dropped, so the client
+    /// never keeps showing a shape the server has already left.
+    fn pointer_shape(&self, ptr: RGBAPointer) -> Result<UpdateFragmenter> {
+        if self.pointer_cache_size == 0 {
+            debug!("Sending the default pointer: client did not advertise New Pointer Update support");
+            return UpdateEncoder::default_pointer();
+        }
+        if self.color_or_new_pointer_size_ok(ptr.width, ptr.height) {
+            return UpdateEncoder::rgba_pointer(ptr);
+        }
+        if self.large_pointer_update_supported() && ptr.width <= 384 && ptr.height <= 384 {
+            return UpdateEncoder::large_pointer(LargePointer {
+                cache_index: ptr.cache_index,
+                width: ptr.width,
+                height: ptr.height,
+                hot_x: ptr.hot_x,
+                hot_y: ptr.hot_y,
+                data: ptr.data,
+            });
+        }
+        debug!(
+            "Sending the default pointer: {}x{} exceeds the client's negotiated pointer size ceiling",
+            ptr.width, ptr.height,
+        );
+        UpdateEncoder::default_pointer()
     }
 
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
@@ -202,6 +287,37 @@ impl UpdateEncoder {
             color_pointer,
         };
         Ok(UpdateFragmenter::new(UpdateCode::NewPointer, encode_vec(&ptr)?))
+    }
+
+    fn large_pointer(ptr: LargePointer) -> Result<UpdateFragmenter> {
+        let xor_mask = ptr.data;
+        // Warpgate fork: the AND mask is not optional (MS-RDPBCGR 2.2.9.1.2.1.11): 1 bpp, rows
+        // in the XOR mask's bottom-up order, each padded to 2 bytes. A set bit keeps the screen
+        // pixel, so it is set where the pointer is fully transparent.
+        let and_stride = usize::from(ptr.width).div_ceil(16) * 2;
+        let mut and_mask = vec![0u8; and_stride * usize::from(ptr.height)];
+        for (row, pixels) in xor_mask.chunks_exact(usize::from(ptr.width) * 4).enumerate() {
+            for (col, pixel) in pixels.chunks_exact(4).enumerate() {
+                if pixel[3] == 0 {
+                    and_mask[row * and_stride + col / 8] |= 0x80 >> (col % 8);
+                }
+            }
+        }
+
+        let hot_spot = Point16 {
+            x: ptr.hot_x,
+            y: ptr.hot_y,
+        };
+        let large_pointer = LargePointerAttribute {
+            xor_bpp: 32,
+            cache_index: ptr.cache_index,
+            hot_spot,
+            width: ptr.width,
+            height: ptr.height,
+            xor_mask: &xor_mask,
+            and_mask: &and_mask,
+        };
+        Ok(UpdateFragmenter::new(UpdateCode::LargePointer, encode_vec(&large_pointer)?))
     }
 
     fn color_pointer(ptr: ColorPointer) -> Result<UpdateFragmenter> {
@@ -389,11 +505,27 @@ impl EncoderIter<'_> {
                         continue;
                     }
                     DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
-                    DisplayUpdate::RGBAPointer(ptr) => UpdateEncoder::rgba_pointer(ptr),
+                    DisplayUpdate::RGBAPointer(ptr) => encoder.pointer_shape(ptr),
+                    DisplayUpdate::LargePointer(ptr) => encoder.pointer_shape(RGBAPointer {
+                        cache_index: ptr.cache_index,
+                        width: ptr.width,
+                        height: ptr.height,
+                        hot_x: ptr.hot_x,
+                        hot_y: ptr.hot_y,
+                        data: ptr.data,
+                    }),
                     DisplayUpdate::ColorPointer(ptr) => UpdateEncoder::color_pointer(ptr),
                     DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
                     DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
-                    DisplayUpdate::CachedPointer(idx) => UpdateEncoder::cached_pointer(idx),
+                    DisplayUpdate::CachedPointer(idx) => {
+                        if encoder.pointer_cache_size == 0 {
+                            debug!(
+                                "Dropping CachedPointer update: client did not advertise New Pointer Update support"
+                            );
+                            continue;
+                        }
+                        UpdateEncoder::cached_pointer(idx)
+                    }
                     DisplayUpdate::Resize(_) => return None,
                 },
                 State::BitmapDiffs { diffs, bitmap, pos } => {
@@ -768,4 +900,120 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
     };
     let cmd = SurfaceCommand::SetSurfaceBits(pdu);
     Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, encode_vec(&cmd)?))
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use ironrdp_core::{ReadCursor, decode, decode_cursor};
+    use ironrdp_graphics::pointer::{DecodedPointer, PointerBitmapTarget};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, UpdateCode};
+    use ironrdp_pdu::pointer::{LargePointerAttribute, PointerAttribute};
+    use ironrdp_pdu::rdp::capability_sets::{CmdFlags, LargePointerSupportFlags};
+
+    use super::{UpdateEncoder, UpdateEncoderCodecs};
+    use crate::{DesktopSize, RGBAPointer};
+
+    const BOTH: LargePointerSupportFlags =
+        LargePointerSupportFlags::UP_TO_96X96_PIXELS.union(LargePointerSupportFlags::UP_TO_384X384_PIXELS);
+
+    fn encoder(pointer_cache_size: u16, large_pointer_flags: LargePointerSupportFlags) -> UpdateEncoder {
+        UpdateEncoder::new(
+            DesktopSize {
+                width: 64,
+                height: 64,
+            },
+            CmdFlags::empty(),
+            UpdateEncoderCodecs::new(),
+            8 * 1024 * 1024,
+        )
+        .unwrap()
+        .with_pointer_capabilities(pointer_cache_size, large_pointer_flags)
+    }
+
+    /// A `side`x`side` pointer, BGRA bottom-up as on the wire, every pixel its own row's value.
+    fn pointer(side: u16) -> RGBAPointer {
+        let data = (0..side)
+            .rev()
+            .flat_map(|row| {
+                let b = u8::try_from(row % 251).unwrap();
+                core::iter::repeat_n([b, 1, 2, 255], usize::from(side)).flatten()
+            })
+            .collect();
+        RGBAPointer {
+            cache_index: 0,
+            width: side,
+            height: side,
+            hot_x: 3,
+            hot_y: 5,
+            data,
+        }
+    }
+
+    /// The update as the client reads it off the wire: its code and reassembled data.
+    fn sent(encoder: &UpdateEncoder, pointer: RGBAPointer) -> (UpdateCode, Vec<u8>) {
+        let mut fragmenter = encoder.pointer_shape(pointer).unwrap();
+        let mut buffer = vec![0; 32 * 1024];
+        let (mut code, mut data) = (None, Vec::new());
+        while let Some(written) = fragmenter.next(&mut buffer) {
+            let mut cursor = ReadCursor::new(&buffer[..written]);
+            let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+            code = Some(update.update_code);
+            data.extend_from_slice(update.data);
+        }
+        (code.unwrap(), data)
+    }
+
+    fn code(encoder: &UpdateEncoder, side: u16) -> UpdateCode {
+        sent(encoder, pointer(side)).0
+    }
+
+    #[test]
+    fn a_pointer_goes_out_as_the_largest_update_the_client_negotiated() {
+        // oracle: spec MS-RDPBCGR 2.2.7.2.7
+        let none = encoder(25, LargePointerSupportFlags::empty());
+        assert_eq!(code(&none, 32), UpdateCode::NewPointer);
+        assert_eq!(code(&none, 48), UpdateCode::DefaultPointer);
+
+        let up_to_96 = encoder(25, LargePointerSupportFlags::UP_TO_96X96_PIXELS);
+        assert_eq!(code(&up_to_96, 96), UpdateCode::NewPointer);
+        assert_eq!(code(&up_to_96, 97), UpdateCode::DefaultPointer);
+
+        let both = encoder(25, BOTH);
+        assert_eq!(code(&both, 96), UpdateCode::NewPointer);
+        assert_eq!(code(&both, 97), UpdateCode::LargePointer);
+        assert_eq!(code(&both, 384), UpdateCode::LargePointer);
+        assert_eq!(code(&both, 385), UpdateCode::DefaultPointer);
+    }
+
+    #[test]
+    fn without_new_pointer_support_the_client_gets_its_default_pointer() {
+        // oracle: spec MS-RDPBCGR 2.2.7.1.5
+        assert_eq!(code(&encoder(0, BOTH), 16), UpdateCode::DefaultPointer);
+    }
+
+    /// What the client decodes from a Large Pointer Update: the shape it was given.
+    #[test]
+    fn the_client_decodes_a_large_pointer_as_sent() {
+        let (code, data) = sent(&encoder(25, BOTH), pointer(200));
+        assert_eq!(code, UpdateCode::LargePointer);
+
+        let attribute: LargePointerAttribute<'_> = decode(&data).unwrap();
+        assert_eq!((attribute.width, attribute.height), (200, 200));
+        // 200 px is 25 bytes of mask, padded to 26; the pointer is opaque, so no bit is set.
+        assert_eq!(attribute.and_mask, vec![0; 26 * 200]);
+        assert_eq!((attribute.hot_spot.x, attribute.hot_spot.y), (3, 5));
+        let decoded = DecodedPointer::decode_large_pointer_attribute(&attribute, PointerBitmapTarget::Accelerated).unwrap();
+        // The client's bitmap is RGBA, top row first; the wire's XOR mask is bottom-up.
+        assert_eq!(decoded.bitmap_data[..4], [2, 1, 0, 255]);
+        assert_eq!(decoded.bitmap_data[decoded.bitmap_data.len() - 4..], [2, 1, 199, 255]);
+    }
+
+    #[test]
+    fn a_pointer_within_the_ceiling_is_a_new_pointer_update() {
+        let (code, data) = sent(&encoder(25, BOTH), pointer(48));
+        assert_eq!(code, UpdateCode::NewPointer);
+        let attribute: PointerAttribute<'_> = decode(&data).unwrap();
+        assert_eq!((attribute.color_pointer.width, attribute.xor_bpp), (48, 32));
+    }
 }

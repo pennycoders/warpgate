@@ -274,13 +274,14 @@ fn frame_to_update(x: u16, y: u16, width: u16, height: u16, data: Bytes) -> Opti
     }))
 }
 
-/// Largest cursor, in pixels per side, sent to the viewer. Bigger ones need the large-pointer
-/// capability, which this server doesn't advertise, so a viewer can't be assumed to take them.
-const MAX_CURSOR_DIM: u16 = 32;
+/// Largest cursor, in pixels per side, sent to the viewer: the Large Pointer Update's limit
+/// (MS-RDPBCGR 2.2.9.1.2.1.11). Which sizes a viewer takes is negotiated per viewer, and the
+/// server's encoder sends a cursor too large for that viewer as its default arrow.
+const MAX_CURSOR_DIM: u16 = 384;
 
 /// Convert a BGRA cursor image (top row first) into an IronRDP pointer update. A cursor that
-/// is malformed or too large for the viewer becomes the viewer's default arrow, so the viewer
-/// never keeps showing a shape the target has already left.
+/// is malformed or larger than any viewer takes becomes the viewer's default arrow, so the
+/// viewer never keeps showing a shape the target has already left.
 fn cursor_to_update(
     hotspot_x: u16,
     hotspot_y: u16,
@@ -806,6 +807,17 @@ mod cursor_tests {
             ),
             DisplayUpdate::RGBAPointer(_)
         ));
+    }
+
+    /// High-DPI targets draw 48 px and larger cursors; the viewer's negotiated pointer sizes
+    /// decide how they go out, not a fixed 32 px limit here.
+    #[test]
+    fn a_high_dpi_cursor_reaches_the_viewer() {
+        let bgra = vec![0x80; 48 * 48 * 4];
+        let DisplayUpdate::RGBAPointer(pointer) = cursor_to_update(24, 24, 48, 48, &bgra) else {
+            panic!("expected a pointer update");
+        };
+        assert_eq!((pointer.width, pointer.height), (48, 48));
     }
 }
 

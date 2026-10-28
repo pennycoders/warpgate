@@ -3,7 +3,7 @@ use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
 use crate::{DesktopSize, RdpServerOptions};
 
 pub(crate) fn capabilities(opts: &RdpServerOptions, size: DesktopSize) -> Vec<capability_sets::CapabilitySet> {
-    vec![
+    let mut caps = vec![
         capability_sets::CapabilitySet::General(general_capabilities()),
         capability_sets::CapabilitySet::Bitmap(bitmap_capabilities(&size)),
         capability_sets::CapabilitySet::Order(order_capabilities()),
@@ -13,7 +13,13 @@ pub(crate) fn capabilities(opts: &RdpServerOptions, size: DesktopSize) -> Vec<ca
         capability_sets::CapabilitySet::VirtualChannel(virtual_channel_capabilities()),
         capability_sets::CapabilitySet::MultiFragmentUpdate(multifragment_update(opts)),
         capability_sets::CapabilitySet::BitmapCodecs(opts.codecs.clone()),
-    ]
+    ];
+
+    if let Some(large_pointer) = large_pointer_capabilities(opts) {
+        caps.push(capability_sets::CapabilitySet::LargePointer(large_pointer));
+    }
+
+    caps
 }
 
 fn general_capabilities() -> capability_sets::General {
@@ -91,5 +97,57 @@ fn virtual_channel_capabilities() -> capability_sets::VirtualChannel {
 fn multifragment_update(opts: &RdpServerOptions) -> capability_sets::MultifragmentUpdate {
     capability_sets::MultifragmentUpdate {
         max_request_size: opts.max_request_size,
+    }
+}
+
+/// MS-RDPBCGR 2.2.7.2.7: the Large Pointer Capability Set's flags MUST be backed by a
+/// matching `MaxRequestSize` in the Multifragment Update Capability Set (already
+/// advertised above from the same `opts.max_request_size`): at least 38,055 bytes for
+/// `LARGE_POINTER_FLAG_96x96`, at least 608,299 bytes for `LARGE_POINTER_FLAG_384x384`
+/// (a 96x96 or 384x384 32bpp pointer respectively). Advertise only what the server's
+/// configured fragment size can actually deliver; `None` when it can't cover even the
+/// smaller tier, so the capability set is omitted entirely rather than advertised empty.
+fn large_pointer_capabilities(opts: &RdpServerOptions) -> Option<capability_sets::LargePointer> {
+    const MIN_REQUEST_SIZE_FOR_96X96: u32 = 38_055;
+    const MIN_REQUEST_SIZE_FOR_384X384: u32 = 608_299;
+
+    let mut flags = capability_sets::LargePointerSupportFlags::empty();
+    if MIN_REQUEST_SIZE_FOR_96X96 <= opts.max_request_size {
+        flags |= capability_sets::LargePointerSupportFlags::UP_TO_96X96_PIXELS;
+    }
+    if MIN_REQUEST_SIZE_FOR_384X384 <= opts.max_request_size {
+        flags |= capability_sets::LargePointerSupportFlags::UP_TO_384X384_PIXELS;
+    }
+
+    (!flags.is_empty()).then_some(capability_sets::LargePointer { flags })
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_pdu::rdp::capability_sets::LargePointerSupportFlags;
+
+    use super::large_pointer_capabilities;
+    use crate::{RdpServerOptions, RdpServerSecurity};
+
+    fn options(max_request_size: u32) -> RdpServerOptions {
+        RdpServerOptions {
+            addr: "127.0.0.1:3389".parse().unwrap(),
+            security: RdpServerSecurity::None,
+            codecs: Default::default(),
+            max_request_size,
+            honor_client_desktop_size: false,
+        }
+    }
+
+    #[test]
+    fn large_pointers_are_offered_as_far_as_the_request_size_carries_them() {
+        // oracle: spec MS-RDPBCGR 2.2.7.2.7
+        let flags = |size| large_pointer_capabilities(&options(size)).map(|c| c.flags);
+        assert_eq!(flags(38_054), None);
+        assert_eq!(flags(38_055), Some(LargePointerSupportFlags::UP_TO_96X96_PIXELS));
+        assert_eq!(
+            flags(RdpServerOptions::DEFAULT_MAX_REQUEST_SIZE),
+            Some(LargePointerSupportFlags::UP_TO_96X96_PIXELS | LargePointerSupportFlags::UP_TO_384X384_PIXELS)
+        );
     }
 }

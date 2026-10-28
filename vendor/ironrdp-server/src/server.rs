@@ -17,7 +17,9 @@ use ironrdp_dvc as dvc;
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
-use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags};
+use ironrdp_pdu::rdp::capability_sets::{
+    BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags, LargePointerSupportFlags,
+};
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
@@ -1394,6 +1396,11 @@ impl RdpServer {
             }
         }
 
+        let mut pointer_cache_size: u16 = 0;
+        // Absence means the client did not send a Large Pointer Capability Set at all,
+        // which per MS-RDPBCGR 2.2.7.2.7 leaves the pointer size ceiling at 32x32 (the
+        // base Color/New Pointer Update limit with no large-pointer flags set).
+        let mut large_pointer_flags = LargePointerSupportFlags::empty();
         let mut update_codecs = UpdateEncoderCodecs::new();
         let mut surface_flags = CmdFlags::empty();
         for c in result.capabilities {
@@ -1475,6 +1482,24 @@ impl RdpServer {
                         }
                     }
                 }
+                CapabilitySet::Pointer(p) => {
+                    // MS-RDPBCGR 2.2.7.1.5: pointerCacheSize is the client's advertised cache
+                    // size for the New Pointer Update specifically (colorPointerCacheSize is
+                    // the separate, always-supported Color Pointer Update cache). A zero or
+                    // absent pointerCacheSize means the client did not advertise New Pointer
+                    // Update support at all, so `UpdateEncoder` must not emit RGBAPointer, and
+                    // must not reference a cache slot via CachedPointer either, since nothing
+                    // else in this crate populates that cache via the Color Pointer Update.
+                    pointer_cache_size = p.pointer_cache_size;
+                }
+                CapabilitySet::LargePointer(lp) => {
+                    // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
+                    // Pointer Update ceiling from 32x32 to 96x96; LARGE_POINTER_FLAG_384x384
+                    // additionally unlocks the dedicated Fast-Path Large Pointer Update, up to
+                    // 384x384. `UpdateEncoder` uses these flags to decide which pointer
+                    // updates it can send at all, and at what size.
+                    large_pointer_flags = lp.flags;
+                }
                 _ => {}
             }
         }
@@ -1482,6 +1507,8 @@ impl RdpServer {
         let desktop_size = self.display.lock().await.size().await;
         let encoder = UpdateEncoder::new(desktop_size, surface_flags, update_codecs, self.opts.max_request_size)
             .context("failed to initialize update encoder")?;
+
+        let encoder = encoder.with_pointer_capabilities(pointer_cache_size, large_pointer_flags);
 
         let state = self
             .client_loop(

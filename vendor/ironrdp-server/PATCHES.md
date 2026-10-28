@@ -33,3 +33,21 @@ had any is never sent at all. The Default Pointer and Hidden Pointer updates
 (MS-RDPBCGR 2.2.9.1.2.1.5 and .6) carry no data: a viewer never got either, and kept
 showing whatever pointer it had last been given. `warpgate.patch` sends such an update as
 one empty single fragment.
+
+## Large pointers
+
+Backport of upstream #1786 and #1787 (IronRDP after 0.13.0): the server reads the client's
+`pointerCacheSize` and Large Pointer Capability Set, advertises its own Large Pointer
+Capability Set as far as `max_request_size` carries it, and has a `DisplayUpdate::LargePointer`
+for the Fast-Path Large Pointer Update (MS-RDPBCGR 2.2.7.2.7, 2.2.9.1.2.1.11). The
+negotiated values reach `UpdateEncoder` through `with_pointer_capabilities` rather than as
+constructor arguments, which leaves the constructor call to the Multifragment Update patch.
+
+Where upstream drops a pointer the client can't take, `warpgate.patch` decides for the
+display instead (`UpdateEncoder::pointer_shape`): an `RGBAPointer` or `LargePointer` goes
+out as a New Pointer Update within the client's 32x32 or 96x96 ceiling, as a Large Pointer
+Update above it when the client takes those, and as the default pointer otherwise, so a
+viewer never keeps a shape the target has left. Warpgate doesn't know the viewer's
+capabilities when it builds a pointer update; the encoder does. A Large Pointer Update also
+carries the 1 bpp AND mask MS-RDPBCGR 2.2.9.1.2.1.11 requires, set where the pointer is fully
+transparent.
