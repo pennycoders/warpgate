@@ -57,6 +57,11 @@ impl UpdateFragmenter {
 
     fn encode_next(&mut self, dst: &mut [u8]) -> Option<(usize, usize)> {
         match self.data.len() - self.position {
+            // Warpgate fork: an update with no data (Default and Hidden Pointer) is still one
+            // update on the wire.
+            0 if self.index == 0 => self
+                .encode_fastpath(Fragmentation::Single, &[], dst)
+                .map(|written| (0, written)),
             0 => None,
 
             1..=MAX_FASTPATH_UPDATE_SIZE => {
@@ -112,6 +117,22 @@ mod tests {
     use ironrdp_core::{ReadCursor, decode_cursor};
 
     use super::*;
+
+    #[test]
+    fn an_update_without_data_is_sent_once() {
+        let mut fragmenter = UpdateFragmenter::new(UpdateCode::DefaultPointer, vec![]);
+        let mut buffer = vec![0; 100];
+        let written = fragmenter.next(&mut buffer).expect("one fragment");
+
+        let mut cursor = ReadCursor::new(&buffer[..written]);
+        let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+        let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+        assert_eq!(update.update_code, UpdateCode::DefaultPointer);
+        assert_eq!(update.fragmentation, Fragmentation::Single);
+        assert!(update.data.is_empty());
+
+        assert!(fragmenter.next(&mut buffer).is_none());
+    }
 
     #[test]
     fn test_single_fragment() {

@@ -1,3 +1,41 @@
+diff -ru ironrdp-server-0.13.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
+--- ironrdp-server-0.13.0/src/encoder/fast_path.rs	2006-07-24 04:21:28.000000000 +0300
++++ base/src/encoder/fast_path.rs	2026-10-29 00:01:17.259243308 +0200
+@@ -57,6 +57,11 @@
+ 
+     fn encode_next(&mut self, dst: &mut [u8]) -> Option<(usize, usize)> {
+         match self.data.len() - self.position {
++            // Warpgate fork: an update with no data (Default and Hidden Pointer) is still one
++            // update on the wire.
++            0 if self.index == 0 => self
++                .encode_fastpath(Fragmentation::Single, &[], dst)
++                .map(|written| (0, written)),
+             0 => None,
+ 
+             1..=MAX_FASTPATH_UPDATE_SIZE => {
+@@ -114,6 +119,22 @@
+     use super::*;
+ 
+     #[test]
++    fn an_update_without_data_is_sent_once() {
++        let mut fragmenter = UpdateFragmenter::new(UpdateCode::DefaultPointer, vec![]);
++        let mut buffer = vec![0; 100];
++        let written = fragmenter.next(&mut buffer).expect("one fragment");
++
++        let mut cursor = ReadCursor::new(&buffer[..written]);
++        let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
++        let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
++        assert_eq!(update.update_code, UpdateCode::DefaultPointer);
++        assert_eq!(update.fragmentation, Fragmentation::Single);
++        assert!(update.data.is_empty());
++
++        assert!(fragmenter.next(&mut buffer).is_none());
++    }
++
++    #[test]
+     fn test_single_fragment() {
+         let data = vec![1, 2, 3, 4];
+         let mut fragmenter = UpdateFragmenter::new(UpdateCode::Bitmap, data);
 diff -ru ironrdp-server-0.13.0/src/encoder/mod.rs base/src/encoder/mod.rs
 --- ironrdp-server-0.13.0/src/encoder/mod.rs	2026-09-18 20:36:51.130844525 +0200
 +++ base/src/encoder/mod.rs	2026-09-18 20:37:30.867676648 +0200

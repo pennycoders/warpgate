@@ -24,3 +24,12 @@ so this vendored path dependency's warnings don't surface in Warpgate's builds. 
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same
 goes for its `zstd-safe = "8.2"` requirement (upstream pins `7.2`); the streaming API the
 code uses is unchanged between the two.
+
+## Updates without data never sent
+
+`UpdateFragmenter` sends an update in as many Fast-Path fragments as its data needs, and
+upstream's `encode_next` ends at once when there is no data left, so an update that never
+had any is never sent at all. The Default Pointer and Hidden Pointer updates
+(MS-RDPBCGR 2.2.9.1.2.1.5 and .6) carry no data: a viewer never got either, and kept
+showing whatever pointer it had last been given. `warpgate.patch` sends such an update as
+one empty single fragment.
