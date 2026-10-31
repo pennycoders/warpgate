@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -41,6 +42,10 @@ pub struct WebDesktopSession {
     /// Separate from the recorder's: that one must only see events it actually wrote.
     /// Holds the refinement scratch too, so encoding one region needs a single lock.
     framebuffer: Mutex<(Framebuffer, RefineScratch)>,
+    /// What the target offers, replayed to every viewer that attaches.
+    features: OnceLock<ServerMessage>,
+    /// A viewer turned sound on. Sound is not sent before, as nothing would play it.
+    audio_enabled: AtomicBool,
 }
 
 /// Buffers reused across refinement encodes. A settling screen refines many regions back to
@@ -74,11 +79,34 @@ impl WebDesktopSession {
             ),
             backend: OnceLock::new(),
             framebuffer: Mutex::new((Framebuffer::default(), RefineScratch::default())),
+            features: OnceLock::new(),
+            audio_enabled: AtomicBool::new(false),
         }
     }
 
     pub fn bind_backend(&self, backend: DesktopBackend) {
         let _ = self.backend.set(backend);
+    }
+
+    /// Tell viewers what the target offers; see [`ServerMessage::Features`].
+    pub async fn announce_features(&self, audio_playback: bool) {
+        let features = ServerMessage::Features { audio_playback };
+        if self.features.set(features.clone()).is_ok() {
+            self.push(features).await;
+        }
+    }
+
+    /// The features for a viewer that just attached, once the backend has announced them.
+    pub fn features(&self) -> Option<ServerMessage> {
+        self.features.get().cloned()
+    }
+
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        self.audio_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn audio_enabled(&self) -> bool {
+        self.audio_enabled.load(Ordering::Relaxed)
     }
 
     /// Composite an event into the session's surface. Driven from the manager's event loop

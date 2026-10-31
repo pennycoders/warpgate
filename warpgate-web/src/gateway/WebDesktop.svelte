@@ -1,6 +1,16 @@
 <script lang="ts">
-    import { faCompress, faExpand } from '@fortawesome/free-solid-svg-icons'
+    import {
+        faCompress,
+        faExpand,
+        faVolumeHigh,
+        faVolumeXmark,
+    } from '@fortawesome/free-solid-svg-icons'
     import { Button } from '@sveltestrap/sveltestrap'
+    import {
+        AUDIO_FRAME_KIND,
+        DesktopAudioPlayer,
+        decodeAudioFrame,
+    } from 'common/desktopAudio'
     import {
         applyDesktopFrame,
         type DesktopFrame,
@@ -40,6 +50,7 @@
         | { type: 'cursor'; rect: Rect; data: string }
         | { type: 'clipboard'; text: string }
         | { type: 'bell' }
+        | { type: 'features'; audio_playback: boolean }
         | { type: 'error'; message: string }
 
     // svelte-ignore state_referenced_locally
@@ -59,6 +70,11 @@
     let sessionNotFound = $state(false)
     let opening = $state(false)
     let sessionInfo = $state<WebClientSessionInfo | null>(null)
+    // The target's sound: offered only when the target has it on, and silent until the
+    // viewer turns it on, as browsers play sound only after a user gesture.
+    let audioAvailable = $state(false)
+    let audioOn = $state(false)
+    const audioPlayer = new DesktopAudioPlayer()
 
     // Framebuffer messages are queued off the WS thread and painted in a rAF loop so a
     // burst of updates (e.g. dragging a window) can never block the main thread. Beyond
@@ -84,7 +100,13 @@
         }
         ws = new ReconnectingWebSocket({
             url: `wss://${location.host}/@warpgate/api/web-desktop/sessions/${sessionId}/stream`,
-            onOpen: () => null,
+            // A reconnect is a new socket; the server forgets nothing, but tell it again
+            // in case the session was re-created behind it.
+            onOpen: () => {
+                if (audioOn) {
+                    send({ type: 'audio', enabled: true })
+                }
+            },
             onMessage: onWsMessage,
         })
         ws.connect()
@@ -140,6 +162,16 @@
             return
         }
         if (typeof data !== 'string') {
+            if (
+                data.byteLength > 0 &&
+                new DataView(data).getUint8(0) === AUDIO_FRAME_KIND
+            ) {
+                const block = decodeAudioFrame(data)
+                if (block && audioOn) {
+                    audioPlayer.play(block)
+                }
+                return
+            }
             const frame = decodeBinaryFrame(data)
             if (frame) {
                 queueFrame(frame)
@@ -164,6 +196,9 @@
                 clipboard.onRemoteCopy(msg.text)
                 break
             case 'bell':
+                break
+            case 'features':
+                audioAvailable = msg.audio_playback
                 break
             case 'error':
                 notice = msg.message
@@ -259,6 +294,23 @@
             pendingPointer = null
         }
         rafHandle = requestAnimationFrame(tick)
+    }
+
+    async function toggleAudio() {
+        if (audioOn) {
+            audioOn = false
+            audioPlayer.stop()
+            send({ type: 'audio', enabled: false })
+            return
+        }
+        try {
+            await audioPlayer.start()
+        } catch (e) {
+            notice = `Could not play sound: ${await stringifyError(e)}`
+            return
+        }
+        audioOn = true
+        send({ type: 'audio', enabled: true })
     }
 
     function toggleFullscreen() {
@@ -486,6 +538,7 @@
         ws?.close()
         resizeObserver?.disconnect()
         resizeSubscription.unsubscribe()
+        audioPlayer.stop()
         if (rafHandle !== null) {
             cancelAnimationFrame(rafHandle)
         }
@@ -520,6 +573,17 @@
                     {notice}
                 />
             </div>
+        {/if}
+        {#if audioAvailable}
+            <button
+                type="button"
+                class="btn btn-link"
+                title={audioOn ? 'Mute sound' : 'Play sound'}
+                aria-pressed={audioOn}
+                onclick={toggleAudio}
+            >
+                <Fa icon={audioOn ? faVolumeHigh : faVolumeXmark} fw />
+            </button>
         {/if}
         <button
             type="button"

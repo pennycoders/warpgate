@@ -129,6 +129,10 @@ async fn connect(
     size: Option<(u16, u16)>,
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>, bool), WarpgateError> {
     let target_session_id = admitted.id();
+    let audio_playback = match &admitted.target().options {
+        TargetOptions::Rdp(options) => options.audio_playback,
+        _ => false,
+    };
     let (handles, encode_jpeg) = match session.target_kind() {
         TargetKind::Vnc => {
             // Tight already picks JPEG for photographic tiles and keeps text and UI
@@ -179,6 +183,7 @@ async fn connect(
         input_tx: handles.input_tx.clone(),
         recorder: recorder.clone(),
     });
+    session.announce_features(audio_playback).await;
     Ok((handles, recorder, encode_jpeg))
 }
 
@@ -220,6 +225,8 @@ async fn emit(
                 .await;
             Err(anyhow!(message).into())
         }
+        // Nothing plays it until a viewer turns sound on.
+        DesktopEvent::Audio(_) if !session.audio_enabled() => Ok(()),
         event => {
             if let Some(msg) = ServerMessage::from_event(event) {
                 session.push(msg).await;

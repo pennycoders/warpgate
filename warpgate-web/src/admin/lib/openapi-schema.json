@@ -8309,7 +8309,7 @@
           },
           "audio_playback": {
             "type": "boolean",
-            "description": "Play the target's sound on native RDP viewers (audio output redirection, MS-RDPEA)."
+            "description": "Play the target's sound on RDP viewers and in the web client (audio output\nredirection, MS-RDPEA)."
           },
           "tls_security": {
             "$ref": "#/components/schemas/RdpTlsSecurity"
