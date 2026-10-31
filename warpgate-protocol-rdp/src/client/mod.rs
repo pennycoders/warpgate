@@ -1007,9 +1007,7 @@ mod tests {
     use ironrdp_session::image::DecodedImage;
     use warpgate_core::{DesktopEvent, DesktopRect};
 
-    use super::{
-        GraphicsPipelineOutput, encode_pointer, encode_resized_keyframe, is_other_channel,
-    };
+    use super::{GraphicsPipelineOutput, encode_pointer, encode_resized_keyframe};
 
     #[test]
     fn unhandled_graphics_are_reported_once_per_codec() {
@@ -1129,10 +1127,10 @@ mod tests {
     #[test]
     fn reactivation_holds_back_data_for_other_channels() {
         // The I/O channel carries the activation; sound on drdynvc does not.
-        assert!(!is_other_channel(&send_data_indication(1003), 1003));
-        assert!(is_other_channel(&send_data_indication(1007), 1003));
+        assert!(!super::is_other_channel(&send_data_indication(1003), 1003));
+        assert!(super::is_other_channel(&send_data_indication(1007), 1003));
         // Not MCS data at all: the activation sequence decides what it is.
-        assert!(!is_other_channel(&[0x03, 0x00, 0x00, 0x04], 1003));
-        assert!(!is_other_channel(&[], 1003));
+        assert!(!super::is_other_channel(&[0x03, 0x00, 0x00, 0x04], 1003));
+        assert!(!super::is_other_channel(&[], 1003));
     }
 }
