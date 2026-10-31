@@ -14,7 +14,7 @@ use crate::protocols::framebuffer::{
 };
 use crate::recordings::RecordingWriterOpener;
 use crate::recordings::writer::NDJsonRecordingWriter;
-use crate::{DesktopEvent, DesktopInput, DesktopRect, LogonState};
+use crate::{DesktopEvent, DesktopInput, DesktopRect, FileTransferDirection, LogonState};
 
 const MAX_GOP_BYTES: usize = 2_000_000;
 const MAX_GOP_SECONDS: f32 = 10.0;
@@ -120,6 +120,14 @@ pub enum DesktopRecordingItem {
         code: u8,
         extended: bool,
         down: bool,
+    },
+    /// A file read across the session through the clipboard, captured for audit. Only the
+    /// name and declared size are kept, never the contents.
+    FileTransfer {
+        time: f32,
+        direction: FileTransferDirection,
+        path: String,
+        size: u64,
     },
     /// A viewer mouse-wheel scroll (client -> server), captured for audit.
     WheelInput {
@@ -427,12 +435,25 @@ impl DesktopRecorder {
             | DesktopEvent::CursorHidden
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
+            | DesktopEvent::ClipboardTransfer(_)
+            | DesktopEvent::Capabilities(_)
             | DesktopEvent::Bell
             | DesktopEvent::Audio(_)
             | DesktopEvent::MicrophoneOpen { .. }
             | DesktopEvent::MicrophoneClose
             | DesktopEvent::Error(_)
             | DesktopEvent::Ended(_) => return Ok(()),
+            DesktopEvent::FileTransferred(record) => {
+                let item = DesktopRecordingItem::FileTransfer {
+                    time,
+                    direction: record.direction,
+                    path: record.path.clone(),
+                    size: record.size,
+                };
+                self.write_data_item(&mut st, &item).await?;
+                self.write_index_item(&IndexEntry::Input { time }).await?;
+                return Ok(());
+            }
         }
 
         self.maybe_keyframe(&mut st, time).await?;
@@ -569,6 +590,9 @@ impl DesktopRecorder {
             DesktopInput::Refresh | DesktopInput::Resize { .. } |
             // The viewer's voice is relayed, not kept.
             DesktopInput::Microphone(_) |
+            // File transfer steps carry file contents, which are not recorded; the
+            // transfer itself is recorded once as a `FileTransfer` item.
+            DesktopInput::ClipboardTransfer(_) |
             // A key with neither representation carries nothing to replay.
             DesktopInput::Key { .. } => return Ok(()),
         };
@@ -690,5 +714,26 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// The audit item names the file and its size and has nowhere to put contents.
+    #[test]
+    fn file_transfer_item_carries_only_name_and_size() {
+        let item = DesktopRecordingItem::FileTransfer {
+            time: 2.0,
+            direction: FileTransferDirection::Download,
+            path: "dir/report.pdf".into(),
+            size: 1234,
+        };
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            serde_json::json!({
+                "type": "file_transfer",
+                "time": 2.0,
+                "direction": "download",
+                "path": "dir/report.pdf",
+                "size": 1234,
+            })
+        );
     }
 }

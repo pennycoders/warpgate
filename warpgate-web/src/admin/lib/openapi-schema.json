@@ -8318,6 +8318,19 @@
           },
           "tls_security": {
             "$ref": "#/components/schemas/RdpTlsSecurity"
+          },
+          "clipboard_files": {
+            "type": "boolean",
+            "description": "Let files be copied and pasted through the clipboard, in both directions.\nWarpgate relays every byte itself, so the cap below always applies and each\ntransferred file is logged with the session.",
+            "default": false
+          },
+          "clipboard_files_max_mb": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "The most a single clipboard copy may carry, in MiB, summed over its files.\nFiles past the cap are left out of the copy.",
+            "default": 100,
+            "maximum": 65536.0,
+            "minimum": 1.0
           }
         }
       },

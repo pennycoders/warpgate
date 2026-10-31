@@ -60,6 +60,7 @@ x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+ironrdp-svc = "0.10"
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]

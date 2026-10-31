@@ -6,6 +6,7 @@ use warpgate_common::ListenEndpoint;
 use warpgate_tls::TlsCertificateAndPrivateKey;
 
 mod desktop;
+mod desktop_files;
 pub mod framebuffer;
 mod handle;
 mod terminal_screen;
@@ -17,6 +18,11 @@ pub use desktop::{
     DesktopRect, DesktopState, LogonState, MAX_CLIPBOARD_BYTES, MAX_DESKTOP_DIM, Scancode,
     check_desktop_size, truncate_clipboard_contents, truncate_clipboard_contents_in_place,
     within_deadline,
+};
+pub use desktop_files::{
+    ClipboardFile, ClipboardFileOffer, ClipboardTransfer, DesktopCapabilities, FileContentsReply,
+    FileContentsRequest, FileTransferDirection, FileTransferRecord, MAX_FILE_CHUNK_BYTES,
+    MAX_OFFERED_FILES, clamp_file_range, limit_file_offer, sanitize_file_path,
 };
 pub use framebuffer::{Framebuffer, PngEncodeError, Rect, decode_png_rgba};
 pub use handle::{AdmittedTarget, SessionHandle, TargetSessionStart, WarpgateServerHandle};

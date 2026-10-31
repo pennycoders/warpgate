@@ -8,6 +8,9 @@
 
 mod client;
 mod clipboard;
+mod clipboard_files;
+#[cfg(test)]
+mod clipboard_relay_tests;
 mod desktop_size;
 mod server;
 mod session_handle;

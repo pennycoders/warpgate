@@ -53,8 +53,9 @@ use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, un
 use tracing::{debug, warn};
 use warpgate_common::{RdpTargetAuth, RdpTargetCompression, SecretResolver, TargetRdpOptions};
 use warpgate_core::{
-    DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopConnectionError, DesktopEndReason,
-    DesktopEvent, DesktopInput, DesktopRect, DesktopState, check_desktop_size, within_deadline,
+    ClipboardTransfer, DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopCapabilities,
+    DesktopConnectionError, DesktopEndReason, DesktopEvent, DesktopInput, DesktopRect,
+    DesktopState, FileTransferRecord, check_desktop_size, within_deadline,
 };
 
 pub use self::audio::pcm_format;
@@ -73,7 +74,7 @@ struct Aborted;
 #[derive(Debug)]
 enum ClipboardOut {
     Request(ClipboardMessage),
-    Text(String),
+    Event(DesktopEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -85,9 +86,29 @@ impl ClipboardSink for ClientClipboardSink {
     }
 
     fn text_received(&self, text: String) {
-        let _ = self.0.send(ClipboardOut::Text(text));
+        let _ = self
+            .0
+            .send(ClipboardOut::Event(DesktopEvent::Clipboard(text)));
+    }
+
+    fn transfer(&self, transfer: ClipboardTransfer) {
+        let _ = self
+            .0
+            .send(ClipboardOut::Event(DesktopEvent::ClipboardTransfer(
+                transfer,
+            )));
+    }
+
+    fn transferred(&self, record: FileTransferRecord) {
+        let _ = self
+            .0
+            .send(ClipboardOut::Event(DesktopEvent::FileTransferred(record)));
     }
 }
+
+/// How often the clipboard channel's lock and transfer timeouts are driven; the interval
+/// `ironrdp_cliprdr::Cliprdr::drive_timeouts` documents.
+const CLIPBOARD_TIMEOUT_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Connect to `options` and pump the session until it ends or is aborted.
 pub async fn run(
@@ -119,7 +140,15 @@ pub async fn run(
     );
 
     let (clipboard_tx, clipboard_rx) = unbounded_channel();
-    let clipboard = Clipboard::deferred(ClientClipboardSink(clipboard_tx));
+    let mut clipboard = Clipboard::deferred(ClientClipboardSink(clipboard_tx));
+    let capabilities = DesktopCapabilities {
+        clipboard_files_max_bytes: options.clipboard_files_max_bytes(),
+    };
+    if let Some(max_bytes) = capabilities.clipboard_files_max_bytes {
+        // This is the channel every transfer crosses, whichever viewer is attached, so it
+        // is the one that audits them.
+        clipboard = clipboard.with_files(Some(max_bytes), true);
+    }
     let (microphone_channel, microphone) = match options
         .microphone
         .then(|| MicrophoneRelay::new(event_tx.clone()))
@@ -148,6 +177,10 @@ pub async fn run(
 
     event_tx
         .send(DesktopEvent::State(DesktopState::Connected))
+        .await
+        .ok();
+    event_tx
+        .send(DesktopEvent::Capabilities(capabilities))
         .await
         .ok();
 
@@ -214,6 +247,8 @@ async fn active_loop(
     // graphics reset, and the viewer re-sends its size right after connecting.
     let mut requested_size = (u32::from(image.width()), u32::from(image.height()));
     let mut reported_size = None;
+    let mut clipboard_timeouts = tokio::time::interval(CLIPBOARD_TIMEOUT_TICK);
+    clipboard_timeouts.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if report_size(image, &mut reported_size, None, event_tx, abort_rx)
         .await
         .is_err()
@@ -265,6 +300,7 @@ async fn active_loop(
                                 microphone.push(&data);
                             }
                         }
+                        DesktopInput::ClipboardTransfer(transfer) => clipboard.transfer(transfer),
                         other => input::translate(other, &mut ops),
                     }
                 }
@@ -320,6 +356,10 @@ async fn active_loop(
                     .write_all(&frame)
                     .await
                     .context("sending microphone audio")?;
+                continue;
+            }
+            _ = clipboard_timeouts.tick() => {
+                drive_clipboard_timeouts(&mut framed, &mut active_stage).await?;
                 continue;
             }
             pdu = framed.read_pdu() => {
@@ -419,15 +459,32 @@ async fn handle_clipboard_out(
             send_clipboard(framed, active_stage, message).await?;
             Ok(true)
         }
-        ClipboardOut::Text(text) => {
+        ClipboardOut::Event(event) => {
             Ok(
                 // false = receiver gone
-                send_event(event_tx, abort_rx, DesktopEvent::Clipboard(text))
-                    .await
-                    .is_ok(),
+                send_event(event_tx, abort_rx, event).await.is_ok(),
             )
         }
     }
+}
+
+/// Expire stale clipboard locks and file ranges the target never answered; the latter
+/// reach the backend as failed responses, which releases whoever waits on them.
+async fn drive_clipboard_timeouts(
+    framed: &mut Framed,
+    active_stage: &mut ActiveStage,
+) -> Result<()> {
+    let Some(cliprdr) = active_stage.get_svc_processor_mut::<CliprdrClient>() else {
+        return Ok(());
+    };
+    let messages = match cliprdr.drive_timeouts() {
+        Ok(messages) => messages,
+        Err(error) => {
+            warn!(%error, "failed to drive clipboard timeouts");
+            return Ok(());
+        }
+    };
+    write_clipboard_messages(framed, active_stage, messages).await
 }
 
 async fn send_clipboard(
@@ -442,9 +499,15 @@ async fn send_clipboard(
         ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
         ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
         ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
-        // file transfer not supported
-        other => {
-            warn!(?other, "unsupported clipboard operation");
+        ClipboardMessage::SendInitiateFileCopy(files) => cliprdr.initiate_file_copy(files),
+        ClipboardMessage::SendFileContentsRequest(request) => {
+            cliprdr.request_file_contents(request)
+        }
+        ClipboardMessage::SendFileContentsResponse(response) => {
+            cliprdr.submit_file_contents(response)
+        }
+        ClipboardMessage::Error(error) => {
+            warn!(%error, "clipboard backend error");
             return Ok(());
         }
     };
@@ -455,6 +518,14 @@ async fn send_clipboard(
             return Ok(());
         }
     };
+    write_clipboard_messages(framed, active_stage, messages).await
+}
+
+async fn write_clipboard_messages(
+    framed: &mut Framed,
+    active_stage: &mut ActiveStage,
+    messages: ironrdp_cliprdr::CliprdrSvcMessages<ironrdp_cliprdr::Client>,
+) -> Result<()> {
     let frame = match active_stage.process_svc_processor_messages(messages) {
         Ok(frame) => frame,
         Err(error) => {

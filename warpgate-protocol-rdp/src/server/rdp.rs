@@ -327,6 +327,10 @@ async fn route_input(
                 frames_per_packet,
             } => microphone.open(format, frames_per_packet),
             Input::MicrophoneClose => microphone.close(),
+            Input::ClipboardTransfer(transfer) => clipboard.transfer(transfer),
+            Input::Capabilities(capabilities) => {
+                clipboard.set_file_limit(capabilities.clipboard_files_max_bytes);
+            }
             Input::Shutdown => break,
             Input::Disconnect(code) => {
                 match decode::<ServerSetErrorInfoPdu>(&code.to_le_bytes()) {
