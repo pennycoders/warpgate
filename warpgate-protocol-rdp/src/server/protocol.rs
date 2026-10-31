@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
-use warpgate_core::DesktopInput;
+use warpgate_core::{ClipboardTransfer, DesktopCapabilities, DesktopInput};
 
 /// Warpgate's verdict on a viewer's credentials, returned through the
 /// [`Event::AuthRequest`] reply channel.
@@ -40,6 +40,10 @@ pub enum Input {
     CursorDefault,
     CursorHidden,
     Clipboard(String),
+    /// A clipboard file transfer step from the target side.
+    ClipboardTransfer(ClipboardTransfer),
+    /// What the target allows, once it is up.
+    Capabilities(DesktopCapabilities),
     Shutdown,
 }
 

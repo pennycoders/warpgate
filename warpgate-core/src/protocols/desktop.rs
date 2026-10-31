@@ -13,6 +13,8 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use warpgate_common::{UserFacingReason, WarpgateError, io_connect_reason};
 
+use super::desktop_files::{ClipboardTransfer, DesktopCapabilities, FileTransferRecord};
+
 pub const DESKTOP_INPUT_CHANNEL_CAPACITY: usize = 256;
 
 pub const MAX_CLIPBOARD_BYTES: usize = 10 * 1024 * 1024;
@@ -126,6 +128,13 @@ pub enum DesktopEvent {
     CursorHidden,
     /// The remote clipboard contents changed.
     Clipboard(String),
+    /// A clipboard file transfer step from the target: files it copied, a range it wants
+    /// of files the viewer offered, or a range the viewer asked it for.
+    ClipboardTransfer(ClipboardTransfer),
+    /// A file was read across the session (audit only).
+    FileTransferred(FileTransferRecord),
+    /// What the target connection allows; sent once it is up.
+    Capabilities(DesktopCapabilities),
     /// The remote rang the bell.
     Bell,
     /// A non-fatal error message.
@@ -231,6 +240,9 @@ pub enum DesktopInput {
     },
     /// Set the remote clipboard contents.
     Clipboard(String),
+    /// A clipboard file transfer step from the viewer: files it copied, a range it wants
+    /// of files the target offered, or a range the target asked it for.
+    ClipboardTransfer(ClipboardTransfer),
     /// Request a full framebuffer refresh.
     Refresh,
     /// The viewer's available display area changed; request the target resize its

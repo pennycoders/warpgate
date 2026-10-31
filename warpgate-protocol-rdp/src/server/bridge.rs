@@ -45,8 +45,14 @@ async fn frame_bridge(
 
     while let Some(event) = event_rx.recv().await {
         if let Some(record_tx) = &record_tx {
-            // Best-effort: recording must never stall the live path, so drop under overload.
-            let _ = record_tx.try_send(event.clone());
+            if matches!(event, DesktopEvent::FileTransferred(_)) {
+                // An audit record, not a frame: worth waiting for, and rare.
+                let _ = record_tx.send(event.clone()).await;
+            } else {
+                // Best-effort: recording must never stall the live path, so drop under
+                // overload.
+                let _ = record_tx.try_send(event.clone());
+            }
         }
 
         let message = match event {
@@ -70,6 +76,10 @@ async fn frame_bridge(
             DesktopEvent::CursorDefault => ServerInput::CursorDefault,
             DesktopEvent::CursorHidden => ServerInput::CursorHidden,
             DesktopEvent::Clipboard(text) => ServerInput::Clipboard(text),
+            DesktopEvent::ClipboardTransfer(transfer) => ServerInput::ClipboardTransfer(transfer),
+            DesktopEvent::Capabilities(capabilities) => ServerInput::Capabilities(capabilities),
+            // Recorded above; the target-facing client has already logged it.
+            DesktopEvent::FileTransferred(_) => continue,
             DesktopEvent::State(DesktopState::Disconnected) => {
                 let _ = server_in.send(ServerInput::Shutdown).await;
                 return;

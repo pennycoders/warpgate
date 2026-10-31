@@ -129,3 +129,27 @@
     will significantly improve image quality, even if the client is connecting
     remotely. GNOME Remote Desktop and KDE KRDP require the graphics pipeline.
 </HelpText>
+
+<h4 class="mt-4">Clipboard</h4>
+<Input
+    type="switch"
+    label="Copy and paste files"
+    bind:checked={options.clipboardFiles}
+/>
+<HelpText>
+    Lets files cross the clipboard in both directions, for native RDP clients
+    and the browser. Warpgate relays every byte itself and logs each file's name
+    and size with the session; the contents are not recorded.
+</HelpText>
+{#if options.clipboardFiles}
+    <FormGroup floating label="Size limit per copy (MiB)">
+        <input
+            class="form-control"
+            type="number"
+            bind:value={options.clipboardFilesMaxMb}
+            min="1"
+            max="65536"
+            step="1"
+        >
+    </FormGroup>
+{/if}
