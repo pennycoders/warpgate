@@ -45,6 +45,7 @@ mod hold_screen;
 mod protocol;
 mod rdp;
 mod sound;
+mod surface;
 
 use bridge::connect_backend;
 use hold_screen::{hold_while, run_banner_screen, run_hold_screen};
@@ -430,12 +431,17 @@ async fn control_loop(
                     {
                         break;
                     }
-                } else if server_in_tx
-                    .send(ServerInput::Resize { width, height })
-                    .await
-                    .is_err()
-                {
-                    break;
+                } else {
+                    // Nothing to ask yet: the holding screen is drawn at the new size, and
+                    // the target is dialed at it.
+                    screen = warpgate_desktop_ui::Screen { width, height };
+                    if server_in_tx
+                        .send(ServerInput::Resize { width, height })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 continue;
             }

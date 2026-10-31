@@ -61,9 +61,10 @@ pub enum Event {
         /// a rejection rather than hanging the server on a reply that never comes.
         reply: oneshot::Sender<AuthVerdict>,
     },
-    /// The desktop size settled with the viewer. Sent once the capability exchange
-    /// completes, and again after every renegotiation, so Warpgate can paint and dial
-    /// the target at the size the viewer is actually showing.
+    /// The desktop size settled with the viewer, sent once the capability exchange
+    /// completes, so Warpgate can paint and dial the target at the size the viewer is
+    /// actually showing. Later sizes come as [`Self::ResizeRequest`]: the viewer's surface
+    /// only changes when the viewer asks.
     Size {
         width: u16,
         height: u16,
