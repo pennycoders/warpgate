@@ -17,6 +17,14 @@ alongside (see `vendor/ironrdp-async/PATCHES.md`) solely to pass it.
 Worth offering upstream as a `Config` field; drop both forks once a release carries an
 equivalent knob.
 
+## sspi 0.23.0 and picky 7.0.0-rc.26
+
+0.12.0 pins `picky = "=7.0.0-rc.26"` and builds `sspi::KerberosConfig` with its `kdc_url`
+field. sspi 0.23.1 needs `picky = "=7.0.0-rc.27"` and replaces that field with
+`kdc_resolution` (IronRDP master follows it in #1987), so the dependency tree stays on sspi
+0.23.0 and picky rc.26 until an `ironrdp-connector` release moves to them; this fork does not
+carry that port.
+
 `Cargo.toml` is the published one plus `warnings = { level = "allow", priority = 1 }`
 under `[lints.rust]`, so this vendored path dependency's warnings don't surface in
 Warpgate's builds. That is not in `warpgate.patch` (which is source-only); re-apply it by
