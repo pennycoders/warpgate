@@ -19,8 +19,11 @@ ironrdp-egfx = "0.5"
 ironrdp-graphics = "0.11"
 ironrdp-input = "0.9"
 ironrdp-pdu = "0.11"
+ironrdp-rdpdr = "0.9"
+ironrdp-rdpsnd = "0.11"
 ironrdp-server = "0.14"
 ironrdp-session = "0.13"
+ironrdp-svc = "0.10"
 ironrdp-tokio = "0.12"
 libz-sys = { version = "1", features = ["static"] } # winscard (via sspi) links C zlib
 openssl = { version = "0.10", optional = true, features = ["vendored"] }
@@ -55,7 +58,6 @@ warpgate-tls = { path = "../warpgate-tls" }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-ironrdp-svc = "0.10"
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]

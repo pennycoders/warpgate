@@ -376,6 +376,8 @@ impl ServerMessage {
             },
             // Audit only: the recorder has it.
             DesktopEvent::FileTransferred(_) => return None,
+            // The browser has no session drive yet.
+            DesktopEvent::DriveUpload(_) => return None,
             DesktopEvent::Bell => Self::Bell,
             DesktopEvent::Error(message) => Self::Error { message },
         })
@@ -485,6 +487,7 @@ mod tests {
             json(DesktopEvent::Capabilities(
                 warpgate_core::DesktopCapabilities {
                     clipboard_files_max_bytes: None,
+                    drive_uploads_max_bytes: None,
                 }
             )),
             serde_json::json!({"type": "capabilities", "clipboard_files_max_bytes": null})

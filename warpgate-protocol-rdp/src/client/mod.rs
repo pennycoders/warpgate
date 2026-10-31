@@ -4,6 +4,7 @@
 //! translates both directions into the shared [`DesktopEvent`]/[`DesktopInput`] vocabulary,
 //! so the web-desktop manager and the native RDP server front end both work unchanged.
 
+mod drives;
 mod input;
 mod logon;
 mod tls;
@@ -45,13 +46,16 @@ use tracing::{debug, warn};
 use warpgate_common::{RdpTargetAuth, RdpTargetCompression, SecretResolver, TargetRdpOptions};
 use warpgate_core::{
     ClipboardTransfer, DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopCapabilities,
-    DesktopConnectionError, DesktopEvent, DesktopInput, DesktopRect, DesktopState,
-    FileTransferRecord, check_desktop_size, within_deadline,
+    DesktopConnectionError, DesktopEvent, DesktopInput, DesktopRect, DesktopState, DriveUpload,
+    DriveUploadStatus, FileTransferRecord, check_desktop_size, within_deadline,
 };
 
+use self::drives::DriveLink;
+pub(crate) use self::drives::DriveSetup;
 pub(crate) use self::logon::LogonWatcher;
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
 use crate::desktop_size::bound_desktop_size;
+use crate::drive::DriveUpdate;
 
 type Framed = TokioFramed<tls::TargetTlsStream>;
 
@@ -99,6 +103,7 @@ impl ClipboardSink for ClientClipboardSink {
 const CLIPBOARD_TIMEOUT_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Connect to `options` and pump the session until it ends or is aborted.
+#[expect(clippy::too_many_arguments)]
 pub async fn run(
     options: TargetRdpOptions,
     (width, height): (u16, u16),
@@ -107,6 +112,7 @@ pub async fn run(
     mut abort_rx: UnboundedReceiver<()>,
     logon: LogonWatcher,
     secrets: Arc<dyn SecretResolver>,
+    drives: Option<DriveSetup>,
 ) -> Result<(), DesktopConnectionError> {
     event_tx
         .send(DesktopEvent::State(DesktopState::Connecting))
@@ -131,6 +137,17 @@ pub async fn run(
     let mut clipboard = Clipboard::deferred(ClientClipboardSink(clipboard_tx));
     let capabilities = DesktopCapabilities {
         clipboard_files_max_bytes: options.clipboard_files_max_bytes(),
+        drive_uploads_max_bytes: drives
+            .as_ref()
+            .and_then(|drives| drives.uploads.as_ref())
+            .and_then(|_| options.drive_uploads_max_bytes()),
+    };
+    let (mut drives, drive_channels) = match drives {
+        Some(setup) => {
+            let (link, rdpdr, rdpsnd) = DriveLink::new(setup);
+            (Some(link), Some((rdpdr, rdpsnd)))
+        }
+        None => (None, None),
     };
     if let Some(max_bytes) = capabilities.clipboard_files_max_bytes {
         // This is the channel every transfer crosses, whichever viewer is attached, so it
@@ -148,6 +165,7 @@ pub async fn run(
             options.tls_security,
             options.kdc_url.clone().filter(|url| !url.is_empty()),
             clipboard.backend(),
+            drive_channels,
         ),
     )
     .await?;
@@ -179,6 +197,7 @@ pub async fn run(
         &clipboard,
         clipboard_rx,
         &logon,
+        drives.as_mut(),
     )
     .await
     .map_err(DesktopConnectionError::Session)
@@ -195,6 +214,7 @@ async fn active_loop(
     clipboard: &Clipboard<ClientClipboardSink>,
     mut clipboard_rx: UnboundedReceiver<ClipboardOut>,
     logon: &LogonWatcher,
+    mut drives: Option<&mut DriveLink>,
 ) -> Result<()> {
     let activation_factory = connection_result.activation_factory;
     let mut active_stage = ActiveStageBuilder {
@@ -250,6 +270,7 @@ async fn active_loop(
                 // window drag are wasted work.
                 let mut ops = Vec::new();
                 let mut resize = None;
+                let mut uploads = Vec::new();
                 for input in std::iter::once(first)
                     .chain(std::iter::from_fn(|| input_rx.try_recv().ok()))
                 {
@@ -257,6 +278,21 @@ async fn active_loop(
                         DesktopInput::Resize { width, height } => resize = Some((width, height)),
                         DesktopInput::Clipboard(text) => clipboard.offer(text),
                         DesktopInput::ClipboardTransfer(transfer) => clipboard.transfer(transfer),
+                        DesktopInput::DriveUpload(step) => {
+                            // Only the browser's session drive takes uploads.
+                            let status = drives
+                                .as_ref()
+                                .and_then(|drives| drives.setup.uploads.as_ref())
+                                .map(|uploads| uploads.upload(step.clone()));
+                            match status {
+                                Some(Some(status)) => uploads.push(status),
+                                Some(None) => {}
+                                None => uploads.push(DriveUploadStatus {
+                                    id: upload_id(&step),
+                                    stored: false,
+                                }),
+                            }
+                        }
                         other => input::translate(other, &mut ops),
                     }
                 }
@@ -267,6 +303,14 @@ async fn active_loop(
                 while let Ok(out) = clipboard_rx.try_recv() {
                     if !handle_clipboard_out(out, &mut framed, &mut active_stage, event_tx, abort_rx)
                         .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                for status in uploads {
+                    if send_event(event_tx, abort_rx, DesktopEvent::DriveUpload(status))
+                        .await
+                        .is_err()
                     {
                         return Ok(());
                     }
@@ -298,6 +342,22 @@ async fn active_loop(
                     .await?
                 {
                     return Ok(());
+                }
+                continue;
+            }
+            update = next_drive_update(drives.as_deref_mut()) => {
+                let (Some(update), Some(link)) = (update, drives.as_deref_mut()) else {
+                    // The owner went away; its drives stay announced but idle.
+                    drives = None;
+                    continue;
+                };
+                for record in link.apply(update, &mut framed, &mut active_stage).await? {
+                    if send_event(event_tx, abort_rx, DesktopEvent::FileTransferred(record))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
                 }
                 continue;
             }
@@ -351,6 +411,21 @@ async fn active_loop(
             }
             send_refresh_request(&mut framed, &mut active_stage, size).await?;
         }
+    }
+}
+
+async fn next_drive_update(drives: Option<&mut DriveLink>) -> Option<DriveUpdate> {
+    match drives {
+        Some(drives) => drives.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+const fn upload_id(step: &DriveUpload) -> u32 {
+    match step {
+        DriveUpload::Start { id, .. }
+        | DriveUpload::Chunk { id, .. }
+        | DriveUpload::Delete { id } => *id,
     }
 }
 
@@ -895,6 +970,7 @@ impl GraphicsPipelineHandler for GraphicsPipelineOutput {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn connect(
     config: ironrdp_connector::Config,
     server_name: String,
@@ -903,6 +979,7 @@ async fn connect(
     tls_security: warpgate_common::RdpTlsSecurity,
     kdc_url: Option<String>,
     clipboard: TextClipboard<ClientClipboardSink>,
+    drive_channels: Option<(ironrdp_rdpdr::Rdpdr, ironrdp_rdpsnd::client::Rdpsnd)>,
 ) -> Result<(ConnectionResult, Framed), DesktopConnectionError> {
     // Without a Kerberos config IronRDP runs CredSSP over NTLM only.
     let kerberos_config = kdc_url
@@ -938,6 +1015,11 @@ async fn connect(
     let mut connector = ironrdp_connector::ClientConnector::new(config, client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(CliprdrClient::new(Box::new(clipboard)));
+    if let Some((rdpdr, rdpsnd)) = drive_channels {
+        connector = connector
+            .with_static_channel(rdpdr)
+            .with_static_channel(rdpsnd);
+    }
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
