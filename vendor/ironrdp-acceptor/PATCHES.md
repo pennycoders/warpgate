@@ -12,6 +12,14 @@ and logs it at `warn` (`AcceptorState::CapabilitiesWaitConfirm` in `src/connecti
 
 IronRDP master still ends the connection there; drop this fork once a release does not.
 
+## The client's RDP version in Server Core Data
+
+Upstream always answers RDP 5.0-8.1 (`0x00080004`) in Server Core Data, whatever the client
+sends. Windows and the FreeRDP server answer with the client's version, up to the newest they
+know. Windows App on iOS changes the session's orientation only with servers from Windows 8.1
+on, and against Warpgate it sends no Display Control layout when the device rotates. The fork
+answers like FreeRDP, up to RDP 10.12 (`common_rdp_version` in `src/connection.rs`).
+
 (The `RDP` Demand Active source descriptor the 0.10.0 fork also carried is in 0.12.0,
 upstream #2119.)
 
