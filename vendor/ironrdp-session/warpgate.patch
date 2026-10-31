@@ -1,7 +1,15 @@
 diff -ru ironrdp-session-0.13.0/src/active_stage.rs base/src/active_stage.rs
---- ironrdp-session-0.13.0/src/active_stage.rs	2026-10-31 10:47:26
-+++ base/src/active_stage.rs	2026-10-31 10:47:26
-@@ -945,6 +945,14 @@
+--- ironrdp-session-0.13.0/src/active_stage.rs	2026-10-31 11:34:35
++++ base/src/active_stage.rs	2026-10-31 11:34:35
+@@ -18,6 +18,7 @@
+ use ironrdp_pdu::rdp::headers::ShareDataPdu;
+ use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu};
+ use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
++use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
+ use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
+ use ironrdp_pdu::rdp::session_info::{LogonErrorsInfo, ServerAutoReconnect};
+ use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
+@@ -945,6 +946,14 @@
      ///
      /// [\[MS-RDPBCGR\] 2.2.10.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
      SessionId(u32),
@@ -16,7 +24,15 @@ diff -ru ironrdp-session-0.13.0/src/active_stage.rs base/src/active_stage.rs
      /// Received a Server Deactivate All PDU. The consumer should execute the [Deactivation-Reactivation Sequence].
      ///
      /// [Deactivation-Reactivation Sequence]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
-@@ -1009,6 +1017,7 @@
+@@ -1002,13 +1011,14 @@
+                         mcs::DisconnectReason::UserRequested => GracefulDisconnectReason::UserInitiated,
+                         other => GracefulDisconnectReason::Other(other.description().to_owned()),
+                     },
+-                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::Other(info.description()),
++                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::ErrorInfo(info),
+                 };
+ 
+                 Ok(Self::Terminate(desc))
              }
              x224::ProcessorOutput::SaveSessionInfo { logon_complete } => Ok(Self::SaveSessionInfo { logon_complete }),
              x224::ProcessorOutput::SessionId(session_id) => Ok(Self::SessionId(session_id)),
@@ -24,9 +40,26 @@ diff -ru ironrdp-session-0.13.0/src/active_stage.rs base/src/active_stage.rs
              x224::ProcessorOutput::DeactivateAll => Ok(Self::DeactivateAll),
              x224::ProcessorOutput::MultitransportRequest(pdu) => Ok(Self::MultitransportRequest(pdu)),
              x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
+@@ -1032,6 +1042,8 @@
+ pub enum GracefulDisconnectReason {
+     UserInitiated,
+     ServerInitiated,
++    /// The server explained the disconnection with a Set Error Info PDU.
++    ErrorInfo(ErrorInfo),
+     Other(String),
+ }
+ 
+@@ -1040,6 +1052,7 @@
+         match self {
+             GracefulDisconnectReason::UserInitiated => "user initiated disconnect".to_owned(),
+             GracefulDisconnectReason::ServerInitiated => "server initiated disconnect".to_owned(),
++            GracefulDisconnectReason::ErrorInfo(info) => info.description(),
+             GracefulDisconnectReason::Other(description) => description.clone(),
+         }
+     }
 diff -ru ironrdp-session-0.13.0/src/x224/mod.rs base/src/x224/mod.rs
---- ironrdp-session-0.13.0/src/x224/mod.rs	2026-10-31 10:47:26
-+++ base/src/x224/mod.rs	2026-10-31 10:47:26
+--- ironrdp-session-0.13.0/src/x224/mod.rs	2026-10-31 11:34:35
++++ base/src/x224/mod.rs	2026-10-31 11:34:35
 @@ -13,7 +13,7 @@
  use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
  use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;

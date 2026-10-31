@@ -69,6 +69,16 @@ and declares the padded width, while the destination rectangle keeps the real wi
 client clips the padding. The scan width above is that of the padded row. xrdp sends its bitmap
 updates the same way (`libxrdp_send_bitmap` in `libxrdp/libxrdp.c`).
 
+## Disconnect Provider Ultimatum on a server-initiated disconnection
+
+`ServerEvent::Disconnect(ErrorInfo)` sends the client a Set Error Info PDU (when it opted
+into them) and ends the client loop, but the server then drops the socket, as it does for
+`ServerEvent::Quit` and for the display's update stream ending, so the client reports a
+transport error instead of a disconnection. Every disconnection the server side starts now
+ends with an MCS Disconnect Provider Ultimatum (`ProviderInitiated`) at the end of
+`client_loop` in `src/server.rs`. Warpgate uses this to pass the target's reason for ending
+a session on to the viewer.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same

@@ -215,14 +215,16 @@ pub const fn phase_for(state: DesktopState) -> Option<LiveSessionPhase> {
 }
 
 impl ServerMessage {
-    /// `None` for state changes, which are reported as a session phase instead.
+    /// `None` for state changes and the end of the session, which are reported as a session
+    /// phase instead.
     pub fn from_event(event: DesktopEvent) -> Option<Self> {
         Some(match event {
             // The browser client doesn't draw the target's cursor shape, so there is nothing
-            // to tell it when the cursor reverts or hides.
-            DesktopEvent::State(_) | DesktopEvent::CursorDefault | DesktopEvent::CursorHidden => {
-                return None;
-            }
+            // to tell it when the cursor reverts or hides; a session end is reported on close.
+            DesktopEvent::State(_)
+            | DesktopEvent::CursorDefault
+            | DesktopEvent::CursorHidden
+            | DesktopEvent::Ended(_) => return None,
             DesktopEvent::Resize { width, height } => Self::Resize { width, height },
             DesktopEvent::RawImage { rect, data } => Self::RawImage {
                 rect: rect.into(),
@@ -249,5 +251,22 @@ impl ServerMessage {
             DesktopEvent::Bell => Self::Bell,
             DesktopEvent::Error(message) => Self::Error { message },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use warpgate_core::{DesktopEndReason, DesktopEvent};
+
+    use super::ServerMessage;
+
+    /// The end reaches the browser as the session's closing phase, not as a message.
+    #[test]
+    fn the_end_of_the_session_is_not_a_frame_message() {
+        let ended = DesktopEvent::Ended(DesktopEndReason {
+            message: "Another user connected to the server.".into(),
+            rdp_error_info: Some(5),
+        });
+        assert!(ServerMessage::from_event(ended).is_none());
     }
 }

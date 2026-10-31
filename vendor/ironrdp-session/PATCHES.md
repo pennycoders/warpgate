@@ -16,6 +16,15 @@ auto-reconnect cookie, is still not surfaced.
 
 Drop this fork once a release surfaces the logon account.
 
+## Error info kept in the disconnect reason
+
+Upstream turns a Set Error Info PDU into `GracefulDisconnectReason::Other` with only its
+description, so a caller cannot tell which disconnection it was or pass the code on.
+`GracefulDisconnectReason` gains an `ErrorInfo` variant carrying it (`src/active_stage.rs`),
+which Warpgate forwards to its own viewers.
+
+Upstream: pennycoders/IronRDP `fix/session-disconnect-error-info`.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same

@@ -132,7 +132,7 @@ async fn run_session(
             if let Some(pending) = session.take_pending_host_key().await {
                 let _ = pending.reply.send(false);
             }
-            last_error
+            last_error.map(|()| None)
         },
     )
     .await;

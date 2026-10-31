@@ -1,6 +1,6 @@
-diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
---- ironrdp-server-0.14.0/src/display.rs	2026-10-31 11:23:34
-+++ base/src/display.rs	2026-10-31 11:23:34
+diff -ruN ironrdp-server-0.14.0/src/display.rs base/src/display.rs
+--- ironrdp-server-0.14.0/src/display.rs	2026-10-31 13:36:07
++++ base/src/display.rs	2026-10-31 13:36:07
 @@ -329,6 +329,19 @@
      /// and then signals the event loop via `ServerEvent::Egfx`.
      #[cfg(feature = "egfx")]
@@ -30,9 +30,9 @@ diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
              .finish_non_exhaustive()
      }
  }
-diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
---- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 11:23:34
-+++ base/src/encoder/bitmap.rs	2026-10-31 11:23:34
+diff -ruN ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
+--- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 13:36:07
++++ base/src/encoder/bitmap.rs	2026-10-31 13:36:07
 @@ -1,6 +1,6 @@
 -use core::num::NonZeroUsize;
 +use core::iter;
@@ -122,9 +122,9 @@ diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
                  }),
                  bitmap_data: &self.buffer[..len],
              };
-diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
---- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 11:23:34
-+++ base/src/encoder/fast_path.rs	2026-10-31 11:23:34
+diff -ruN ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
+--- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 13:36:07
++++ base/src/encoder/fast_path.rs	2026-10-31 13:36:07
 @@ -4,7 +4,8 @@
  use ironrdp_pdu::{Encode as _, WriteCursor};
  
@@ -153,9 +153,9 @@ diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_pa
              0 => None,
  
              1..=MAX_FASTPATH_UPDATE_SIZE => {
-diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 11:23:34
-+++ base/src/encoder/mod.rs	2026-10-31 11:23:34
+diff -ruN ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
+--- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 13:36:07
++++ base/src/encoder/mod.rs	2026-10-31 13:36:07
 @@ -16,6 +16,8 @@
  use tracing::{debug, warn};
  
@@ -564,9 +564,9 @@ diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
      }
  }
  
-diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
---- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 11:23:34
-+++ base/src/lib.rs	2026-10-31 11:23:34
+diff -ruN ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
+--- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 13:36:07
++++ base/src/lib.rs	2026-10-31 13:36:07
 @@ -36,7 +36,7 @@
  #[cfg(all(feature = "__test", feature = "qoiz"))]
  pub use encoder::qoiz::Compressor as QoizCompressor;
@@ -594,9 +594,9 @@ diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
  pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
  #[cfg(feature = "usb")]
  pub use urbdrc::{
-diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
---- ironrdp-server-0.14.0/src/server.rs	2026-10-31 11:23:34
-+++ base/src/server.rs	2026-10-31 11:23:34
+diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
+--- ironrdp-server-0.14.0/src/server.rs	2026-10-31 13:36:07
++++ base/src/server.rs	2026-10-31 13:36:07
 @@ -62,7 +62,7 @@
  use crate::clipboard::CliprdrServerFactory;
  use crate::display::{DisplayContext, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
@@ -680,7 +680,56 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          }
      }
  
-@@ -5170,22 +5216,6 @@
+@@ -4737,6 +4783,7 @@
+         let udp_transport_for_events = Rc::clone(&udp_transport);
+         let udp_transport_for_pdus = Rc::clone(&udp_transport);
+         let mut cliprdr_writer = writer.clone();
++        let mut ultimatum_writer = writer.clone();
+         let write_counter = writer.write_counter();
+         let ev_receiver = Arc::clone(&self.ev_receiver);
+         let s = Rc::new(Mutex::new((self, conn)));
+@@ -5061,17 +5108,32 @@
+             }
+         };
+ 
+-        let state = tokio::select!(
+-            state = dispatch_pdu => state,
+-            state = dispatch_display => state,
+-            state = dispatch_events => state,
+-            state = refresh_auto_reconnect_cookie => state,
+-            state = send_heartbeats => state,
+-            state = dispatch_udp_tunnel => state,
+-            state = drive_cliprdr_timeouts => state,
++        let (state, server_initiated) = tokio::select!(
++            state = dispatch_pdu => (state, false),
++            state = dispatch_display => (state, true),
++            state = dispatch_events => (state, true),
++            state = refresh_auto_reconnect_cookie => (state, true),
++            state = send_heartbeats => (state, true),
++            state = dispatch_udp_tunnel => (state, true),
++            state = drive_cliprdr_timeouts => (state, true),
+         );
+ 
+         debug!("End of client loop: {state:?}");
++        // A disconnection the server starts ends with a Disconnect Provider Ultimatum, so the
++        // client reports a disconnection rather than a transport error.
++        if server_initiated && matches!(state, Ok(RunState::Disconnect)) {
++            let ultimatum = mcs::McsMessage::DisconnectProviderUltimatum(mcs::DisconnectProviderUltimatum::from_reason(
++                mcs::DisconnectReason::ProviderInitiated,
++            ));
++            match encode_vec(&X224(ultimatum)) {
++                Ok(data) => {
++                    if let Err(error) = ultimatum_writer.write_all(&data).await {
++                        debug!(%error, "Could not send the disconnect ultimatum");
++                    }
++                }
++                Err(error) => debug!(%error, "Could not encode the disconnect ultimatum"),
++            }
++        }
+         state
+     }
+ 
+@@ -5170,22 +5232,6 @@
              });
          }
  
@@ -703,7 +752,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          #[cfg(feature = "egfx")]
          if let Some(gfx_handle) = conn.gfx_handle.as_ref() {
              let mut server = gfx_handle
-@@ -5224,10 +5254,12 @@
+@@ -5224,10 +5270,12 @@
          let mut update_codecs = UpdateEncoderCodecs::new();
          let mut surface_flags = CmdFlags::empty();
          let mut pointer_cache_size: u16 = 0;
@@ -716,7 +765,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          for c in result.capabilities {
              match c {
                  CapabilitySet::General(c) => {
-@@ -5239,7 +5271,6 @@
+@@ -5239,7 +5287,6 @@
                  CapabilitySet::Bitmap(b) => {
                      if !b.desktop_resize_flag {
                          debug!("Desktop resize is not supported by the client");
@@ -724,7 +773,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      }
  
                      let client_size = DesktopSize {
-@@ -5250,12 +5281,12 @@
+@@ -5250,12 +5297,12 @@
  
                      // It's problematic when the client didn't resize, as we send bitmap updates that don't fit.
                      // The client will likely drop the connection.
@@ -742,7 +791,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      }
                  }
                  CapabilitySet::SurfaceCommands(c) => {
-@@ -5310,6 +5341,7 @@
+@@ -5310,6 +5357,7 @@
                      // must not reference a cache slot via CachedPointer either, since nothing
                      // else in this crate populates that cache via the Color Pointer Update.
                      pointer_cache_size = p.pointer_cache_size;
@@ -750,7 +799,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                  }
                  CapabilitySet::LargePointer(lp) => {
                      // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
-@@ -5323,15 +5355,34 @@
+@@ -5323,15 +5371,34 @@
              }
          }
  
