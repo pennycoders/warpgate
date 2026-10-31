@@ -18,10 +18,13 @@ use bytes::Bytes;
 use ironrdp_cliprdr::CliprdrClient;
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_connector::connection_activation::{
-    ConnectionActivationFactory, ConnectionActivationState,
+    ConnectionActivationFactory, ConnectionActivationSequence, ConnectionActivationState,
 };
 use ironrdp_connector::credssp::KerberosConfig;
-use ironrdp_connector::{self as connector, ConnectionResult, Credentials};
+use ironrdp_connector::{
+    self as connector, ConnectionResult, ConnectorResult, Credentials, MonotonicInstant, Sequence,
+    State, Written,
+};
 use ironrdp_core::WriteBuf;
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
@@ -30,6 +33,7 @@ use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::pdu::{Codec1Type, GfxPdu};
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
+use ironrdp_pdu::PduHint;
 use ironrdp_pdu::gcc::{ConnectionType, KeyboardType};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::capability_sets::{
@@ -467,18 +471,20 @@ async fn active_loop(
             request_full_redraw(&mut framed, &mut active_stage, size, redraw).await?;
         }
 
-        if should_reactivate
-            && let Some(size) = reactivate(
-                &mut framed,
-                &mut active_stage,
-                &activation_factory,
-                channel_ids,
-                &mut redraw,
-                image,
-            )
-            .await
-            .context("RDP deactivation-reactivation sequence")?
-        {
+        if !should_reactivate {
+            continue;
+        }
+        let (resized, held) = reactivate(
+            &mut framed,
+            &mut active_stage,
+            &activation_factory,
+            channel_ids,
+            &mut redraw,
+            image,
+        )
+        .await
+        .context("RDP deactivation-reactivation sequence")?;
+        if let Some(size) = resized {
             // Reactivation resets the viewer's surface; re-seed it with the pre-resize content
             // (overlap kept, new margin black) so it isn't blank until the full refresh lands.
             let keyframe = encode_resized_keyframe(image, size);
@@ -490,6 +496,28 @@ async fn active_loop(
                 return Ok(());
             }
             request_full_redraw(&mut framed, &mut active_stage, size, redraw).await?;
+        }
+
+        // What the target sent on its other channels while reactivating, in order, now that
+        // the session can take it.
+        for frame in held {
+            let outputs = active_stage
+                .process(image, ironrdp_pdu::Action::X224, &frame, None)
+                .context("processing PDU held during reactivation")?;
+            logon.observe(&outputs);
+            match process_outputs(
+                &mut framed,
+                image,
+                &mut reported_size,
+                outputs,
+                event_tx,
+                abort_rx,
+            )
+            .await
+            {
+                Ok(true) | Err(Aborted) => return Ok(()),
+                Ok(false) => {}
+            }
         }
     }
 }
@@ -654,7 +682,8 @@ struct RedrawSupport {
 }
 
 /// Drive the deactivation-reactivation sequence. Returns the new desktop size if the target
-/// came back at a different one than `image`.
+/// came back at a different one than `image`, and what the target sent on its other channels
+/// meanwhile, for the session to process once it is active again.
 async fn reactivate(
     framed: &mut Framed,
     active_stage: &mut ActiveStage,
@@ -662,14 +691,19 @@ async fn reactivate(
     channel_ids: ChannelIds,
     redraw: &mut RedrawSupport,
     image: &DecodedImage,
-) -> Result<Option<connector::DesktopSize>> {
-    let mut activation = activation_factory.create();
+) -> Result<(Option<connector::DesktopSize>, Vec<Vec<u8>>)> {
+    let mut activation = HoldChannelData {
+        activation: activation_factory.create(),
+        held: Vec::new(),
+    };
     let mut output = WriteBuf::new();
 
     loop {
         ironrdp_tokio::single_sequence_step(framed, &mut activation, &mut output)
             .await
             .context("driving connection reactivation")?;
+        let held = &mut activation.held;
+        let activation = &activation.activation;
 
         let ConnectionActivationState::Finalized {
             desktop_size,
@@ -708,11 +742,50 @@ async fn reactivate(
                 to = ?(desktop_size.width, desktop_size.height),
                 "target reactivated at a new desktop size"
             );
-            return Ok(Some(desktop_size));
+            return Ok((Some(desktop_size), std::mem::take(held)));
         }
 
-        return Ok(None);
+        return Ok((None, std::mem::take(held)));
     }
+}
+
+/// The activation sequence of a reactivation, holding back what the target sends on its
+/// other channels meanwhile. A target keeps using its virtual channels while it reactivates
+/// (a resize while sound plays: audio on drdynvc), and the activation sequence would decode
+/// those as Share Control PDUs and fail ("invalid pdu type"), ending the session.
+struct HoldChannelData {
+    activation: ConnectionActivationSequence,
+    held: Vec<Vec<u8>>,
+}
+
+impl Sequence for HoldChannelData {
+    fn next_pdu_hint(&self) -> Option<&dyn PduHint> {
+        self.activation.next_pdu_hint()
+    }
+
+    fn state(&self) -> &dyn State {
+        self.activation.state()
+    }
+
+    fn step(
+        &mut self,
+        input: &[u8],
+        received_at: Option<MonotonicInstant>,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written> {
+        if is_other_channel(input, self.activation.io_channel_id()) {
+            self.held.push(input.to_vec());
+            return Ok(Written::Nothing);
+        }
+        self.activation.step(input, received_at, output)
+    }
+}
+
+/// Whether `frame` is MCS data for a channel other than the I/O channel, which carries the
+/// activation's Share Control PDUs. Anything else is left for the sequence to judge.
+fn is_other_channel(frame: &[u8], io_channel_id: u16) -> bool {
+    ironrdp_pdu::mcs::decode_send_data_indication(frame)
+        .is_ok_and(|indication| indication.channel_id != io_channel_id)
 }
 
 /// Ask the target to repaint the whole desktop. After a resize the target only sends the
@@ -1628,5 +1701,26 @@ mod tests {
             Some(DesktopEvent::CursorHidden)
         ));
         assert!(encode_pointer(&pointer(2, 2, vec![0; 4])).is_none());
+    }
+
+    fn send_data_indication(channel_id: u16) -> Vec<u8> {
+        use ironrdp_pdu::mcs::{McsMessage, SendDataIndication};
+        use ironrdp_pdu::x224::X224;
+        ironrdp_core::encode_vec(&X224(McsMessage::SendDataIndication(SendDataIndication {
+            initiator_id: 1002,
+            channel_id,
+            user_data: std::borrow::Cow::Borrowed(&[0x10, 0x00, 0x00, 0x00][..]),
+        })))
+        .unwrap()
+    }
+
+    #[test]
+    fn reactivation_holds_back_data_for_other_channels() {
+        // The I/O channel carries the activation; sound on drdynvc does not.
+        assert!(!super::is_other_channel(&send_data_indication(1003), 1003));
+        assert!(super::is_other_channel(&send_data_indication(1007), 1003));
+        // Not MCS data at all: the activation sequence decides what it is.
+        assert!(!super::is_other_channel(&[0x03, 0x00, 0x00, 0x04], 1003));
+        assert!(!super::is_other_channel(&[], 1003));
     }
 }
