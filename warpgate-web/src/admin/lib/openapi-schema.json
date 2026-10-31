@@ -8269,7 +8269,6 @@
           "verify_tls",
           "compression",
           "interactive_logon",
-          "audio_playback",
           "microphone",
           "tls_security"
         ],
@@ -8310,7 +8309,8 @@
           },
           "audio_playback": {
             "type": "boolean",
-            "description": "Play the target's sound on RDP viewers and in the web client (audio output\nredirection, MS-RDPEA)."
+            "description": "Play the target's sound on RDP viewers and in the web client (audio output\nredirection, MS-RDPEA).",
+            "default": false
           },
           "microphone": {
             "type": "boolean",
