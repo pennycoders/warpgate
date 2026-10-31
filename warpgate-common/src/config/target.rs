@@ -332,6 +332,7 @@ pub struct TargetRdpOptions {
     /// Let the target record from the viewer's microphone (audio input redirection,
     /// MS-RDPEAI), on RDP viewers and in the web client.
     #[serde(default)]
+    #[oai(default)]
     pub microphone: bool,
 
     // TLS compatibility/security profile used for the target-facing RDP connection.
@@ -750,9 +751,11 @@ mod tests {
         let mut upstream = defaults.to_json().unwrap();
         let fields = upstream.as_object_mut().unwrap();
         fields.remove("audio_playback");
+        fields.remove("microphone");
         let rdp = TargetRdpOptions::parse_from_json(Some(upstream)).unwrap();
 
         assert!(!rdp.audio_playback);
+        assert!(!rdp.microphone);
     }
 
     #[test]
