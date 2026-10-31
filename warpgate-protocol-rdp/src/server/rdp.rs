@@ -31,9 +31,10 @@ use warpgate_core::{DesktopInput, Scancode};
 use warpgate_desktop_ui::DEFAULT_SIZE;
 
 use super::clipboard::ViewerClipboard;
-use super::gfx::{GraphicsFactory, Signal, ViewerGraphics};
+use super::gfx::{GraphicsFactory, Routed, ViewerGraphics};
 use super::protocol::{AuthVerdict, Event, Input};
 use super::sound::ViewerSound;
+use super::surface::Request;
 use crate::desktop_size::bound_desktop_size;
 #[cfg(test)]
 use crate::desktop_size::{MAX_DESKTOP_DIM, MAX_FRAME_BYTES, MIN_DESKTOP_DIM};
@@ -116,10 +117,9 @@ where
 
     let clipboard = ViewerClipboard::new(out_tx.clone());
     let sound = ViewerSound::new();
-    let graphics = graphics_pipeline.then(ViewerGraphics::new);
+    let graphics = ViewerGraphics::new(*size.lock().await);
     let display_route = DisplayRouteState {
         size: Arc::clone(&size),
-        out: out_tx.clone(),
     };
 
     let display = DisplayHandler {
@@ -127,14 +127,14 @@ where
         initial_size_negotiated: false,
         updates: Arc::new(Mutex::new(frame_rx)),
         out: out_tx.clone(),
-        graphics: graphics.as_ref().map(ViewerGraphics::factory),
+        graphics: graphics.factory(),
     };
     let input = InputHandler {
         out: out_tx.clone(),
         x: 0,
         y: 0,
         buttons: 0,
-        graphics: graphics.as_ref().map(ViewerGraphics::factory),
+        graphics: graphics.factory(),
     };
     let validator: Arc<dyn CredentialValidator> = Arc::new(Validator {
         out: out_tx.clone(),
@@ -156,11 +156,9 @@ where
         // Offered to every viewer: the target is not known yet when channels are joined.
         .with_sound_factory(Some(Box::new(sound.clone())))
         .with_gfx_factory(
-            graphics
-                .as_ref()
-                .map(|graphics| Box::new(graphics.factory()) as Box<dyn GfxServerFactory>),
+            graphics_pipeline.then(|| Box::new(graphics.factory()) as Box<dyn GfxServerFactory>),
         )
-        .with_bitmap_codecs(bitmap_codecs(graphics.is_some()))
+        .with_bitmap_codecs(bitmap_codecs(graphics_pipeline))
         .build();
 
     let router = tokio::spawn(
@@ -211,8 +209,29 @@ fn build_tls_acceptor(cert_pem: &str, key_pem: &str) -> Result<TlsAcceptor> {
 
 /// Shared display state used while routing Warpgate framebuffer messages.
 struct DisplayRouteState {
+    /// The size the bitmap path's encoder is rebuilt at on a reactivation.
     size: Arc<Mutex<DesktopSize>>,
-    out: mpsc::UnboundedSender<Event>,
+}
+
+impl DisplayRouteState {
+    /// Sends bitmap-path updates in order; a resize is committed before it is sent, so the
+    /// reactivation it starts rebuilds the encoder at the new size. `false` once the server
+    /// is gone.
+    async fn send(
+        &self,
+        frame_tx: &mpsc::Sender<DisplayUpdate>,
+        updates: impl IntoIterator<Item = DisplayUpdate>,
+    ) -> bool {
+        for update in updates {
+            if let DisplayUpdate::Resize(size) = &update {
+                *self.size.lock().await = *size;
+            }
+            if frame_tx.send(update).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Route Warpgate's messages to the display backend (framebuffer updates) and the
@@ -223,22 +242,22 @@ async fn route_input(
     display: DisplayRouteState,
     clipboard: ViewerClipboard,
     sound: ViewerSound,
-    mut graphics: Option<ViewerGraphics>,
+    mut graphics: ViewerGraphics,
     server_events: mpsc::UnboundedSender<ServerEvent>,
 ) {
     loop {
         let msg = tokio::select! {
-            msg = rx.recv() => msg,
-            Some(signal) = next_signal(graphics.as_mut()) => {
-                let size = *display.size.lock().await;
-                let updates = graphics.as_mut().map(|g| g.handle(signal, size));
-                for update in updates.unwrap_or_default() {
-                    if frame_tx.send(update).await.is_err() {
-                        return;
-                    }
+            // The viewer's requests first: one is always sent before the frames painted for
+            // it (the hold screen paints at the size the viewer negotiated).
+            biased;
+            Some(signal) = graphics.signal() => {
+                let updates = graphics.handle(signal);
+                if !display.send(&frame_tx, updates).await {
+                    return;
                 }
                 continue;
             }
+            msg = rx.recv() => msg,
         };
         let Some(msg) = msg else {
             break;
@@ -251,37 +270,25 @@ async fn route_input(
                 height,
                 data,
             } => {
-                if let Some(graphics) = graphics.as_mut() {
-                    let size = *display.size.lock().await;
-                    if graphics.frame(size, x, y, width, height, &data) {
-                        continue;
-                    }
-                }
-                if let Some(update) = frame_to_update(x, y, width, height, data)
+                let update = match graphics.frame(x, y, width, height, &data) {
+                    Routed::Sent => None,
+                    Routed::AsIs => frame_to_update(x, y, width, height, data),
+                    Routed::Bitmap(update) => Some(update),
+                };
+                if let Some(update) = update
                     && frame_tx.send(update).await.is_err()
                 {
                     break;
                 }
             }
             Input::Resize { width, height } => {
-                let new = DesktopSize { width, height };
-                // A resize costs a deactivation-reactivation: the server tears the session
-                // down to the acceptor and renegotiates capabilities with the viewer. Skip
-                // it when the size is unchanged so an already-correct session is never
-                // disturbed.
-                let previous = core::mem::replace(&mut *display.size.lock().await, new);
-                if previous == new {
-                    continue;
-                }
-                debug!(?previous, ?new, "viewer surface resized");
-                let piped = graphics.as_mut().is_some_and(|g| g.resize(new));
-                if !piped && frame_tx.send(DisplayUpdate::Resize(new)).await.is_err() {
+                // The target's desktop (or the hold screen) changed size. The viewer keeps
+                // the surface it asked for, and the desktop is scaled into it until the two
+                // match, so this never resizes the viewer.
+                let updates = graphics.resize(DesktopSize { width, height });
+                if !display.send(&frame_tx, updates).await {
                     break;
                 }
-                let _ = display.out.send(Event::Size {
-                    width: new.width,
-                    height: new.height,
-                });
             }
             Input::Cursor {
                 hotspot_x,
@@ -320,13 +327,6 @@ async fn route_input(
                 break;
             }
         }
-    }
-}
-
-async fn next_signal(graphics: Option<&mut ViewerGraphics>) -> Option<Signal> {
-    match graphics {
-        Some(graphics) => graphics.signal().await,
-        None => core::future::pending().await,
     }
 }
 
@@ -450,8 +450,8 @@ struct DisplayHandler {
     // one-shot receiver would fail the second connection with "already taken".
     updates: Arc<Mutex<mpsc::Receiver<DisplayUpdate>>>,
     out: mpsc::UnboundedSender<Event>,
-    /// Told the viewer's screen size, which the pipeline's output keeps the shape of.
-    graphics: Option<GraphicsFactory>,
+    /// Told every size the viewer asks for, which its surface is then given.
+    graphics: GraphicsFactory,
 }
 
 #[async_trait::async_trait]
@@ -469,8 +469,8 @@ impl RdpServerDisplay for DisplayHandler {
     /// and adopting it would rebuild the encoder below the frames Warpgate is about to send,
     /// so every larger tile hits the "bitmap exceeds desktop size" drop (a grow paints black,
     /// while a shrink still fits and looks fine). So the viewer's size is honoured only for
-    /// the initial negotiation; from then on the committed size — driven by the target after
-    /// a Display Control resize — is authoritative and the viewer conforms to it.
+    /// the initial negotiation; from then on the committed size — the one the viewer last
+    /// asked for over Display Control — is authoritative and the viewer conforms to it.
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         if self.initial_size_negotiated {
             let committed = *self.size.lock().await;
@@ -484,10 +484,8 @@ impl RdpServerDisplay for DisplayHandler {
         self.initial_size_negotiated = true;
         let size = clamp_desktop_size(client_size);
         debug!(?client_size, adopted = ?size, "initial viewer size negotiated");
-        if let Some(graphics) = &self.graphics {
-            graphics.set_viewer(size);
-        }
         *self.size.lock().await = size;
+        self.graphics.request(size, Request::Initial);
         let _ = self.out.send(Event::Size {
             width: size.width,
             height: size.height,
@@ -503,19 +501,23 @@ impl RdpServerDisplay for DisplayHandler {
         }))
     }
 
+    /// Every layout is answered at its size on the viewer's side, and passed on to the
+    /// target, which follows if it can (the target client drops a size it was already asked
+    /// for).
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         let Some(size) = primary_monitor_size(&layout) else {
+            debug!(
+                ?layout,
+                "viewer sent a layout without a usable primary monitor"
+            );
             return;
         };
-        if let Some(graphics) = &self.graphics {
-            graphics.set_viewer(size);
-        }
-        // ironrdp-server calls this from `spawn_blocking`, never on the runtime thread, which
-        // is what makes blocking on the lock legal here.
-        if *self.size.blocking_lock() == size {
-            return;
-        }
-        debug!(requested = ?size, "viewer requested a dynamic resize");
+        debug!(
+            monitors = ?layout.monitors(),
+            requested = ?size,
+            "viewer requested a dynamic resize"
+        );
+        self.graphics.request(size, Request::Layout);
         let _ = self.out.send(Event::ResizeRequest {
             width: size.width,
             height: size.height,
@@ -578,8 +580,8 @@ struct InputHandler {
     x: u16,
     y: u16,
     buttons: u8,
-    /// Maps the viewer's pointer from the pipeline's letterboxed output to the desktop.
-    graphics: Option<GraphicsFactory>,
+    /// Maps the viewer's pointer from its surface to the desktop.
+    graphics: GraphicsFactory,
 }
 
 impl InputHandler {
@@ -632,10 +634,7 @@ impl RdpServerInputHandler for InputHandler {
     fn mouse(&mut self, event: MouseEvent) {
         match event {
             MouseEvent::Move { x, y } => {
-                (self.x, self.y) = self
-                    .graphics
-                    .as_ref()
-                    .map_or((x, y), |graphics| graphics.to_desktop(x, y));
+                (self.x, self.y) = self.graphics.to_desktop(x, y);
                 self.emit_pointer();
             }
             MouseEvent::LeftPressed => self.set_button(0, true),
@@ -702,7 +701,8 @@ mod desktop_size_tests {
 
     use super::{
         DEFAULT_SIZE, DesktopSize, DisplayHandler, MAX_DESKTOP_DIM, MAX_FRAME_BYTES,
-        MIN_DESKTOP_DIM, RdpServerDisplay, clamp_desktop_size, primary_monitor_size,
+        MIN_DESKTOP_DIM, RdpServerDisplay, ViewerGraphics, clamp_desktop_size,
+        primary_monitor_size,
     };
     use crate::server::protocol::Event;
 
@@ -772,18 +772,25 @@ mod desktop_size_tests {
             initial_size_negotiated,
             updates: Arc::new(Mutex::new(rx)),
             out,
-            graphics: None,
+            graphics: ViewerGraphics::new(committed).factory(),
         };
         (display, events)
     }
 
-    /// A layout at the committed size is noise; a different one is a request for the target.
+    /// Every layout goes to the target, even one at the surface's size: the viewer's side has
+    /// answered it already, and the target may still be at another size.
     #[test]
     fn dynamic_layout_request_is_forwarded_to_the_target() {
         let (mut display, mut events) = display_handler(size(800, 600), true);
 
         display.request_layout(single_primary_layout(800, 600));
-        assert!(events.try_recv().is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::ResizeRequest {
+                width: 800,
+                height: 600,
+            })
+        ));
 
         display.request_layout(single_primary_layout(1024, 768));
         assert!(matches!(
@@ -839,7 +846,9 @@ mod disconnect_tests {
     use ironrdp_server::{DesktopSize, DisplayUpdate, ServerEvent};
     use tokio::sync::{Mutex, mpsc};
 
-    use super::{DisplayRouteState, Input, ViewerClipboard, ViewerSound, route_input};
+    use super::{
+        DisplayRouteState, Input, ViewerClipboard, ViewerGraphics, ViewerSound, route_input,
+    };
 
     struct Router {
         input: mpsc::Sender<Input>,
@@ -853,12 +862,12 @@ mod disconnect_tests {
         let (frame_tx, frames) = mpsc::channel(4);
         let (out, _) = mpsc::unbounded_channel();
         let (server_events, events) = mpsc::unbounded_channel();
+        let size = DesktopSize {
+            width: 800,
+            height: 600,
+        };
         let display = DisplayRouteState {
-            size: Arc::new(Mutex::new(DesktopSize {
-                width: 800,
-                height: 600,
-            })),
-            out: out.clone(),
+            size: Arc::new(Mutex::new(size)),
         };
         let task = tokio::spawn(route_input(
             rx,
@@ -866,7 +875,7 @@ mod disconnect_tests {
             display,
             ViewerClipboard::new(out),
             ViewerSound::new(),
-            None,
+            ViewerGraphics::new(size),
             server_events,
         ));
         Router {
@@ -980,7 +989,10 @@ mod graphics_tests {
 
     #[tokio::test]
     async fn an_open_pipeline_takes_frames_and_resizes_from_the_bitmap_path() {
-        let graphics = ViewerGraphics::new();
+        let graphics = ViewerGraphics::new(DesktopSize {
+            width: 16,
+            height: 8,
+        });
         let mut factory = graphics.factory();
         let (server_events, mut events) = mpsc::unbounded_channel();
         factory.set_sender(server_events.clone());
@@ -996,7 +1008,6 @@ mod graphics_tests {
                 width: 16,
                 height: 8,
             })),
-            out: out.clone(),
         };
         tokio::spawn(route_input(
             rx,
@@ -1004,7 +1015,7 @@ mod graphics_tests {
             display,
             ViewerClipboard::new(out),
             ViewerSound::new(),
-            Some(graphics),
+            graphics,
             server_events,
         ));
 

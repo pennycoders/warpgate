@@ -1,15 +1,14 @@
-//! The desktop over the Graphics Pipeline (MS-RDPEGFX), for viewers that open it.
+//! The desktop on the viewer's surface, over the Graphics Pipeline (MS-RDPEGFX) for viewers
+//! that open it and over the bitmap path for the others.
 //!
-//! A resize then reaches the viewer as a ResetGraphics with a new surface instead of a
-//! deactivation-reactivation. Windows App needs that: after a reactivation it keeps
-//! drawing at the size it connected with.
-//!
-//! The output keeps the viewer's shape: a desktop of another shape (a target that keeps its
-//! own size) is centred in it between black bars, since Windows App stretches the output to
-//! its screen.
+//! The viewer's surface is always the size the viewer last asked for (see
+//! [`super::surface`]): each monitor layout is answered with a ResetGraphics, or on the
+//! bitmap path a deactivation-reactivation, at exactly that size, whether or not the target
+//! follows. Windows App needs that: it draws the last surface it was given over its whole
+//! screen, so a surface of another shape is stretched when the device turns. The target's
+//! desktop is scaled into the surface until it has the same size, then drawn 1:1.
 
 use std::num::{NonZeroU16, NonZeroUsize};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -29,29 +28,26 @@ use ironrdp_server::{
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use super::surface::{Answer, Painter, Placement, Rect, Request, ViewerSurface};
+
 /// Past this many pending rectangles they are sent as their bounding box.
 const MAX_TILES: usize = 16;
-
-/// The largest output side a letterbox may grow to; past it the desktop is sent as it is.
-const MAX_OUTPUT: u32 = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Signal {
     Ready,
     Acknowledged,
     Closed,
-    /// The viewer's screen changed shape.
-    Viewer,
+    /// The viewer asked for its surface to be this size.
+    Viewer(DesktopSize, Request),
 }
 
 struct Shared {
     events: Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>,
     pipeline: Mutex<Option<GfxServerHandle>>,
     signals: mpsc::UnboundedSender<Signal>,
-    /// The viewer's screen size.
-    viewer: Mutex<Option<DesktopSize>>,
-    /// Where the desktop sits in the output, as `x << 16 | y`.
-    origin: AtomicU32,
+    /// Where the desktop is on the viewer's surface, for the pointer.
+    placement: Mutex<Placement>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -62,22 +58,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(super) struct GraphicsFactory(Arc<Shared>);
 
 impl GraphicsFactory {
-    /// Records the viewer's screen size, which the output keeps the shape of.
-    pub(super) fn set_viewer(&self, size: DesktopSize) {
-        let changed = lock(&self.0.viewer).replace(size) != Some(size);
-        if changed {
-            let _ = self.0.signals.send(Signal::Viewer);
-        }
+    /// Passes on the viewer's request for its surface size.
+    pub(super) fn request(&self, size: DesktopSize, request: Request) {
+        let _ = self.0.signals.send(Signal::Viewer(size, request));
     }
 
-    /// Maps a point on the viewer's output to the desktop.
+    /// Maps a point on the viewer's surface to the desktop.
     pub(super) fn to_desktop(&self, x: u16, y: u16) -> (u16, u16) {
-        let origin = self.0.origin.load(Ordering::Relaxed);
-        let (left, top) = (
-            u16::try_from(origin >> 16).unwrap_or(0),
-            u16::try_from(origin & 0xffff).unwrap_or(0),
-        );
-        (x.saturating_sub(left), y.saturating_sub(top))
+        lock(&self.0.placement).to_desktop(x, y)
     }
 }
 
@@ -123,52 +111,63 @@ impl GraphicsPipelineHandler for Handler {
     }
 }
 
-/// The router's side: keeps a copy of the desktop and, while the viewer has the pipeline
-/// open, sends it the changed rectangles as ClearCodec tiles.
+/// Where a frame from the target went.
+#[derive(Debug)]
+pub(super) enum Routed {
+    /// Through the pipeline, or nowhere: nothing more to send.
+    Sent,
+    /// The bitmap path takes it as it is: the desktop is the viewer's surface.
+    AsIs,
+    /// The bitmap path takes the surface's pixels it changed.
+    Bitmap(DisplayUpdate),
+}
+
+/// The router's side: keeps a copy of the desktop and draws it on the viewer's surface,
+/// over the pipeline while the viewer has it open (the changed rectangles as ClearCodec
+/// tiles) and as bitmap updates otherwise.
 pub(super) struct ViewerGraphics {
     shared: Arc<Shared>,
     signals: mpsc::UnboundedReceiver<Signal>,
-    size: DesktopSize,
-    /// BGRA rows of `size`.
+    /// The target's desktop; until the first frame size is known, the surface's.
+    desktop: Option<DesktopSize>,
+    /// BGRA rows of the desktop.
     canvas: Vec<u8>,
-    /// The viewer's output: the desktop letterboxed to the viewer's shape.
-    output: DesktopSize,
-    /// Where the desktop sits in `output`.
-    origin: (u16, u16),
-    surface: Option<u16>,
+    surface: ViewerSurface,
+    painter: Painter,
+    /// The pipeline surface, while the pipeline is open.
+    pipeline_surface: Option<u16>,
     encoder: ClearCodecEncoder,
-    dirty: Vec<ExclusiveRectangle>,
-    /// The size the bitmap path was left at when the pipeline opened.
-    committed: DesktopSize,
+    dirty: Vec<Rect>,
+    /// The size the bitmap path's encoder is at.
+    bitmap: DesktopSize,
     started: Instant,
 }
 
 impl ViewerGraphics {
-    pub(super) fn new() -> Self {
+    /// Starts with the viewer's surface at `size`, the size the server advertises.
+    pub(super) fn new(size: DesktopSize) -> Self {
         let (signals_tx, signals) = mpsc::unbounded_channel();
-        let empty = DesktopSize {
-            width: 0,
-            height: 0,
-        };
-        Self {
+        let placement = Placement::identity(size);
+        let mut graphics = Self {
             shared: Arc::new(Shared {
                 events: Mutex::default(),
                 pipeline: Mutex::default(),
                 signals: signals_tx,
-                viewer: Mutex::default(),
-                origin: AtomicU32::new(0),
+                placement: Mutex::new(placement),
             }),
             signals,
-            size: empty,
+            desktop: None,
             canvas: Vec::new(),
-            output: empty,
-            origin: (0, 0),
-            surface: None,
+            surface: ViewerSurface::new(size),
+            painter: Painter::new(placement),
+            pipeline_surface: None,
             encoder: ClearCodecEncoder::new(),
             dirty: Vec::new(),
-            committed: empty,
+            bitmap: size,
             started: Instant::now(),
-        }
+        };
+        graphics.fit_canvas();
+        graphics
     }
 
     pub(super) fn factory(&self) -> GraphicsFactory {
@@ -179,38 +178,29 @@ impl ViewerGraphics {
         self.signals.recv().await
     }
 
-    /// Updates for the bitmap path, which takes the desktop back when the pipeline closes.
-    pub(super) fn handle(&mut self, signal: Signal, size: DesktopSize) -> Vec<DisplayUpdate> {
+    /// Updates for the bitmap path.
+    pub(super) fn handle(&mut self, signal: Signal) -> Vec<DisplayUpdate> {
         match signal {
             Signal::Ready => {
-                self.open(size);
+                self.open();
                 Vec::new()
             }
             Signal::Acknowledged => {
                 self.flush();
                 Vec::new()
             }
-            Signal::Closed => self.close(size),
-            Signal::Viewer => {
-                self.reshape();
-                Vec::new()
-            }
+            Signal::Closed => self.close(),
+            Signal::Viewer(size, request) => self.requested(size, request),
         }
     }
 
-    /// Whether the frame went through the pipeline; otherwise it is the bitmap path's.
-    pub(super) fn frame(
-        &mut self,
-        size: DesktopSize,
-        x: u16,
-        y: u16,
-        width: u16,
-        height: u16,
-        data: &[u8],
-    ) -> bool {
-        self.fit(size);
+    /// Takes a frame of the target's desktop.
+    pub(super) fn frame(&mut self, x: u16, y: u16, width: u16, height: u16, data: &[u8]) -> Routed {
+        // From the first frame on the desktop keeps its size until told otherwise, so a later
+        // layout scales what is on it rather than clearing it.
+        self.desktop.get_or_insert_with(|| self.surface.size());
         let rect = self.clip(x, y, width, height);
-        let columns = usize::from(rect.right - rect.left) * 4;
+        let columns = usize::from(rect.width()) * 4;
         let src_stride = usize::from(width) * 4;
         for (row, top) in (rect.top..rect.bottom).enumerate() {
             let at = self.offset(rect.left, top);
@@ -222,121 +212,197 @@ impl ViewerGraphics {
             };
             dst.copy_from_slice(src);
         }
-        if self.surface.is_none() {
-            return false;
+        if self.pipeline_surface.is_none() {
+            if self.painter.placement().is_identity() && self.bitmap == self.desktop_size() {
+                return Routed::AsIs;
+            }
+            if rect.is_empty() {
+                return Routed::Sent;
+            }
+            let output =
+                self.painter
+                    .placement()
+                    .to_output(rect.left, rect.top, rect.right, rect.bottom);
+            return self
+                .bitmap_update(output)
+                .map_or(Routed::Sent, Routed::Bitmap);
         }
-        if rect.right > rect.left && rect.bottom > rect.top {
-            let (left, top) = self.origin;
-            self.dirty.push(ExclusiveRectangle {
-                left: rect.left + left,
-                top: rect.top + top,
-                right: rect.right + left,
-                bottom: rect.bottom + top,
-            });
+        if !rect.is_empty() {
+            let output =
+                self.painter
+                    .placement()
+                    .to_output(rect.left, rect.top, rect.right, rect.bottom);
+            self.dirty.push(output);
         }
         self.flush();
-        true
+        Routed::Sent
     }
 
-    /// Whether the pipeline took the resize; otherwise the bitmap path reactivates.
-    pub(super) fn resize(&mut self, size: DesktopSize) -> bool {
-        self.fit(size);
-        if self.surface.is_none() {
-            return false;
+    /// The target's desktop is now `size`. The viewer's surface stays as it is.
+    pub(super) fn resize(&mut self, size: DesktopSize) -> Vec<DisplayUpdate> {
+        if self.desktop == Some(size) {
+            return Vec::new();
         }
-        self.reset();
-        true
+        self.desktop = Some(size);
+        self.fit_canvas();
+        let placement = self.relayout();
+        let surface = self.surface.size();
+        if size == surface {
+            debug!(
+                ?size,
+                "target desktop has the viewer's size; drawing it 1:1"
+            );
+        } else {
+            debug!(
+                desktop = ?size,
+                ?surface,
+                scaled = ?placement.scaled,
+                scale = %format_args!("{:.3}", placement.scale()),
+                "target desktop differs from the viewer's surface; scaling it in"
+            );
+        }
+        if self.pipeline_surface.is_some() {
+            self.dirty = vec![self.full()];
+            self.flush();
+            return Vec::new();
+        }
+        if placement.is_identity() {
+            // The target's next update covers all of it.
+            return Vec::new();
+        }
+        self.bitmap_update(self.full()).into_iter().collect()
     }
 
-    /// Letterboxes the desktop to the viewer's new shape, if that moves it.
-    fn reshape(&mut self) {
-        let before = (self.output, self.origin);
-        if self.surface.is_some() && self.layout() != before {
+    /// Answers the viewer's request for its surface size.
+    fn requested(&mut self, size: DesktopSize, request: Request) -> Vec<DisplayUpdate> {
+        let answer = self.surface.request(size, request);
+        if request == Request::Initial {
+            // The connection is negotiated at this size.
+            self.bitmap = size;
+            self.fit_canvas();
+            self.relayout();
+            debug!(?size, "viewer surface negotiated");
+            return Vec::new();
+        }
+        let Answer::Reset { changed } = answer else {
+            debug!(?size, "viewer repeated the layout just answered");
+            return Vec::new();
+        };
+        if self.desktop.is_none() {
+            self.fit_canvas();
+        }
+        let placement = self.relayout();
+        let pipeline = self.pipeline_surface.is_some();
+        debug!(
+            requested = ?size,
+            applied = ?self.surface.size(),
+            desktop = ?placement.desktop,
+            scaled = ?placement.scaled,
+            scale = %format_args!("{:.3}", placement.scale()),
+            path = if pipeline { "graphics pipeline" } else { "bitmap" },
+            "answering the viewer's layout at its size"
+        );
+        if pipeline {
             self.reset();
+            return Vec::new();
         }
+        if !changed {
+            return Vec::new();
+        }
+        self.bitmap = size;
+        let desktop = self.bitmap_update(self.full());
+        core::iter::once(DisplayUpdate::Resize(size))
+            .chain(desktop)
+            .collect()
     }
 
-    fn open(&mut self, size: DesktopSize) {
-        self.fit(size);
-        self.committed = size;
+    fn open(&mut self) {
         // A (re)negotiation starts the viewer's ClearCodec state from scratch.
         self.encoder = ClearCodecEncoder::new();
+        self.relayout();
         self.reset();
     }
 
-    /// Resets the viewer's graphics to the letterboxed output and sends all of it.
+    /// Resets the viewer's graphics to its surface and sends all of it.
     fn reset(&mut self) {
-        self.layout();
         let Some(pipeline) = self.pipeline() else {
             return;
         };
-        self.surface = reset(&mut lock(&pipeline), self.output);
-        let (left, top) = self.origin;
-        self.shared
-            .origin
-            .store(u32::from(left) << 16 | u32::from(top), Ordering::Relaxed);
+        let size = self.surface.size();
+        self.pipeline_surface = reset(&mut lock(&pipeline), size);
+        debug!(?size, "reset the viewer's graphics");
         self.dirty = vec![self.full()];
         self.flush();
     }
 
-    fn layout(&mut self) -> (DesktopSize, (u16, u16)) {
-        let viewer = *lock(&self.shared.viewer);
-        (self.output, self.origin) = letterbox(self.size, viewer);
-        (self.output, self.origin)
+    /// Places the desktop on the surface again.
+    fn relayout(&mut self) -> Placement {
+        let placement = Placement::fit(self.desktop_size(), self.surface.size());
+        if *self.painter.placement() != placement {
+            self.painter = Painter::new(placement);
+            *lock(&self.shared.placement) = placement;
+        }
+        placement
     }
 
-    fn close(&mut self, size: DesktopSize) -> Vec<DisplayUpdate> {
-        if self.surface.take().is_none() {
+    fn close(&mut self) -> Vec<DisplayUpdate> {
+        if self.pipeline_surface.take().is_none() {
             return Vec::new();
         }
-        self.shared.origin.store(0, Ordering::Relaxed);
         self.dirty.clear();
-        self.fit(size);
-        let resize = (size != self.committed).then_some(DisplayUpdate::Resize(size));
-        let (Some(width), Some(height), Some(stride)) = (
-            NonZeroU16::new(size.width),
-            NonZeroU16::new(size.height),
-            NonZeroUsize::new(usize::from(size.width) * 4),
+        let surface = self.surface.size();
+        let resize = (surface != self.bitmap).then_some(DisplayUpdate::Resize(surface));
+        self.bitmap = surface;
+        let desktop = self.bitmap_update(self.full());
+        resize.into_iter().chain(desktop).collect()
+    }
+
+    /// The surface's pixels in `rect` as a bitmap update.
+    fn bitmap_update(&self, rect: Rect) -> Option<DisplayUpdate> {
+        let (Some(width), Some(height)) = (
+            NonZeroU16::new(rect.width()),
+            NonZeroU16::new(rect.height()),
         ) else {
-            return resize.into_iter().collect();
+            return None;
         };
-        let desktop = DisplayUpdate::Bitmap(BitmapUpdate {
-            x: 0,
-            y: 0,
+        let stride = NonZeroUsize::new(usize::from(rect.width()) * 4)?;
+        Some(DisplayUpdate::Bitmap(BitmapUpdate {
+            x: rect.left,
+            y: rect.top,
             width,
             height,
             format: PixelFormat::BgrA32,
-            data: Bytes::copy_from_slice(&self.canvas),
+            data: Bytes::from(self.painter.paint(&self.canvas, rect)),
             stride,
-        });
-        resize.into_iter().chain([desktop]).collect()
+        }))
     }
 
     /// Sends the pending rectangles unless the viewer is behind on acknowledgements, and
     /// whatever else the pipeline has queued.
     fn flush(&mut self) {
-        let (Some(surface), Some(pipeline)) = (self.surface, self.pipeline()) else {
+        let (Some(surface), Some(pipeline)) = (self.pipeline_surface, self.pipeline()) else {
             return;
         };
         let mut pipeline = lock(&pipeline);
         if !self.dirty.is_empty() && !pipeline.should_backpressure() {
             if self.dirty.len() > MAX_TILES {
-                self.dirty = self
-                    .dirty
-                    .drain(..)
-                    .reduce(|a, b| union(&a, &b))
-                    .into_iter()
-                    .collect();
+                self.dirty = self.dirty.drain(..).reduce(union).into_iter().collect();
             }
             let tiles = core::mem::take(&mut self.dirty)
                 .into_iter()
-                .map(|destination| MixedTilePayload::ClearCodec {
+                .filter(|rect| !rect.is_empty())
+                .map(|rect| MixedTilePayload::ClearCodec {
                     bitmap_data: self.encoder.encode(
-                        &self.pixels(&destination),
-                        destination.right - destination.left,
-                        destination.bottom - destination.top,
+                        &self.painter.paint(&self.canvas, rect),
+                        rect.width(),
+                        rect.height(),
                     ),
-                    destination,
+                    destination: ExclusiveRectangle {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    },
                 })
                 .collect();
             let timestamp = u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX);
@@ -368,63 +434,42 @@ impl ViewerGraphics {
         lock(&self.shared.pipeline).clone()
     }
 
-    fn fit(&mut self, size: DesktopSize) {
-        if self.size != size {
-            self.size = size;
-            self.canvas = vec![0; usize::from(size.width) * usize::from(size.height) * 4];
+    fn desktop_size(&self) -> DesktopSize {
+        self.desktop.unwrap_or_else(|| self.surface.size())
+    }
+
+    fn fit_canvas(&mut self) {
+        let size = self.desktop_size();
+        let len = usize::from(size.width) * usize::from(size.height) * 4;
+        if self.canvas.len() != len {
+            self.canvas = vec![0; len];
         }
     }
 
-    fn clip(&self, x: u16, y: u16, width: u16, height: u16) -> ExclusiveRectangle {
-        let left = x.min(self.size.width);
-        let top = y.min(self.size.height);
-        ExclusiveRectangle {
+    fn clip(&self, x: u16, y: u16, width: u16, height: u16) -> Rect {
+        let size = self.desktop_size();
+        let left = x.min(size.width);
+        let top = y.min(size.height);
+        Rect {
             left,
             top,
-            right: x.saturating_add(width).clamp(left, self.size.width),
-            bottom: y.saturating_add(height).clamp(top, self.size.height),
+            right: x.saturating_add(width).clamp(left, size.width),
+            bottom: y.saturating_add(height).clamp(top, size.height),
         }
     }
 
-    const fn full(&self) -> ExclusiveRectangle {
-        ExclusiveRectangle {
+    const fn full(&self) -> Rect {
+        let size = self.surface.size();
+        Rect {
             left: 0,
             top: 0,
-            right: self.output.width,
-            bottom: self.output.height,
+            right: size.width,
+            bottom: size.height,
         }
     }
 
     fn offset(&self, x: u16, y: u16) -> usize {
-        (usize::from(y) * usize::from(self.size.width) + usize::from(x)) * 4
-    }
-
-    /// The output's pixels in `rect`: the desktop's, black around it.
-    fn pixels(&self, rect: &ExclusiveRectangle) -> Vec<u8> {
-        let (left, top) = self.origin;
-        let width = usize::from(rect.right - rect.left);
-        let mut out = vec![0; width * usize::from(rect.bottom - rect.top) * 4];
-        let from = rect.left.max(left);
-        let to = rect.right.min(left + self.size.width);
-        if from >= to {
-            return out;
-        }
-        let columns = usize::from(to - from) * 4;
-        let into = usize::from(from - rect.left) * 4;
-        for (row, y) in (rect.top..rect.bottom).enumerate() {
-            let Some(y) = y.checked_sub(top).filter(|y| *y < self.size.height) else {
-                continue;
-            };
-            let at = self.offset(from - left, y);
-            let start = row * width * 4 + into;
-            if let (Some(src), Some(dst)) = (
-                self.canvas.get(at..at + columns),
-                out.get_mut(start..start + columns),
-            ) {
-                dst.copy_from_slice(src);
-            }
-        }
-        out
+        (usize::from(y) * usize::from(self.desktop_size().width) + usize::from(x)) * 4
     }
 }
 
@@ -445,43 +490,8 @@ fn reset(pipeline: &mut GraphicsPipelineServer, size: DesktopSize) -> Option<u16
     Some(surface)
 }
 
-/// The output for `desktop` on a viewer of `viewer`'s shape, and where the desktop sits in it:
-/// the smallest size of that shape around the desktop, which is centred in it.
-fn letterbox(desktop: DesktopSize, viewer: Option<DesktopSize>) -> (DesktopSize, (u16, u16)) {
-    let as_is = (desktop, (0, 0));
-    let Some(viewer) = viewer.filter(|v| v.width > 0 && v.height > 0) else {
-        return as_is;
-    };
-    let (width, height) = (u32::from(desktop.width), u32::from(desktop.height));
-    let (shape_width, shape_height) = (u32::from(viewer.width), u32::from(viewer.height));
-    let (output_width, output_height) = if width * shape_height >= height * shape_width {
-        (width, (width * shape_height).div_ceil(shape_width))
-    } else {
-        ((height * shape_width).div_ceil(shape_height), height)
-    };
-    let (Ok(output_width), Ok(output_height)) = (
-        u16::try_from(output_width.min(MAX_OUTPUT + 1)),
-        u16::try_from(output_height.min(MAX_OUTPUT + 1)),
-    ) else {
-        return as_is;
-    };
-    if u32::from(output_width.max(output_height)) > MAX_OUTPUT {
-        return as_is;
-    }
-    (
-        DesktopSize {
-            width: output_width,
-            height: output_height,
-        },
-        (
-            (output_width - desktop.width) / 2,
-            (output_height - desktop.height) / 2,
-        ),
-    )
-}
-
-fn union(a: &ExclusiveRectangle, b: &ExclusiveRectangle) -> ExclusiveRectangle {
-    ExclusiveRectangle {
+fn union(a: Rect, b: Rect) -> Rect {
+    Rect {
         left: a.left.min(b.left),
         top: a.top.min(b.top),
         right: a.right.max(b.right),
@@ -505,9 +515,9 @@ mod tests {
     const CHANNEL: u32 = 7;
 
     /// Counts the tiles the client decodes.
-    struct Painter(Arc<AtomicUsize>);
+    struct Counter(Arc<AtomicUsize>);
 
-    impl ironrdp_egfx::client::GraphicsPipelineHandler for Painter {
+    impl ironrdp_egfx::client::GraphicsPipelineHandler for Counter {
         fn on_bitmap_updated(&mut self, _update: &ironrdp_egfx::client::BitmapUpdate) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
@@ -531,8 +541,14 @@ mod tests {
     }
 
     impl Viewer {
-        fn new() -> Self {
-            let graphics = ViewerGraphics::new();
+        /// A viewer that connected at `surface`.
+        fn new(surface: DesktopSize) -> Self {
+            let mut graphics = ViewerGraphics::new(size(1024, 768));
+            assert!(
+                graphics
+                    .handle(Signal::Viewer(surface, Request::Initial))
+                    .is_empty()
+            );
             let mut factory = graphics.factory();
             let (sender, events) = mpsc::unbounded_channel();
             factory.set_sender(sender);
@@ -543,7 +559,7 @@ mod tests {
                 graphics,
                 bridge,
                 events,
-                client: GraphicsPipelineClient::new(Box::new(Painter(Arc::clone(&tiles))), None),
+                client: GraphicsPipelineClient::new(Box::new(Counter(Arc::clone(&tiles))), None),
                 screen: Vec::new(),
                 width: 0,
                 acks: Vec::new(),
@@ -554,7 +570,7 @@ mod tests {
         }
 
         /// Negotiates the pipeline and hands the router its `Ready`.
-        fn open(&mut self, size: DesktopSize) {
+        fn open(&mut self) {
             for advertise in self.client.start(CHANNEL).unwrap() {
                 let confirm = self
                     .bridge
@@ -567,7 +583,17 @@ mod tests {
                 }
             }
             assert_eq!(self.signals(), [Signal::Ready]);
-            assert!(self.graphics.handle(Signal::Ready, size).is_empty());
+            assert!(self.graphics.handle(Signal::Ready).is_empty());
+            self.deliver();
+        }
+
+        /// The viewer sends a monitor layout of `size`.
+        fn layout(&mut self, size: DesktopSize) {
+            assert!(
+                self.graphics
+                    .handle(Signal::Viewer(size, Request::Layout))
+                    .is_empty()
+            );
             self.deliver();
         }
 
@@ -619,10 +645,16 @@ mod tests {
             }
         }
 
+        fn reset_sizes(&self) -> Vec<(u32, u32)> {
+            self.resets.iter().map(|r| (r.width, r.height)).collect()
+        }
+
         fn acknowledge(&mut self) {
             for ack in core::mem::take(&mut self.acks) {
                 self.bridge.process(CHANNEL, &ack).unwrap();
             }
+            self.graphics.handle(Signal::Acknowledged);
+            self.deliver();
         }
 
         /// The client's screen as BGR, to compare with what the target drew.
@@ -652,13 +684,30 @@ mod tests {
         bgra.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect()
     }
 
+    /// What the viewer should see: `desktop` (BGRA rows of `desktop_size`) on `surface`.
+    fn expected(desktop_size: DesktopSize, desktop: &[u8], surface: DesktopSize) -> Vec<[u8; 3]> {
+        let painter = Painter::new(Placement::fit(desktop_size, surface));
+        bgr(&painter.paint(
+            desktop,
+            Rect {
+                left: 0,
+                top: 0,
+                right: surface.width,
+                bottom: surface.height,
+            },
+        ))
+    }
+
     #[test]
     fn frames_go_to_the_bitmap_path_until_the_pipeline_opens_and_then_reach_it() {
-        let mut viewer = Viewer::new();
+        let mut viewer = Viewer::new(size(16, 8));
         let desktop = pixels(16, 8, 0);
 
-        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
-        viewer.open(size(16, 8));
+        assert!(matches!(
+            viewer.graphics.frame(0, 0, 16, 8, &desktop),
+            Routed::AsIs
+        ));
+        viewer.open();
 
         assert_eq!(viewer.client.total_frames_decoded(), 1);
         assert_eq!(viewer.bgr(), bgr(&desktop));
@@ -666,14 +715,17 @@ mod tests {
 
     #[test]
     fn a_frame_on_an_open_pipeline_is_painted_in_place() {
-        let mut viewer = Viewer::new();
+        let mut viewer = Viewer::new(size(16, 8));
         let mut desktop = pixels(16, 8, 0);
-        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
-        viewer.open(size(16, 8));
+        viewer.graphics.frame(0, 0, 16, 8, &desktop);
+        viewer.open();
         viewer.acknowledge();
 
         let patch = pixels(5, 3, 99);
-        assert!(viewer.graphics.frame(size(16, 8), 6, 2, 5, 3, &patch));
+        assert!(matches!(
+            viewer.graphics.frame(6, 2, 5, 3, &patch),
+            Routed::Sent
+        ));
         viewer.deliver();
 
         for (row, src) in patch.chunks_exact(5 * 4).enumerate() {
@@ -683,29 +735,48 @@ mod tests {
         assert_eq!(viewer.bgr(), bgr(&desktop));
     }
 
+    /// Windows App on a phone: it connects in portrait, the target keeps its landscape
+    /// desktop, and the viewer gets its own size with the desktop shrunk into it.
     #[test]
-    fn a_resize_resets_the_graphics_instead_of_reactivating() {
-        let mut viewer = Viewer::new();
-        viewer.open(size(16, 8));
+    fn the_pipeline_opens_at_the_viewers_size_with_the_desktop_scaled_into_it() {
+        let mut viewer = Viewer::new(size(14, 26));
+        // Until the pipeline opens the bitmap path shows it.
+        assert_eq!(viewer.graphics.resize(size(36, 22)).len(), 1);
+        let desktop = pixels(36, 22, 3);
+        viewer.graphics.frame(0, 0, 36, 22, &desktop);
+        viewer.open();
 
-        assert!(viewer.graphics.resize(size(8, 12)));
-        let rotated = pixels(8, 12, 7);
-        assert!(viewer.graphics.frame(size(8, 12), 0, 0, 8, 12, &rotated));
-        viewer.acknowledge();
-        viewer.graphics.handle(Signal::Acknowledged, size(8, 12));
-        viewer.deliver();
-
-        assert_eq!(viewer.width, 8);
-        assert_eq!(viewer.bgr(), bgr(&rotated));
+        assert_eq!(viewer.reset_sizes(), [(14, 26)]);
+        assert_eq!(viewer.bgr(), expected(size(36, 22), &desktop, size(14, 26)));
+        let placement = Placement::fit(size(36, 22), size(14, 26));
+        assert_eq!(placement.scaled, size(14, 9));
+        assert_eq!(placement.origin, (0, 8));
+        assert_eq!(viewer.graphics.factory().to_desktop(13, 16), (34, 20));
     }
 
     #[test]
-    fn every_reset_lays_out_one_primary_monitor_of_the_new_size() {
-        let mut viewer = Viewer::new();
-        viewer.open(size(16, 8));
-        assert!(viewer.graphics.resize(size(8, 12)));
-        viewer.deliver();
+    fn every_layout_is_answered_with_a_reset_of_exactly_its_size() {
+        let mut viewer = Viewer::new(size(14, 26));
+        viewer.graphics.resize(size(36, 22));
+        let desktop = pixels(36, 22, 3);
+        viewer.graphics.frame(0, 0, 36, 22, &desktop);
+        viewer.open();
+        viewer.acknowledge();
 
+        // The layout Windows App sends once it has the pipeline repeats its size.
+        viewer.layout(size(14, 26));
+        // Turned to landscape, then back.
+        viewer.layout(size(26, 14));
+        viewer.acknowledge();
+        assert_eq!(viewer.bgr(), expected(size(36, 22), &desktop, size(26, 14)));
+        viewer.layout(size(14, 26));
+        // A repeat of the layout just answered.
+        viewer.layout(size(14, 26));
+
+        assert_eq!(
+            viewer.reset_sizes(),
+            [(14, 26), (14, 26), (26, 14), (14, 26)]
+        );
         let monitor = |right, bottom| Monitor {
             left: 0,
             top: 0,
@@ -714,42 +785,100 @@ mod tests {
             flags: MonitorFlags::PRIMARY,
         };
         // oracle: spec MS-RDPEGFX §2.2.2.14, MS-RDPBCGR §2.2.1.3.6.1 (inclusive edges)
-        assert_eq!(
-            viewer.resets,
-            [
-                ResetGraphicsPdu {
-                    width: 16,
-                    height: 8,
-                    monitors: vec![monitor(15, 7)],
-                },
-                ResetGraphicsPdu {
-                    width: 8,
-                    height: 12,
-                    monitors: vec![monitor(7, 11)],
-                },
-            ]
-        );
+        assert_eq!(viewer.resets[2].monitors, [monitor(25, 13)]);
+        assert_eq!(viewer.resets[3].monitors, [monitor(13, 25)]);
+    }
+
+    /// Once the target follows the viewer's layout the desktop is drawn 1:1, with no further
+    /// reset of the viewer's graphics.
+    #[test]
+    fn a_target_that_follows_is_drawn_one_to_one() {
+        let mut viewer = Viewer::new(size(16, 8));
+        viewer.graphics.frame(0, 0, 16, 8, &pixels(16, 8, 0));
+        viewer.open();
+        viewer.acknowledge();
+        viewer.layout(size(8, 12));
+        viewer.acknowledge();
+
+        assert!(viewer.graphics.resize(size(8, 12)).is_empty());
+        let rotated = pixels(8, 12, 7);
+        viewer.graphics.frame(0, 0, 8, 12, &rotated);
+        viewer.acknowledge();
+
+        assert_eq!(viewer.reset_sizes(), [(16, 8), (8, 12)]);
+        assert_eq!(viewer.width, 8);
+        assert_eq!(viewer.bgr(), bgr(&rotated));
+        assert_eq!(viewer.graphics.factory().to_desktop(5, 9), (5, 9));
     }
 
     #[test]
-    fn without_the_pipeline_a_resize_is_the_bitmap_paths() {
-        assert!(!ViewerGraphics::new().resize(size(8, 12)));
+    fn without_the_pipeline_a_layout_reactivates_the_bitmap_path_at_its_size() {
+        let mut graphics = ViewerGraphics::new(size(16, 8));
+        graphics.resize(size(16, 8));
+        let desktop = pixels(16, 8, 0);
+        assert!(matches!(
+            graphics.frame(0, 0, 16, 8, &desktop),
+            Routed::AsIs
+        ));
+
+        let updates = graphics.handle(Signal::Viewer(size(8, 12), Request::Layout));
+        let [
+            DisplayUpdate::Resize(resized),
+            DisplayUpdate::Bitmap(surface),
+        ] = updates.as_slice()
+        else {
+            panic!("expected a resize and the surface, got {updates:?}");
+        };
+        assert_eq!(*resized, size(8, 12));
+        assert_eq!((surface.width.get(), surface.height.get()), (8, 12));
+        assert_eq!(
+            bgr(&surface.data),
+            expected(size(16, 8), &desktop, size(8, 12))
+        );
+        // Frames now come out scaled, as surface pixels.
+        let Routed::Bitmap(DisplayUpdate::Bitmap(update)) =
+            graphics.frame(0, 0, 4, 4, &pixels(4, 4, 9))
+        else {
+            panic!("expected a scaled bitmap");
+        };
+        assert!(update.x + update.width.get() <= 8 && update.y + update.height.get() <= 12);
+
+        // The same size again needs no reactivation.
+        assert!(
+            graphics
+                .handle(Signal::Viewer(size(8, 12), Request::Layout))
+                .is_empty()
+        );
+        // The target follows: frames pass through again.
+        assert!(graphics.resize(size(8, 12)).is_empty());
+        assert!(matches!(
+            graphics.frame(0, 0, 8, 12, &pixels(8, 12, 1)),
+            Routed::AsIs
+        ));
+    }
+
+    #[test]
+    fn a_bitmap_viewer_keeps_its_size_when_the_target_does_not_follow() {
+        let mut graphics = ViewerGraphics::new(size(1024, 768));
+        graphics.handle(Signal::Viewer(size(28, 53), Request::Initial));
+        let updates = graphics.resize(size(72, 45));
+        let [DisplayUpdate::Bitmap(surface)] = updates.as_slice() else {
+            panic!("expected the surface repainted, got {updates:?}");
+        };
+        assert_eq!((surface.width.get(), surface.height.get()), (28, 53));
+        assert_eq!(graphics.surface.size(), size(28, 53));
     }
 
     #[test]
     fn frames_wait_for_acknowledgements_and_none_is_lost() {
-        let mut viewer = Viewer::new();
+        let mut viewer = Viewer::new(size(16, 8));
         let mut desktop = pixels(16, 8, 0);
-        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
-        viewer.open(size(16, 8));
+        viewer.graphics.frame(0, 0, 16, 8, &desktop);
+        viewer.open();
 
         for x in 0..6 {
             let column = pixels(1, 8, 40 + x);
-            assert!(
-                viewer
-                    .graphics
-                    .frame(size(16, 8), u16::from(x), 0, 1, 8, &column)
-            );
+            viewer.graphics.frame(u16::from(x), 0, 1, 8, &column);
             for (y, src) in column.chunks_exact(4).enumerate() {
                 let at = (y * 16 + usize::from(x)) * 4;
                 desktop[at..at + 4].copy_from_slice(src);
@@ -762,9 +891,11 @@ mod tests {
             "every frame went out unacknowledged"
         );
 
-        viewer.acknowledge();
+        for ack in core::mem::take(&mut viewer.acks) {
+            viewer.bridge.process(CHANNEL, &ack).unwrap();
+        }
         assert!(viewer.signals().contains(&Signal::Acknowledged));
-        viewer.graphics.handle(Signal::Acknowledged, size(16, 8));
+        viewer.graphics.handle(Signal::Acknowledged);
         viewer.deliver();
 
         assert_eq!(viewer.bgr(), bgr(&desktop));
@@ -772,24 +903,26 @@ mod tests {
 
     #[test]
     fn a_backlog_of_rectangles_goes_out_as_one_tile() {
-        let mut viewer = Viewer::new();
+        let mut viewer = Viewer::new(size(16, 8));
         let mut desktop = pixels(16, 8, 0);
-        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
-        viewer.open(size(16, 8));
+        viewer.graphics.frame(0, 0, 16, 8, &desktop);
+        viewer.open();
         // Two go out before the client is three frames behind; the rest wait.
         for i in 0..MAX_TILES + 3 {
             let (x, y) = (i % 16, i / 16);
             let pixel = pixels(1, 1, 60 + u8::try_from(i).unwrap());
             let (x, y) = (u16::try_from(x).unwrap(), u16::try_from(y).unwrap());
-            assert!(viewer.graphics.frame(size(16, 8), x, y, 1, 1, &pixel));
+            viewer.graphics.frame(x, y, 1, 1, &pixel);
             let at = (usize::from(y) * 16 + usize::from(x)) * 4;
             desktop[at..at + 4].copy_from_slice(&pixel);
         }
         viewer.deliver();
-        viewer.acknowledge();
+        for ack in core::mem::take(&mut viewer.acks) {
+            viewer.bridge.process(CHANNEL, &ack).unwrap();
+        }
         let before = viewer.tiles.load(Ordering::Relaxed);
 
-        viewer.graphics.handle(Signal::Acknowledged, size(16, 8));
+        viewer.graphics.handle(Signal::Acknowledged);
         viewer.deliver();
 
         assert_eq!(viewer.tiles.load(Ordering::Relaxed) - before, 1);
@@ -797,33 +930,39 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_pipeline_hands_the_desktop_back_to_the_bitmap_path() {
-        let mut viewer = Viewer::new();
-        viewer.open(size(16, 8));
-        assert!(viewer.graphics.resize(size(8, 12)));
-        let rotated = pixels(8, 12, 7);
-        assert!(viewer.graphics.frame(size(8, 12), 0, 0, 8, 12, &rotated));
+    fn a_closed_pipeline_hands_the_surface_back_to_the_bitmap_path() {
+        let mut viewer = Viewer::new(size(16, 8));
+        let desktop = pixels(16, 8, 0);
+        viewer.graphics.frame(0, 0, 16, 8, &desktop);
+        viewer.open();
+        viewer.layout(size(8, 12));
 
-        let updates = viewer.graphics.handle(Signal::Closed, size(8, 12));
+        let updates = viewer.graphics.handle(Signal::Closed);
 
         let [
             DisplayUpdate::Resize(resized),
-            DisplayUpdate::Bitmap(desktop),
+            DisplayUpdate::Bitmap(surface),
         ] = updates.as_slice()
         else {
-            panic!("expected a resize and the desktop, got {updates:?}");
+            panic!("expected a resize and the surface, got {updates:?}");
         };
         assert_eq!(*resized, size(8, 12));
-        assert_eq!((desktop.width.get(), desktop.height.get()), (8, 12));
-        assert_eq!(desktop.data.as_ref(), rotated);
-        assert!(!viewer.graphics.frame(size(8, 12), 0, 0, 8, 12, &rotated));
+        assert_eq!((surface.width.get(), surface.height.get()), (8, 12));
+        assert_eq!(
+            bgr(&surface.data),
+            expected(size(16, 8), &desktop, size(8, 12))
+        );
+        assert!(matches!(
+            viewer.graphics.frame(0, 0, 4, 4, &pixels(4, 4, 1)),
+            Routed::Bitmap(_)
+        ));
     }
 
     #[test]
     fn a_frame_past_the_desktop_edge_is_clipped() {
-        let mut graphics = ViewerGraphics::new();
+        let mut graphics = ViewerGraphics::new(size(16, 8));
         let patch = pixels(4, 4, 3);
-        assert!(!graphics.frame(size(16, 8), 14, 6, 4, 4, &patch));
+        graphics.frame(14, 6, 4, 4, &patch);
 
         assert_eq!(graphics.clip(14, 6, 4, 4).right, 16);
         assert_eq!(
@@ -833,98 +972,6 @@ mod tests {
         assert_eq!(
             &graphics.canvas[(7 * 16 + 14) * 4..(7 * 16 + 16) * 4],
             &patch[16..24]
-        );
-    }
-
-    /// The viewer, told its screen size, gets the desktop centred in an output of its shape.
-    fn letterboxed(screen: DesktopSize, desktop: DesktopSize) -> (Viewer, GraphicsFactory) {
-        let mut viewer = Viewer::new();
-        let factory = viewer.graphics.factory();
-        factory.set_viewer(screen);
-        assert_eq!(viewer.signals(), [Signal::Viewer]);
-        assert!(viewer.graphics.handle(Signal::Viewer, desktop).is_empty());
-        (viewer, factory)
-    }
-
-    #[test]
-    fn a_desktop_of_another_shape_is_centred_between_black_bars() {
-        let (mut viewer, factory) = letterboxed(size(8, 16), size(16, 8));
-        let desktop = pixels(16, 8, 0);
-        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
-        viewer.open(size(16, 8));
-
-        let reset = viewer.resets.last().unwrap();
-        assert_eq!((reset.width, reset.height), (16, 32));
-        let mut screen = vec![0; 16 * 32 * 4];
-        screen[12 * 16 * 4..20 * 16 * 4].copy_from_slice(&desktop);
-        assert_eq!(viewer.bgr(), bgr(&screen));
-        assert_eq!(factory.to_desktop(5, 13), (5, 1));
-        assert_eq!(factory.to_desktop(5, 3), (5, 0));
-    }
-
-    #[test]
-    fn a_frame_lands_inside_the_bars() {
-        let (mut viewer, _) = letterboxed(size(8, 16), size(16, 8));
-        let mut desktop = pixels(16, 8, 0);
-        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
-        viewer.open(size(16, 8));
-        viewer.acknowledge();
-
-        let patch = pixels(5, 3, 99);
-        assert!(viewer.graphics.frame(size(16, 8), 6, 2, 5, 3, &patch));
-        viewer.deliver();
-
-        for (row, src) in patch.chunks_exact(5 * 4).enumerate() {
-            let at = ((2 + row) * 16 + 6) * 4;
-            desktop[at..at + src.len()].copy_from_slice(src);
-        }
-        let mut screen = vec![0; 16 * 32 * 4];
-        screen[12 * 16 * 4..20 * 16 * 4].copy_from_slice(&desktop);
-        assert_eq!(viewer.bgr(), bgr(&screen));
-    }
-
-    #[test]
-    fn a_viewer_turned_to_the_desktop_shape_gets_it_without_bars() {
-        let (mut viewer, factory) = letterboxed(size(8, 16), size(16, 8));
-        let desktop = pixels(16, 8, 0);
-        assert!(!viewer.graphics.frame(size(16, 8), 0, 0, 16, 8, &desktop));
-        viewer.open(size(16, 8));
-        viewer.acknowledge();
-
-        factory.set_viewer(size(32, 16));
-        assert_eq!(viewer.signals(), [Signal::Acknowledged, Signal::Viewer]);
-        assert!(
-            viewer
-                .graphics
-                .handle(Signal::Viewer, size(16, 8))
-                .is_empty()
-        );
-        viewer.deliver();
-
-        let reset = viewer.resets.last().unwrap();
-        assert_eq!((reset.width, reset.height), (16, 8));
-        assert_eq!(viewer.bgr(), bgr(&desktop));
-        assert_eq!(factory.to_desktop(5, 3), (5, 3));
-    }
-
-    #[test]
-    fn the_output_is_the_smallest_of_the_viewers_shape_around_the_desktop() {
-        assert_eq!(
-            letterbox(size(1440, 900), Some(size(560, 1058))),
-            (size(1440, 2721), (0, 910))
-        );
-        assert_eq!(
-            letterbox(size(560, 1058), Some(size(1058, 560))),
-            (size(1999, 1058), (719, 0))
-        );
-        assert_eq!(
-            letterbox(size(560, 1058), Some(size(560, 1058))),
-            (size(560, 1058), (0, 0))
-        );
-        assert_eq!(letterbox(size(560, 1058), None), (size(560, 1058), (0, 0)));
-        assert_eq!(
-            letterbox(size(8000, 100), Some(size(100, 8000))),
-            (size(8000, 100), (0, 0))
         );
     }
 }
