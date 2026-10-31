@@ -8269,7 +8269,6 @@
           "verify_tls",
           "compression",
           "interactive_logon",
-          "microphone",
           "tls_security"
         ],
         "properties": {
@@ -8314,7 +8313,8 @@
           },
           "microphone": {
             "type": "boolean",
-            "description": "Let the target record from the viewer's microphone (audio input redirection,\nMS-RDPEAI), on RDP viewers and in the web client."
+            "description": "Let the target record from the viewer's microphone (audio input redirection,\nMS-RDPEAI), on RDP viewers and in the web client.",
+            "default": false
           },
           "tls_security": {
             "$ref": "#/components/schemas/RdpTlsSecurity"
