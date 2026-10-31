@@ -48,6 +48,15 @@ Together they make `src/` identical to IronRDP master at `904a7da6` except for #
   leaving the viewer black (warp-tech/warpgate#2606). The buffer is now sized from the tile
   count up front as well. Warpgate's own patch for this is replaced by upstream's.
 
+## Bitmap scan width in bytes
+
+The legacy bitmap path (clients without Surface Commands, such as Jump Desktop) writes the
+Compressed Data Header's `cbScanWidth` as the width in pixels. MS-RDPBCGR words it that
+way, but the FreeRDP server sends `width * 4` for 32 bpp and clients read it so: Jump
+Desktop drew every bitmap at a quarter of its width and rejected widths whose quarter is
+not a multiple of 4 ("bad width - must be divisible by 4"). `src/encoder/bitmap.rs` sends
+the row length in bytes.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same

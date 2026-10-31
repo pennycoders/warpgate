@@ -1,6 +1,6 @@
 diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
---- ironrdp-server-0.14.0/src/display.rs	2026-10-27 18:26:26
-+++ base/src/display.rs	2026-10-31 11:21:18
+--- ironrdp-server-0.14.0/src/display.rs	2026-10-31 11:23:05
++++ base/src/display.rs	2026-10-31 11:23:05
 @@ -329,6 +329,19 @@
      /// and then signals the event loop via `ServerEvent::Egfx`.
      #[cfg(feature = "egfx")]
@@ -31,8 +31,8 @@ diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
      }
  }
 diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
---- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-27 18:26:26
-+++ base/src/encoder/bitmap.rs	2026-10-31 11:21:18
+--- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 11:23:05
++++ base/src/encoder/bitmap.rs	2026-10-31 11:23:05
 @@ -47,7 +47,8 @@
          BitmapUpdateData::encode_header(total, &mut cursor).map_err(BitmapEncodeError::Encode)?;
  
@@ -43,9 +43,20 @@ diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
              let i: u16 = cast_int!("chunk idx", i).map_err(BitmapEncodeError::Encode)?;
              let top = bitmap.y + i * chunk_height;
  
+@@ -76,7 +77,9 @@
+                 compression_flags: Compression::BITMAP_COMPRESSION,
+                 compressed_data_header: Some(bitmap::CompressedDataHeader {
+                     main_body_size: cast_length!("main body size", len).map_err(BitmapEncodeError::Encode)?,
+-                    scan_width: u16::from(bitmap.width),
++                    // In bytes, as the FreeRDP server sends it and clients read it, although
++                    // MS-RDPBCGR 2.2.9.1.1.3.1.2.3 words it as pixels.
++                    scan_width: row_len,
+                     uncompressed_size: height * row_len,
+                 }),
+                 bitmap_data: &self.buffer[..len],
 diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
---- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-27 18:26:26
-+++ base/src/encoder/fast_path.rs	2026-10-31 11:21:18
+--- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 11:23:05
++++ base/src/encoder/fast_path.rs	2026-10-31 11:23:05
 @@ -4,7 +4,8 @@
  use ironrdp_pdu::{Encode as _, WriteCursor};
  
@@ -75,8 +86,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_pa
  
              1..=MAX_FASTPATH_UPDATE_SIZE => {
 diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-27 18:26:26
-+++ base/src/encoder/mod.rs	2026-10-31 11:21:18
+--- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 11:23:05
++++ base/src/encoder/mod.rs	2026-10-31 11:23:05
 @@ -16,6 +16,8 @@
  use tracing::{debug, warn};
  
@@ -486,8 +497,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
  }
  
 diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
---- ironrdp-server-0.14.0/src/lib.rs	2026-10-27 18:26:26
-+++ base/src/lib.rs	2026-10-31 11:21:18
+--- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 11:23:05
++++ base/src/lib.rs	2026-10-31 11:23:05
 @@ -36,7 +36,7 @@
  #[cfg(all(feature = "__test", feature = "qoiz"))]
  pub use encoder::qoiz::Compressor as QoizCompressor;
@@ -516,8 +527,8 @@ diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
  #[cfg(feature = "usb")]
  pub use urbdrc::{
 diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
---- ironrdp-server-0.14.0/src/server.rs	2026-10-27 18:26:26
-+++ base/src/server.rs	2026-10-31 11:21:18
+--- ironrdp-server-0.14.0/src/server.rs	2026-10-31 11:23:05
++++ base/src/server.rs	2026-10-31 11:23:05
 @@ -62,7 +62,7 @@
  use crate::clipboard::CliprdrServerFactory;
  use crate::display::{DisplayContext, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
