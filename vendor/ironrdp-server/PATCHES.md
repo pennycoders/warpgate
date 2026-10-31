@@ -14,27 +14,39 @@ ironrdp-server` at that commit; `warpgate.patch` is the source difference from i
 
 It needs `ironrdp-error` 0.2.1 (`ResultExt`).
 
-## RemoteFX header blocks lost to a buffer retry
+## Backported upstream fixes
 
-`RemoteFxHandler` carries the desktop size as an `Option`, and `Some` is what makes
-`RfxEncoder::encode` emit the once-per-connection RFX header blocks (`TS_RFX_SYNC`,
-`TS_RFX_CONTEXT`, `TS_RFX_CHANNELS`, `TS_RFX_CODEC_VERSIONS`). Upstream `take()`s that
-`Option` *inside* the loop that grows the output buffer on `NotEnoughBytes`, so a first
-frame whose encoding overruns the buffer consumes the headers on the attempt that failed
-and re-encodes without them. The buffer is sized from the frame's raw BGRA length, and RFX
-always emits whole 64x64 tiles, so anything tile-padded — a few-pixel rect, or a thin strip
-like a 1px window border — encodes larger than its source and takes that path. The headers
-are never re-armed, so every later frame is rejected (FreeRDP: `rfx_process_message:
-incomplete header blocks processing`) and the viewer stays black for the life of the
-connection while input still works. Which frame arrives first is the target's choice, which
-is why this strikes some deployments and not others; see warp-tech/warpgate#2606.
+`warpgate.patch` carries four IronRDP master commits made after `b13befa`, applied in this
+order with their `ironrdp-server/src` changes only (the testsuite changes stay upstream).
+Together they make `src/` identical to IronRDP master at `904a7da6` except for #2293
+(rdpsnd left unstarted for a client that asked for no audio), which needs an
+`ironrdp-acceptor` change and is not taken. All four drop out on a re-vendor past
+`904a7da6`.
 
-`warpgate.patch` reads the size without consuming it and clears it only once a message
-carrying the headers has been built. It also drops a `* 2` from the adjacent buffer-resize
-`debug!`, which reported twice the size actually allocated.
-
-IronRDP master fixed this after `b13befa` (#2274, which also sizes the buffer from the tile
-count up front); drop the hunk on a re-vendor past it.
+- **#2261, size the display for non-resizing clients before input.** A client that does
+  not set `desktopResizeFlag` (Windows App on iOS) keeps the size it asked for, but
+  upstream skipped `request_initial_size` for it, so the encoder could be built at another
+  size; and input queued during activation was replayed before the display was sized.
+- **#2291, keep pointer updates within the client's pointer cache.** A pointer update whose
+  `cache_index` is not below the client's `pointerCacheSize` is dropped, since mstsc ends
+  the session and FreeRDP drops the connection on one. `DisplayContext` gains
+  `pointer_cache_size` and `color_pointer_cache_size`.
+- **#2123, cap fast-path updates at the client's MaxRequestSize** (Devolutions/IronRDP#2122).
+  The encoder used the server's own `max_request_size` (8 MB) and ignored the client's
+  Multifragment Update Capability Set; Jump Desktop sends 65536 and dropped the connection
+  on the first full-screen bitmap update ("FastPath: Not enough space in the reassembly
+  buffer"). This replaces Warpgate's own fix of the same bug. It also counts the rows of a
+  bitmap chunk with `div_ceil`: a sub-rectangle's data ends at its last pixel, short of a
+  full stride, so the legacy bitmap path sent every region narrower than the screen one row
+  short (horizontal lines in Jump Desktop), which Warpgate had patched separately too.
+- **#2274, fix pointer update encoding and reuse the RemoteFX buffer.** It also takes the
+  desktop size once, outside the loop that grows the buffer, which is the fix for the RFX
+  header blocks a buffer retry used to drop: a first frame whose encoding overran the
+  buffer consumed the once-per-connection `TS_RFX_SYNC` / `TS_RFX_CONTEXT` /
+  `TS_RFX_CHANNELS` / `TS_RFX_CODEC_VERSIONS` blocks on the failed attempt, and every later
+  frame was rejected (FreeRDP: `rfx_process_message: incomplete header blocks processing`),
+  leaving the viewer black (warp-tech/warpgate#2606). The buffer is now sized from the tile
+  count up front as well. Warpgate's own patch for this is replaced by upstream's.
 
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not

@@ -62,7 +62,7 @@ use crate::autodetect::{AutoDetectHandles, AutoDetectManager, AutoDetectOutcome}
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayContext, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
 use crate::echo::{EchoDvcBridge, EchoServerHandle, EchoServerMessage, build_echo_request};
-use crate::encoder::{RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
+use crate::encoder::{MAX_FASTPATH_UPDATE_SIZE, RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
 use crate::error::{ServerError, ServerErrorExt as _, ServerErrorKind, ServerResult};
 #[cfg(feature = "egfx")]
 use crate::gfx::{EgfxServerMessage, GfxContext, GfxServerFactory, GfxServerHandle};
@@ -95,6 +95,44 @@ fn client_core_frame_ack_limit(capabilities: &[CapabilitySet]) -> Option<NonZero
         _ => None,
     })
 }
+
+/// The Fast-Path Update size the client can reassemble, capped by the server's own.
+///
+/// A client's [MaxRequestSize] is the size of its reassembly buffer, which caps the largest
+/// fragmented Fast-Path Update it can take. A client that sends no Multifragment Update
+/// Capability Set, or a zero size, leaves the server's in place.
+///
+/// Neither value is taken below one Fast-Path fragment: an update that size is sent
+/// unfragmented and never reaches the reassembly buffer, and a smaller value would only make
+/// the encoder cut every frame into tiny tiles, or refuse every update at zero.
+///
+/// [MaxRequestSize]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/01717954-716a-424d-af35-28fb2b86df89
+#[cfg_attr(feature = "__test", visibility::make(pub))]
+fn client_max_request_size(server_max_request_size: u32, capabilities: &[CapabilitySet]) -> u32 {
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "try_from is not const; the assertion fails the build if the fragment size outgrows a u32"
+    )]
+    const ONE_FRAGMENT: u32 = {
+        assert!(MAX_FASTPATH_UPDATE_SIZE <= u32::MAX as usize);
+        MAX_FASTPATH_UPDATE_SIZE as u32
+    };
+
+    let server_max_request_size = server_max_request_size.max(ONE_FRAGMENT);
+    capabilities
+        .iter()
+        .find_map(|capability| match capability {
+            CapabilitySet::MultiFragmentUpdate(capability) if capability.max_request_size != 0 => {
+                Some(capability.max_request_size)
+            }
+            _ => None,
+        })
+        .map_or(server_max_request_size, |client| {
+            client.max(ONE_FRAGMENT).min(server_max_request_size)
+        })
+}
+
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How often the server drives [`CliprdrServer::drive_timeouts`].
@@ -1827,6 +1865,10 @@ struct ConnectionState {
     /// eligible for the hourly update when cookies are on request (see
     /// [`RdpServer::set_auto_reconnect_on_request`]).
     auto_reconnect_issued: bool,
+    /// The client's Pointer Capability Set (MS-RDPBCGR 2.2.7.1.5) from the last activation, for
+    /// [`DisplayContext::pointer_cache_size`] and [`DisplayContext::color_pointer_cache_size`].
+    pointer_cache_size: u16,
+    color_pointer_cache_size: u16,
 }
 
 impl ConnectionState {
@@ -1839,6 +1881,8 @@ impl ConnectionState {
             autodetect: self.autodetect_handles.clone(),
             #[cfg(feature = "egfx")]
             gfx_handle: self.gfx_handle.clone(),
+            pointer_cache_size: self.pointer_cache_size,
+            color_pointer_cache_size: self.color_pointer_cache_size,
         }
     }
 
@@ -2786,6 +2830,8 @@ impl RdpServer {
             egfx_on_udp: false,
             early_tunnel_payloads: VecDeque::new(),
             auto_reconnect_issued: false,
+            pointer_cache_size: 0,
+            color_pointer_cache_size: 0,
         }
     }
 
@@ -5170,22 +5216,6 @@ impl RdpServer {
             });
         }
 
-        if !result.input_events.is_empty() {
-            debug!("Handling input event backlog from acceptor sequence");
-            // Set on a reactivation pass, where EGFX may already be on the tunnel.
-            let current_udp_transport = udp_transport.borrow().clone();
-            self.handle_input_backlog(
-                conn,
-                writer,
-                result.io_channel_id,
-                result.user_channel_id,
-                result.message_channel_id,
-                result.input_events,
-                current_udp_transport.as_ref(),
-            )
-            .await?;
-        }
-
         #[cfg(feature = "egfx")]
         if let Some(gfx_handle) = conn.gfx_handle.as_ref() {
             let mut server = gfx_handle
@@ -5224,10 +5254,12 @@ impl RdpServer {
         let mut update_codecs = UpdateEncoderCodecs::new();
         let mut surface_flags = CmdFlags::empty();
         let mut pointer_cache_size: u16 = 0;
+        let mut color_pointer_cache_size: u16 = 0;
         // Absence means the client did not send a Large Pointer Capability Set at all,
         // which per MS-RDPBCGR 2.2.7.2.7 leaves the pointer size ceiling at 32x32 (the
         // base Color/New Pointer Update limit with no large-pointer flags set).
         let mut large_pointer_flags = LargePointerSupportFlags::empty();
+        let max_request_size = client_max_request_size(self.opts.max_request_size, &result.capabilities);
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
@@ -5239,7 +5271,6 @@ impl RdpServer {
                 CapabilitySet::Bitmap(b) => {
                     if !b.desktop_resize_flag {
                         debug!("Desktop resize is not supported by the client");
-                        continue;
                     }
 
                     let client_size = DesktopSize {
@@ -5250,12 +5281,12 @@ impl RdpServer {
 
                     // It's problematic when the client didn't resize, as we send bitmap updates that don't fit.
                     // The client will likely drop the connection.
-                    if client_size.width < display_size.width || client_size.height < display_size.height {
+                    if (!b.desktop_resize_flag && client_size != display_size)
+                        || client_size.width < display_size.width
+                        || client_size.height < display_size.height
+                    {
                         // TODO: we may have different behaviour instead, such as clipping or scaling?
-                        warn!(
-                            "Client size doesn't fit the server size: {:?} < {:?}",
-                            client_size, display_size
-                        );
+                        warn!(?client_size, ?display_size, "Client size differs from the server size");
                     }
                 }
                 CapabilitySet::SurfaceCommands(c) => {
@@ -5310,6 +5341,7 @@ impl RdpServer {
                     // must not reference a cache slot via CachedPointer either, since nothing
                     // else in this crate populates that cache via the Color Pointer Update.
                     pointer_cache_size = p.pointer_cache_size;
+                    color_pointer_cache_size = p.color_pointer_cache_size;
                 }
                 CapabilitySet::LargePointer(lp) => {
                     // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
@@ -5323,15 +5355,34 @@ impl RdpServer {
             }
         }
 
+        if !result.input_events.is_empty() {
+            debug!("Handling input event backlog from acceptor sequence");
+            // Set on a reactivation pass, where EGFX may already be on the tunnel.
+            let current_udp_transport = udp_transport.borrow().clone();
+            self.handle_input_backlog(
+                conn,
+                writer,
+                result.io_channel_id,
+                result.user_channel_id,
+                result.message_channel_id,
+                result.input_events,
+                current_udp_transport.as_ref(),
+            )
+            .await?;
+        }
+
         let desktop_size = self.display.lock().await.size().await;
         let encoder = UpdateEncoder::new(
             desktop_size,
             surface_flags,
             update_codecs,
-            self.opts.max_request_size,
+            max_request_size,
             pointer_cache_size,
+            color_pointer_cache_size,
             large_pointer_flags,
         )?;
+        conn.pointer_cache_size = pointer_cache_size;
+        conn.color_pointer_cache_size = color_pointer_cache_size;
 
         // By default every connection gets a cookie at activation. On request, only one that came
         // back with a verified cookie does.
