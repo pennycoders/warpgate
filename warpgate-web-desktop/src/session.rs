@@ -41,6 +41,9 @@ pub struct WebDesktopSession {
     /// Separate from the recorder's: that one must only see events it actually wrote.
     /// Holds the refinement scratch too, so encoding one region needs a single lock.
     framebuffer: Mutex<(Framebuffer, RefineScratch)>,
+    /// The target's last capabilities announcement, replayed to every viewer that attaches
+    /// so a reloaded page still knows which features work.
+    capabilities: std::sync::Mutex<Option<ServerMessage>>,
 }
 
 /// Buffers reused across refinement encodes. A settling screen refines many regions back to
@@ -74,7 +77,22 @@ impl WebDesktopSession {
             ),
             backend: OnceLock::new(),
             framebuffer: Mutex::new((Framebuffer::default(), RefineScratch::default())),
+            capabilities: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn remember_capabilities(&self, message: &ServerMessage) {
+        *self
+            .capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.clone());
+    }
+
+    pub fn capabilities(&self) -> Option<ServerMessage> {
+        self.capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn bind_backend(&self, backend: DesktopBackend) {
@@ -142,6 +160,12 @@ impl WebDesktopSession {
             && let Err(error) = recorder.write_input(&input).await
         {
             warn!(%error, "Failed to record web-desktop viewer input");
+        }
+        if matches!(input, DesktopInput::ClipboardTransfer(_)) {
+            // A lost file step would stall a transfer until it times out; these are paced
+            // by the pull model, so waiting for room is cheap.
+            let _ = backend.input_tx.send(input).await;
+            return;
         }
         // let inputs drop under backpressure
         let _ = backend.input_tx.try_send(input);

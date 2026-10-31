@@ -46,6 +46,9 @@ pub async fn ws_handler(
             session.push(keyframe).await;
         }
         session.replay_phase().await;
+        if let Some(capabilities) = session.capabilities() {
+            session.push(capabilities).await;
+        }
 
         let input_session = session.clone();
         run_stream_loop(

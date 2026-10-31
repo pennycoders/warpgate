@@ -222,6 +222,9 @@ async fn emit(
         }
         event => {
             if let Some(msg) = ServerMessage::from_event(event) {
+                if matches!(msg, ServerMessage::Capabilities { .. }) {
+                    session.remember_capabilities(&msg);
+                }
                 session.push(msg).await;
             }
             Ok(())

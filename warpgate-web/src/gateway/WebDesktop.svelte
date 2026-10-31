@@ -1,5 +1,10 @@
 <script lang="ts">
-    import { faCompress, faExpand } from '@fortawesome/free-solid-svg-icons'
+    import {
+        faCompress,
+        faDownload,
+        faExpand,
+        faFile,
+    } from '@fortawesome/free-solid-svg-icons'
     import { Button } from '@sveltestrap/sveltestrap'
     import {
         applyDesktopFrame,
@@ -10,6 +15,12 @@
         type Rect,
     } from 'common/desktopCanvas'
     import { DesktopClipboard } from 'common/desktopClipboard'
+    import {
+        DesktopFiles,
+        type DownloadProgress,
+        downloadName,
+        saveBlob,
+    } from 'common/desktopFiles'
     import { codeToScancode } from 'common/desktopInput'
     import { stringifyError } from 'common/errors'
     import { handleReauthError } from 'common/reauth'
@@ -99,6 +110,86 @@
         (key, down) => send({ type: 'key_event', ...key, down }),
     )
 
+    // Bumped by `files` on every change, so the template re-reads its plain fields.
+    let filesVersion = $state(0)
+    const files = new DesktopFiles(send, () => filesVersion++)
+    const filesEnabled = $derived(filesVersion >= 0 && files.enabled)
+    const remoteFiles = $derived(
+        filesVersion >= 0 && files.remoteOffer
+            ? files.remoteOffer.files
+                  .map((file, index) => ({ file, index }))
+                  .filter(({ file }) => !file.directory)
+            : [],
+    )
+    let filesOpen = $state(false)
+    let filesNotice: string | null = $state(null)
+    let download = $state<DownloadProgress | null>(null)
+
+    function offerFiles(list: FileList | null | undefined): boolean {
+        const picked = Array.from(list ?? [])
+        if (!filesEnabled || picked.length === 0) {
+            return false
+        }
+        const offered = files.offer(picked)
+        const skipped = picked.length - offered.length
+        filesNotice =
+            offered.length === 0
+                ? 'Too large to copy to the remote'
+                : `${offered.length} file(s) on the remote clipboard` +
+                  (skipped > 0 ? `, ${skipped} too large` : '')
+        return offered.length > 0
+    }
+
+    async function downloadFile(index: number) {
+        const offer = files.remoteOffer
+        if (!offer || download) {
+            return
+        }
+        const file = offer.files[index]
+        if (!file) {
+            return
+        }
+        download = { path: file.path, received: 0, size: file.size }
+        try {
+            const blob = await files.fetch(offer, index, p => (download = p))
+            saveBlob(blob, downloadName(file.path))
+        } catch (e) {
+            filesNotice = await stringifyError(e)
+        } finally {
+            download = null
+        }
+    }
+
+    function formatSize(bytes: number): string {
+        const units = ['B', 'KiB', 'MiB', 'GiB']
+        let value = bytes
+        let unit = 0
+        while (value >= 1024 && unit < units.length - 1) {
+            value /= 1024
+            unit++
+        }
+        return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`
+    }
+
+    function onDragOver(e: DragEvent) {
+        if (filesEnabled && e.dataTransfer?.types.includes('Files')) {
+            e.preventDefault()
+            e.dataTransfer.dropEffect = 'copy'
+        }
+    }
+
+    // A drop can't land on the remote desktop directly, so the files go on the remote
+    // clipboard and the user pastes them where they want them.
+    function onDrop(e: DragEvent) {
+        if (!filesEnabled) {
+            return
+        }
+        e.preventDefault()
+        if (offerFiles(e.dataTransfer?.files)) {
+            filesNotice += ' — paste them on the remote'
+        }
+    }
+
     function viewportSize(): { width: number; height: number } | null {
         const width = Math.floor(canvasArea?.clientWidth ?? window.innerWidth)
         const height = Math.floor(
@@ -147,6 +238,9 @@
             return
         }
         const msg = JSON.parse(data) as ServerMessage
+        if (files.onMessage(msg)) {
+            return
+        }
         switch (msg.type) {
             case 'state':
                 phase = msg
@@ -402,6 +496,9 @@
         if (!connected) {
             return
         }
+        // Files ride ahead of the replayed Ctrl+V, like text, so the target already holds
+        // them when the paste arrives.
+        offerFiles(e.clipboardData?.files)
         clipboard.onPaste(e)
     }
 
@@ -483,6 +580,7 @@
     })
 
     onDestroy(() => {
+        files.abort()
         ws?.close()
         resizeObserver?.disconnect()
         resizeSubscription.unsubscribe()
@@ -521,6 +619,23 @@
                 />
             </div>
         {/if}
+        {#if filesNotice}
+            <span class="text-muted small">{filesNotice}</span>
+        {/if}
+        {#if filesEnabled}
+            <button
+                type="button"
+                class="btn btn-link"
+                title="Files copied on the remote"
+                disabled={remoteFiles.length === 0}
+                onclick={() => (filesOpen = !filesOpen)}
+            >
+                <Fa icon={faFile} fw />
+                {#if remoteFiles.length}
+                    <span class="small">{remoteFiles.length}</span>
+                {/if}
+            </button>
+        {/if}
         <button
             type="button"
             class="btn btn-link"
@@ -534,9 +649,42 @@
         </Button>
     </div>
 
+    {#if filesOpen && remoteFiles.length}
+        <div class="files-panel small p-2">
+            {#each remoteFiles as { file, index } (index)}
+                <div class="d-flex align-items-center gap-2">
+                    <span class="me-auto text-truncate" title={file.path}
+                        >{file.path}</span
+                    >
+                    <span class="text-muted">{formatSize(file.size)}</span>
+                    <button
+                        type="button"
+                        class="btn btn-link btn-sm"
+                        title="Download"
+                        disabled={!!download}
+                        onclick={() => downloadFile(index)}
+                    >
+                        <Fa icon={faDownload} fw />
+                    </button>
+                </div>
+            {/each}
+            {#if download}
+                <progress
+                    class="w-100"
+                    max={download.size}
+                    value={download.received}
+                ></progress>
+            {/if}
+        </div>
+    {/if}
+
     <div
         bind:this={canvasArea}
         class="canvas-area flex-grow-1 d-flex align-items-center justify-content-center"
+        role="application"
+        aria-label="Remote desktop"
+        ondragover={onDragOver}
+        ondrop={onDrop}
     >
         <canvas
             bind:this={canvas}
@@ -571,6 +719,15 @@
 
     .canvas-area {
         overflow: auto;
+    }
+
+    .files-panel {
+        flex-shrink: 0;
+        margin: 0 10px 10px;
+        max-height: 30vh;
+        overflow: auto;
+        background: black;
+        border-radius: 10px;
     }
 
     canvas {
