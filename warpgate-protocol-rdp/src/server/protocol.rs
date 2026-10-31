@@ -41,6 +41,8 @@ pub enum Input {
     CursorHidden,
     Clipboard(String),
     Shutdown,
+    /// End the session, telling the viewer why with this RDP error info code.
+    Disconnect(u32),
 }
 
 /// RDP server → Warpgate: viewer credentials and input. The viewer's domain is discarded —

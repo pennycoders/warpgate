@@ -130,6 +130,17 @@ pub enum DesktopEvent {
     Bell,
     /// A non-fatal error message.
     Error(String),
+    /// The remote ended the session and said why.
+    Ended(DesktopEndReason),
+}
+
+/// Why the remote ended a desktop session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopEndReason {
+    /// For the person at the viewer.
+    pub message: String,
+    /// The RDP error info code (MS-RDPBCGR 2.2.5.1.1), when the remote is an RDP server.
+    pub rdp_error_info: Option<u32>,
 }
 
 impl DesktopEvent {

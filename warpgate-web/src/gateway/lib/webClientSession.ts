@@ -22,7 +22,7 @@ export function closeReasonText(
         case 'error':
             return phase.message ?? 'Connection failed.'
         case 'disconnected':
-            return 'Disconnected.'
+            return phase.message ?? 'Disconnected.'
         default: {
             const reason: string = phase.reason
             return `Session closed (${reason}).`

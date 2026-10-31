@@ -680,7 +680,56 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          }
      }
  
-@@ -5208,10 +5254,12 @@
+@@ -4737,6 +4783,7 @@
+         let udp_transport_for_events = Rc::clone(&udp_transport);
+         let udp_transport_for_pdus = Rc::clone(&udp_transport);
+         let mut cliprdr_writer = writer.clone();
++        let mut ultimatum_writer = writer.clone();
+         let write_counter = writer.write_counter();
+         let ev_receiver = Arc::clone(&self.ev_receiver);
+         let s = Rc::new(Mutex::new((self, conn)));
+@@ -5061,17 +5108,32 @@
+             }
+         };
+ 
+-        let state = tokio::select!(
+-            state = dispatch_pdu => state,
+-            state = dispatch_display => state,
+-            state = dispatch_events => state,
+-            state = refresh_auto_reconnect_cookie => state,
+-            state = send_heartbeats => state,
+-            state = dispatch_udp_tunnel => state,
+-            state = drive_cliprdr_timeouts => state,
++        let (state, server_initiated) = tokio::select!(
++            state = dispatch_pdu => (state, false),
++            state = dispatch_display => (state, true),
++            state = dispatch_events => (state, true),
++            state = refresh_auto_reconnect_cookie => (state, true),
++            state = send_heartbeats => (state, true),
++            state = dispatch_udp_tunnel => (state, true),
++            state = drive_cliprdr_timeouts => (state, true),
+         );
+ 
+         debug!("End of client loop: {state:?}");
++        // A disconnection the server starts ends with a Disconnect Provider Ultimatum, so the
++        // client reports a disconnection rather than a transport error.
++        if server_initiated && matches!(state, Ok(RunState::Disconnect)) {
++            let ultimatum = mcs::McsMessage::DisconnectProviderUltimatum(mcs::DisconnectProviderUltimatum::from_reason(
++                mcs::DisconnectReason::ProviderInitiated,
++            ));
++            match encode_vec(&X224(ultimatum)) {
++                Ok(data) => {
++                    if let Err(error) = ultimatum_writer.write_all(&data).await {
++                        debug!(%error, "Could not send the disconnect ultimatum");
++                    }
++                }
++                Err(error) => debug!(%error, "Could not encode the disconnect ultimatum"),
++            }
++        }
+         state
+     }
+ 
+@@ -5208,10 +5270,12 @@
          let mut update_codecs = UpdateEncoderCodecs::new();
          let mut surface_flags = CmdFlags::empty();
          let mut pointer_cache_size: u16 = 0;
@@ -693,7 +742,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          for c in result.capabilities {
              match c {
                  CapabilitySet::General(c) => {
-@@ -5293,6 +5341,7 @@
+@@ -5293,6 +5357,7 @@
                      // must not reference a cache slot via CachedPointer either, since nothing
                      // else in this crate populates that cache via the Color Pointer Update.
                      pointer_cache_size = p.pointer_cache_size;
@@ -701,7 +750,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                  }
                  CapabilitySet::LargePointer(lp) => {
                      // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
-@@ -5327,10 +5376,13 @@
+@@ -5327,10 +5392,13 @@
              desktop_size,
              surface_flags,
              update_codecs,

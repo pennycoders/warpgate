@@ -4783,6 +4783,7 @@ impl RdpServer {
         let udp_transport_for_events = Rc::clone(&udp_transport);
         let udp_transport_for_pdus = Rc::clone(&udp_transport);
         let mut cliprdr_writer = writer.clone();
+        let mut ultimatum_writer = writer.clone();
         let write_counter = writer.write_counter();
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let s = Rc::new(Mutex::new((self, conn)));
@@ -5107,17 +5108,32 @@ impl RdpServer {
             }
         };
 
-        let state = tokio::select!(
-            state = dispatch_pdu => state,
-            state = dispatch_display => state,
-            state = dispatch_events => state,
-            state = refresh_auto_reconnect_cookie => state,
-            state = send_heartbeats => state,
-            state = dispatch_udp_tunnel => state,
-            state = drive_cliprdr_timeouts => state,
+        let (state, server_initiated) = tokio::select!(
+            state = dispatch_pdu => (state, false),
+            state = dispatch_display => (state, true),
+            state = dispatch_events => (state, true),
+            state = refresh_auto_reconnect_cookie => (state, true),
+            state = send_heartbeats => (state, true),
+            state = dispatch_udp_tunnel => (state, true),
+            state = drive_cliprdr_timeouts => (state, true),
         );
 
         debug!("End of client loop: {state:?}");
+        // A disconnection the server starts ends with a Disconnect Provider Ultimatum, so the
+        // client reports a disconnection rather than a transport error.
+        if server_initiated && matches!(state, Ok(RunState::Disconnect)) {
+            let ultimatum = mcs::McsMessage::DisconnectProviderUltimatum(mcs::DisconnectProviderUltimatum::from_reason(
+                mcs::DisconnectReason::ProviderInitiated,
+            ));
+            match encode_vec(&X224(ultimatum)) {
+                Ok(data) => {
+                    if let Err(error) = ultimatum_writer.write_all(&data).await {
+                        debug!(%error, "Could not send the disconnect ultimatum");
+                    }
+                }
+                Err(error) => debug!(%error, "Could not encode the disconnect ultimatum"),
+            }
+        }
         state
     }
 

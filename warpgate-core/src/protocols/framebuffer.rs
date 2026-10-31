@@ -260,7 +260,8 @@ impl Framebuffer {
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::Bell
-            | DesktopEvent::Error(_) => {}
+            | DesktopEvent::Error(_)
+            | DesktopEvent::Ended(_) => {}
         }
     }
 

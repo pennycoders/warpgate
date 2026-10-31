@@ -253,7 +253,7 @@ async fn relay_events(
     handles: DesktopClientHandles,
     recorder: Option<Arc<DesktopRecorder>>,
     encode_jpeg: bool,
-) -> Result<(), WarpgateError> {
+) -> Result<Option<String>, WarpgateError> {
     let DesktopClientHandles {
         mut event_rx,
         abort_tx,
@@ -267,6 +267,7 @@ async fn relay_events(
     let mut pipeline: FuturesOrdered<_> = FuturesOrdered::new();
     let mut backend_done = false;
     let mut final_result: Result<(), WarpgateError> = Ok(());
+    let mut end_message = None;
     loop {
         if backend_done && pipeline.is_empty() {
             break;
@@ -302,6 +303,7 @@ async fn relay_events(
                     DesktopEvent::JpegImage { rect, .. } if encode_jpeg => {
                         dirty.touch(*rect, Instant::now());
                     }
+                    DesktopEvent::Ended(reason) => end_message = Some(reason.message.clone()),
                     _ => {}
                 }
                 if let Err(err) = emit(session, recorder.as_deref(), event, raw.as_ref()).await {
@@ -327,5 +329,5 @@ async fn relay_events(
     }
     // Backend ended; dropping `recorder` here finalises the recording.
     drop(recorder);
-    final_result
+    final_result.map(|()| end_message)
 }
