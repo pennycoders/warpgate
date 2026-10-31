@@ -601,7 +601,15 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          }
      }
  
-@@ -5208,10 +5254,12 @@
+@@ -3955,6 +4001,7 @@
+                             input_buffer,
+                             output_buffer_length,
+                         ),
++                        RdpdrServerMessage::Forward(request) => rdpdr.forward_drive_io_request(request),
+                     }
+                     .map_err_kind("failed to send rdpdr event", ServerErrorKind::Pdu)?;
+                     let channel_id = conn
+@@ -5208,10 +5255,12 @@
          let mut update_codecs = UpdateEncoderCodecs::new();
          let mut surface_flags = CmdFlags::empty();
          let mut pointer_cache_size: u16 = 0;
@@ -614,7 +622,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          for c in result.capabilities {
              match c {
                  CapabilitySet::General(c) => {
-@@ -5293,6 +5341,7 @@
+@@ -5293,6 +5342,7 @@
                      // must not reference a cache slot via CachedPointer either, since nothing
                      // else in this crate populates that cache via the Color Pointer Update.
                      pointer_cache_size = p.pointer_cache_size;
@@ -622,7 +630,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                  }
                  CapabilitySet::LargePointer(lp) => {
                      // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
-@@ -5327,10 +5376,13 @@
+@@ -5327,10 +5377,13 @@
              desktop_size,
              surface_flags,
              update_codecs,

@@ -45,6 +45,12 @@ earlier base of this fork carried as a backport too, is the snapshot commit itse
   well. This replaces Warpgate's own patch for the same bug, which read the size without
   consuming it and cleared it once a message carrying the blocks had been built.
 
+## Forwarded drive requests
+
+`RdpdrServerMessage::Forward` (added by the `ironrdp-rdpdr` fork, see its PATCHES.md) is
+dispatched to `RdpdrServer::forward_drive_io_request`, next to the other RDPDR messages.
+Drop with the `ironrdp-rdpdr` fork.
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the
