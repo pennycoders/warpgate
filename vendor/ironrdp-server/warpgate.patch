@@ -1,6 +1,6 @@
 diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
---- ironrdp-server-0.14.0/src/display.rs	2026-10-31 11:23:05
-+++ base/src/display.rs	2026-10-31 11:23:05
+--- ironrdp-server-0.14.0/src/display.rs	2026-10-31 11:23:34
++++ base/src/display.rs	2026-10-31 11:23:34
 @@ -329,6 +329,19 @@
      /// and then signals the event loop via `ServerEvent::Egfx`.
      #[cfg(feature = "egfx")]
@@ -31,9 +31,47 @@ diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
      }
  }
 diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
---- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 11:23:05
-+++ base/src/encoder/bitmap.rs	2026-10-31 11:23:05
-@@ -47,7 +47,8 @@
+--- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 11:23:34
++++ base/src/encoder/bitmap.rs	2026-10-31 11:23:34
+@@ -1,6 +1,6 @@
+-use core::num::NonZeroUsize;
++use core::iter;
+ 
+-use ironrdp_core::{Encode as _, WriteCursor, cast_int, cast_length, invalid_field_err};
++use ironrdp_core::{Encode as _, WriteCursor, cast_int, cast_length};
+ use ironrdp_graphics::image_processing::PixelFormat;
+ use ironrdp_graphics::rdp6::{
+     ABgrChannels, ARgbChannels, BgrAChannels, BitmapEncodeError, BitmapStreamEncoder, RgbAChannels,
+@@ -24,20 +24,15 @@
+     }
+ 
+     pub(crate) fn encode(&mut self, bitmap: &BitmapUpdate, output: &mut [u8]) -> Result<usize, BitmapEncodeError> {
+-        // FIXME: support non-multiple of 4 widths.
+-        //
+-        // It’s not clear how to achieve that yet, but generally, server uses multiple of 4-widths,
+-        // and client has surface capabilities, so this path is unlikely.
+-        if !bitmap.width.get().is_multiple_of(4) {
+-            return Err(BitmapEncodeError::Encode(invalid_field_err!(
+-                "bitmap",
+-                "Width must be a multiple of 4"
+-            )));
+-        }
+-
++        // Each row is padded to a multiple of 4 pixels with copies of its last pixel.
++        // The destination rectangle keeps the real width, so the client clips the padding.
++        let width = bitmap.width.get();
++        let padded_width = width.next_multiple_of(4);
+         let bytes_per_pixel = u16::from(bitmap.format.bytes_per_pixel());
+-        let row_len = bitmap.width.get() * bytes_per_pixel;
+-        let chunk_height = u16::MAX / row_len;
++        let row_len = usize::from(width * bytes_per_pixel);
++        let padding = usize::from(padded_width - width);
++        let padded_row_len = padded_width * bytes_per_pixel;
++        let chunk_height = u16::MAX / padded_row_len;
+ 
+         let mut cursor = WriteCursor::new(output);
+         let stride = bitmap.stride.get();
+@@ -47,18 +42,19 @@
          BitmapUpdateData::encode_header(total, &mut cursor).map_err(BitmapEncodeError::Encode)?;
  
          for (i, chunk) in chunks.enumerate() {
@@ -43,20 +81,50 @@ diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
              let i: u16 = cast_int!("chunk idx", i).map_err(BitmapEncodeError::Encode)?;
              let top = bitmap.y + i * chunk_height;
  
-@@ -76,7 +77,9 @@
+-            let encoder = BitmapStreamEncoder::new(NonZeroUsize::from(bitmap.width).get(), usize::from(height));
++            let encoder = BitmapStreamEncoder::new(usize::from(padded_width), usize::from(height));
+ 
+             let len = {
+-                let pixels = chunk
+-                    .chunks(stride)
+-                    .map(|row| &row[..usize::from(row_len)])
+-                    .rev()
+-                    .flat_map(|row| row.chunks(usize::from(bytes_per_pixel)));
++                let pixels = chunk.chunks(stride).map(|row| &row[..row_len]).rev().flat_map(|row| {
++                    let last = &row[row_len - usize::from(bytes_per_pixel)..];
++                    row.chunks(usize::from(bytes_per_pixel))
++                        .chain(iter::repeat_n(last, padding))
++                });
+ 
+                 Self::encode_iter(encoder, bitmap.format, pixels, self.buffer.as_mut_slice())?
+             };
+@@ -67,17 +63,19 @@
+                 rectangle: InclusiveRectangle {
+                     left: bitmap.x,
+                     top,
+-                    right: bitmap.x + bitmap.width.get() - 1,
++                    right: bitmap.x + width - 1,
+                     bottom: top + height - 1,
+                 },
+-                width: u16::from(bitmap.width),
++                width: padded_width,
+                 height,
+                 bits_per_pixel: u16::from(bitmap.format.bytes_per_pixel()) * 8,
                  compression_flags: Compression::BITMAP_COMPRESSION,
                  compressed_data_header: Some(bitmap::CompressedDataHeader {
                      main_body_size: cast_length!("main body size", len).map_err(BitmapEncodeError::Encode)?,
 -                    scan_width: u16::from(bitmap.width),
+-                    uncompressed_size: height * row_len,
 +                    // In bytes, as the FreeRDP server sends it and clients read it, although
 +                    // MS-RDPBCGR 2.2.9.1.1.3.1.2.3 words it as pixels.
-+                    scan_width: row_len,
-                     uncompressed_size: height * row_len,
++                    scan_width: padded_row_len,
++                    uncompressed_size: height * padded_row_len,
                  }),
                  bitmap_data: &self.buffer[..len],
+             };
 diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
---- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 11:23:05
-+++ base/src/encoder/fast_path.rs	2026-10-31 11:23:05
+--- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 11:23:34
++++ base/src/encoder/fast_path.rs	2026-10-31 11:23:34
 @@ -4,7 +4,8 @@
  use ironrdp_pdu::{Encode as _, WriteCursor};
  
@@ -86,8 +154,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_pa
  
              1..=MAX_FASTPATH_UPDATE_SIZE => {
 diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 11:23:05
-+++ base/src/encoder/mod.rs	2026-10-31 11:23:05
+--- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 11:23:34
++++ base/src/encoder/mod.rs	2026-10-31 11:23:34
 @@ -16,6 +16,8 @@
  use tracing::{debug, warn};
  
@@ -497,8 +565,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
  }
  
 diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
---- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 11:23:05
-+++ base/src/lib.rs	2026-10-31 11:23:05
+--- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 11:23:34
++++ base/src/lib.rs	2026-10-31 11:23:34
 @@ -36,7 +36,7 @@
  #[cfg(all(feature = "__test", feature = "qoiz"))]
  pub use encoder::qoiz::Compressor as QoizCompressor;
@@ -527,8 +595,8 @@ diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
  #[cfg(feature = "usb")]
  pub use urbdrc::{
 diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
---- ironrdp-server-0.14.0/src/server.rs	2026-10-31 11:23:05
-+++ base/src/server.rs	2026-10-31 11:23:05
+--- ironrdp-server-0.14.0/src/server.rs	2026-10-31 11:23:34
++++ base/src/server.rs	2026-10-31 11:23:34
 @@ -62,7 +62,7 @@
  use crate::clipboard::CliprdrServerFactory;
  use crate::display::{DisplayContext, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
