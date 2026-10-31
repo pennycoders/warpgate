@@ -224,6 +224,7 @@ impl ServerMessage {
             DesktopEvent::State(_)
             | DesktopEvent::CursorDefault
             | DesktopEvent::CursorHidden
+            | DesktopEvent::Audio(_)
             | DesktopEvent::Ended(_) => return None,
             DesktopEvent::Resize { width, height } => Self::Resize { width, height },
             DesktopEvent::RawImage { rect, data } => Self::RawImage {
@@ -256,9 +257,17 @@ impl ServerMessage {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use warpgate_core::{DesktopEndReason, DesktopEvent};
 
     use super::ServerMessage;
+
+    #[test]
+    fn sound_is_not_sent_to_the_browser() {
+        assert!(
+            ServerMessage::from_event(DesktopEvent::Audio(Bytes::from_static(&[0; 4]))).is_none()
+        );
+    }
 
     /// The end reaches the browser as the session's closing phase, not as a message.
     #[test]

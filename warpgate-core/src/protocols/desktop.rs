@@ -128,6 +128,8 @@ pub enum DesktopEvent {
     Clipboard(String),
     /// The remote rang the bell.
     Bell,
+    /// A block of the remote's sound, as interleaved PCM in [`DESKTOP_AUDIO_FORMAT`].
+    Audio(Bytes),
     /// A non-fatal error message.
     Error(String),
     /// The remote ended the session and said why.
@@ -151,6 +153,30 @@ impl DesktopEvent {
         ))
     }
 }
+
+/// The PCM format desktop sound is relayed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopAudioFormat {
+    pub channels: u16,
+    pub samples_per_sec: u32,
+    pub bits_per_sample: u16,
+}
+
+impl DesktopAudioFormat {
+    pub const fn block_align(self) -> u16 {
+        self.channels * (self.bits_per_sample / 8)
+    }
+
+    pub const fn avg_bytes_per_sec(self) -> u32 {
+        self.samples_per_sec * self.block_align() as u32
+    }
+}
+
+pub const DESKTOP_AUDIO_FORMAT: DesktopAudioFormat = DesktopAudioFormat {
+    channels: 2,
+    samples_per_sec: 44_100,
+    bits_per_sample: 16,
+};
 
 /// Deadline for the TCP connect to a desktop target.
 pub const DESKTOP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

@@ -323,6 +323,10 @@ pub struct TargetRdpOptions {
     #[serde(default)]
     pub interactive_logon: bool,
 
+    /// Play the target's sound on native RDP viewers (audio output redirection, MS-RDPEA).
+    #[serde(default)]
+    pub audio_playback: bool,
+
     // TLS compatibility/security profile used for the target-facing RDP connection.
     // Kept as a plain comment so OpenAPI emits a direct enum reference. A field
     // description wraps the enum in allOf, which typescript-fetch misgenerates.
@@ -915,5 +919,14 @@ mod tests {
     #[test]
     fn malformed_reference_is_a_stored_secret() {
         assert_eq!(malformed_options().stored_secrets_mut().len(), 1);
+    }
+
+    #[test]
+    fn rdp_audio_playback_is_off_unless_asked_for() {
+        let default: TargetRdpOptions = serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        assert!(!default.audio_playback);
+        let on: TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h","audio_playback":true}"#).unwrap();
+        assert!(on.audio_playback);
     }
 }

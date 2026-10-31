@@ -88,6 +88,13 @@ shape. `warpgate.patch` sends the default pointer instead (`EncoderIter::next` i
 `src/encoder/mod.rs`), so a viewer never keeps a shape the target has left. Warpgate does
 not know a viewer's pointer capabilities when it builds the update; the encoder does.
 
+## Audio output on `AUDIO_PLAYBACK_DVC` too
+
+With a sound factory, the server also offers `AUDIO_PLAYBACK_DVC` (`RdpsndDvcServer` from the
+vendored `ironrdp-rdpsnd`) next to the `rdpsnd` static channel, and sends each
+`ServerEvent::Rdpsnd` on the static channel when the client negotiated a format there,
+otherwise on the dynamic one. Jump Desktop takes audio only on the dynamic channel.
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the
