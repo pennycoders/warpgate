@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use ironrdp_core::decode;
 use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, server_codecs_capabilities};
 use ironrdp_pdu::rdp::server_error_info::ServerSetErrorInfoPdu;
 use ironrdp_server::{
     BitmapUpdate, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
@@ -159,6 +160,7 @@ where
                 .as_ref()
                 .map(|graphics| Box::new(graphics.factory()) as Box<dyn GfxServerFactory>),
         )
+        .with_bitmap_codecs(bitmap_codecs(graphics.is_some()))
         .build();
 
     let router = tokio::spawn(
@@ -399,6 +401,18 @@ fn cursor_to_update(
         hot_y: hotspot_y,
         data,
     })
+}
+
+/// The codecs offered for the bitmap path. With the Graphics Pipeline on, RemoteFX is left
+/// out: a viewer encoding with it SHOULD NOT request display changes (MS-RDPEDISP 1.5), and
+/// Windows App then sends no layout when the device rotates.
+fn bitmap_codecs(graphics_pipeline: bool) -> BitmapCodecs {
+    let config: &[&str] = if graphics_pipeline {
+        &["remotefx:off"]
+    } else {
+        &[]
+    };
+    server_codecs_capabilities(config).unwrap_or_default()
 }
 
 /// Bound a viewer-supplied desktop size with [`bound_desktop_size`]. On this path it arrives
@@ -1039,16 +1053,33 @@ mod graphics_tests {
     use ironrdp_core::encode_vec;
     use ironrdp_dvc::DvcProcessor as _;
     use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+    use ironrdp_pdu::rdp::capability_sets::CodecProperty;
     use ironrdp_server::{DesktopSize, DisplayUpdate, ServerEvent, ServerEventSender as _};
     use tokio::sync::{Mutex, mpsc};
 
     use super::{
-        DisplayRouteState, Input, ViewerClipboard, ViewerGraphics, ViewerSound, route_input,
+        DisplayRouteState, Input, ViewerClipboard, ViewerGraphics, ViewerSound, bitmap_codecs,
+        route_input,
     };
 
     struct Painter;
 
     impl GraphicsPipelineHandler for Painter {}
+
+    #[test]
+    fn remotefx_is_offered_only_without_the_pipeline() {
+        let remotefx = |graphics_pipeline| {
+            bitmap_codecs(graphics_pipeline).0.iter().any(|codec| {
+                matches!(
+                    codec.property,
+                    CodecProperty::RemoteFx(_) | CodecProperty::ImageRemoteFx(_)
+                )
+            })
+        };
+        assert!(remotefx(false));
+        // oracle: spec MS-RDPEDISP §1.5
+        assert!(!remotefx(true));
+    }
 
     fn frame() -> Input {
         Input::Frame {

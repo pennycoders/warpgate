@@ -14,6 +14,7 @@ use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilitySet};
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, MixedTilePayload};
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 use ironrdp_graphics::zgfx::CompressionMode;
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, EgfxServerMessage, GfxContext, GfxDvcBridge,
@@ -204,12 +205,7 @@ impl ViewerGraphics {
             return false;
         }
         if let Some(pipeline) = self.pipeline() {
-            let mut pipeline = lock(&pipeline);
-            pipeline.resize(size.width, size.height);
-            self.surface = pipeline.create_surface(size.width, size.height);
-            if let Some(surface) = self.surface {
-                pipeline.map_surface_to_output(surface, 0, 0);
-            }
+            self.surface = reset(&mut lock(&pipeline), size);
         }
         self.flush();
         true
@@ -223,14 +219,7 @@ impl ViewerGraphics {
         let Some(pipeline) = self.pipeline() else {
             return;
         };
-        {
-            let mut pipeline = lock(&pipeline);
-            pipeline.set_output_dimensions(size.width, size.height);
-            self.surface = pipeline.create_surface(size.width, size.height);
-            if let Some(surface) = self.surface {
-                pipeline.map_surface_to_output(surface, 0, 0);
-            }
-        }
+        self.surface = reset(&mut lock(&pipeline), size);
         self.dirty = vec![self.full()];
         self.flush();
     }
@@ -360,6 +349,23 @@ impl ViewerGraphics {
     }
 }
 
+/// Resets the viewer's graphics to `size` with one primary monitor covering it: Windows App
+/// lays the output out by the monitors (MS-RDPEGFX 2.2.2.14), and with none it keeps the
+/// geometry it connected with. Returns the new surface, mapped to the output.
+fn reset(pipeline: &mut GraphicsPipelineServer, size: DesktopSize) -> Option<u16> {
+    let monitor = Monitor {
+        left: 0,
+        top: 0,
+        right: i32::from(size.width) - 1,
+        bottom: i32::from(size.height) - 1,
+        flags: MonitorFlags::PRIMARY,
+    };
+    pipeline.resize_with_monitors(size.width, size.height, vec![monitor]);
+    let surface = pipeline.create_surface(size.width, size.height)?;
+    pipeline.map_surface_to_output(surface, 0, 0);
+    Some(surface)
+}
+
 fn union(a: &ExclusiveRectangle, b: &ExclusiveRectangle) -> ExclusiveRectangle {
     ExclusiveRectangle {
         left: a.left.min(b.left),
@@ -373,10 +379,12 @@ fn union(a: &ExclusiveRectangle, b: &ExclusiveRectangle) -> ExclusiveRectangle {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use ironrdp_core::{Decode as _, ReadCursor, encode_vec};
+    use ironrdp_core::{Decode as _, ReadCursor, decode_cursor, encode_vec};
     use ironrdp_dvc::DvcProcessor as _;
     use ironrdp_dvc::pdu::{DrdynvcDataPdu, DrdynvcServerPdu};
     use ironrdp_egfx::client::GraphicsPipelineClient;
+    use ironrdp_egfx::pdu::{GfxPdu, ResetGraphicsPdu};
+    use ironrdp_graphics::zgfx::Decompressor;
 
     use super::*;
 
@@ -403,6 +411,9 @@ mod tests {
         /// Acknowledgements the client sent and the server has not been given.
         acks: Vec<Vec<u8>>,
         tiles: Arc<AtomicUsize>,
+        /// A second decoder of the server's output, for the ResetGraphics PDUs themselves.
+        decompressor: Decompressor,
+        resets: Vec<ResetGraphicsPdu>,
     }
 
     impl Viewer {
@@ -423,6 +434,8 @@ mod tests {
                 width: 0,
                 acks: Vec::new(),
                 tiles,
+                decompressor: Decompressor::new(),
+                resets: Vec::new(),
             }
         }
 
@@ -434,9 +447,9 @@ mod tests {
                     .process(CHANNEL, &encode_vec(advertise.as_ref()).unwrap())
                     .unwrap();
                 for message in confirm {
-                    self.client
-                        .process(CHANNEL, &encode_vec(message.as_ref()).unwrap())
-                        .unwrap();
+                    let data = encode_vec(message.as_ref()).unwrap();
+                    self.record_resets(&data);
+                    self.client.process(CHANNEL, &data).unwrap();
                 }
             }
             assert_eq!(self.signals(), [Signal::Ready]);
@@ -459,6 +472,7 @@ mod tests {
                     let DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(data)) = pdu else {
                         panic!("expected one DVC data PDU, got {pdu:?}");
                     };
+                    self.record_resets(data.data());
                     for reply in self.client.process(CHANNEL, data.data()).unwrap() {
                         self.acks.push(encode_vec(reply.as_ref()).unwrap());
                     }
@@ -476,6 +490,17 @@ mod tests {
                         * 4;
                     self.screen[at..at + columns]
                         .copy_from_slice(&update.data[row * columns..(row + 1) * columns]);
+                }
+            }
+        }
+
+        fn record_resets(&mut self, data: &[u8]) {
+            let mut pdus = Vec::new();
+            self.decompressor.decompress(data, &mut pdus).unwrap();
+            let mut cursor = ReadCursor::new(&pdus);
+            while !cursor.is_empty() {
+                if let GfxPdu::ResetGraphics(reset) = decode_cursor(&mut cursor).unwrap() {
+                    self.resets.push(reset);
                 }
             }
         }
@@ -558,6 +583,38 @@ mod tests {
 
         assert_eq!(viewer.width, 8);
         assert_eq!(viewer.bgr(), bgr(&rotated));
+    }
+
+    #[test]
+    fn every_reset_lays_out_one_primary_monitor_of_the_new_size() {
+        let mut viewer = Viewer::new();
+        viewer.open(size(16, 8));
+        assert!(viewer.graphics.resize(size(8, 12)));
+        viewer.deliver();
+
+        let monitor = |right, bottom| Monitor {
+            left: 0,
+            top: 0,
+            right,
+            bottom,
+            flags: MonitorFlags::PRIMARY,
+        };
+        // oracle: spec MS-RDPEGFX §2.2.2.14, MS-RDPBCGR §2.2.1.3.6.1 (inclusive edges)
+        assert_eq!(
+            viewer.resets,
+            [
+                ResetGraphicsPdu {
+                    width: 16,
+                    height: 8,
+                    monitors: vec![monitor(15, 7)],
+                },
+                ResetGraphicsPdu {
+                    width: 8,
+                    height: 12,
+                    monitors: vec![monitor(7, 11)],
+                },
+            ]
+        );
     }
 
     #[test]
