@@ -6,9 +6,10 @@ use uuid::Uuid;
 use warpgate_tls::TlsMode;
 
 use super::defaults::{
-    _default_empty_string, _default_empty_vec, _default_mysql_port,
-    _default_postgres_idle_timeout_str, _default_postgres_port, _default_rdp_port,
-    _default_ssh_ca_mount, _default_ssh_port, _default_username, _default_vnc_port,
+    _default_clipboard_files_max_mb, _default_empty_string, _default_empty_vec,
+    _default_mysql_port, _default_postgres_idle_timeout_str, _default_postgres_port,
+    _default_rdp_port, _default_ssh_ca_mount, _default_ssh_port, _default_username,
+    _default_vnc_port,
 };
 use crate::secrets::{MaybeSecretRef, SecretRef, StoredSecrets};
 use crate::{Protocol, Secret, StoredSecret};
@@ -338,6 +339,30 @@ pub struct TargetRdpOptions {
     // description wraps the enum in allOf, which typescript-fetch misgenerates.
     #[serde(default)]
     pub tls_security: RdpTlsSecurity,
+
+    /// Let files be copied and pasted through the clipboard, in both directions.
+    /// Warpgate relays every byte itself, so the cap below always applies and each
+    /// transferred file is logged with the session.
+    #[serde(default)]
+    #[oai(default)]
+    pub clipboard_files: bool,
+
+    /// The most a single clipboard copy may carry, in MiB, summed over its files.
+    /// Files past the cap are left out of the copy.
+    #[serde(default = "_default_clipboard_files_max_mb")]
+    #[oai(
+        default = "_default_clipboard_files_max_mb",
+        validator(minimum(value = "1"), maximum(value = "65536"))
+    )]
+    pub clipboard_files_max_mb: u32,
+}
+
+impl TargetRdpOptions {
+    /// The clipboard file cap in bytes, or `None` when clipboard files are off.
+    pub fn clipboard_files_max_bytes(&self) -> Option<u64> {
+        self.clipboard_files
+            .then(|| u64::from(self.clipboard_files_max_mb.max(1)) * 1024 * 1024)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, Enum)]
@@ -751,6 +776,8 @@ mod tests {
         assert_eq!(postgres.protocol_version, PostgresProtocolVersion::V3_2);
         assert_eq!(rdp.compression, RdpTargetCompression::RemoteFX);
         assert_eq!(rdp.tls_security, RdpTlsSecurity::Tls12);
+        assert!(!rdp.clipboard_files);
+        assert_eq!(rdp.clipboard_files_max_bytes(), None);
         let empty_password = DatabaseTargetAuth::Password(DatabaseTargetPasswordAuth::default());
         assert_eq!(mysql.auth, empty_password);
         assert_eq!(postgres.auth, empty_password);

@@ -6,12 +6,36 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend};
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
+    FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest,
+    FormatDataResponse, LockDataId,
 };
 use ironrdp_core::{AsAny, IntoOwned as _};
 use tracing::debug;
-use warpgate_core::MAX_CLIPBOARD_BYTES;
+use warpgate_core::{ClipboardTransfer, FileTransferRecord, MAX_CLIPBOARD_BYTES};
+
+use crate::clipboard_files::{FileRelay, RelayOutput};
+
+/// The capabilities a channel that may carry files advertises. Paths are never sent
+/// (only names relative to the copy), locks let a paste outlive the next copy, and huge
+/// files are allowed because the per-target cap, not the protocol, is the limit.
+const FILE_CAPABILITIES: ClipboardGeneralCapabilityFlags =
+    ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+        .union(ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS)
+        .union(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA)
+        .union(ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED);
+
+/// The format id a peer gave its file list, if its clipboard holds files.
+fn file_list_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
+    formats
+        .iter()
+        .find(|format| {
+            format
+                .name()
+                .is_some_and(|name| name.value() == ClipboardFormatName::FILE_LIST.value())
+        })
+        .map(ClipboardFormat::id)
+}
 
 /// truncate so that utf16 encoded `text` fits in `max` bytes
 fn truncate_for_wire(text: &mut String, max: usize) {
@@ -48,6 +72,27 @@ fn preferred_text_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatI
 pub(crate) trait ClipboardSink: core::fmt::Debug + Send + 'static {
     fn request(&self, message: ClipboardMessage);
     fn text_received(&self, text: String);
+    /// A file transfer step for the other side of the session.
+    fn transfer(&self, transfer: ClipboardTransfer);
+    /// A file is being read across the session. Only the target-facing channel reports
+    /// these.
+    fn transferred(&self, _record: FileTransferRecord) {}
+}
+
+fn dispatch(sink: &impl ClipboardSink, outputs: Vec<RelayOutput>) {
+    for output in outputs {
+        match output {
+            RelayOutput::Remote(message) => sink.request(message),
+            RelayOutput::Peer(transfer) => sink.transfer(transfer),
+            RelayOutput::Audit(record) => sink.transferred(record),
+        }
+    }
+}
+
+type SharedRelay = Arc<Mutex<FileRelay>>;
+
+fn relay(files: &SharedRelay) -> std::sync::MutexGuard<'_, FileRelay> {
+    files.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -71,6 +116,10 @@ impl ClipboardText {
 pub(crate) struct Clipboard<S> {
     store: ClipboardText,
     ready: Arc<AtomicBool>,
+    files: SharedRelay,
+    /// Whether channels advertise file streaming. The viewer-facing channel always does,
+    /// since it comes up before the target decides; the relay's limit gates actual use.
+    advertise_files: bool,
     sink: S,
 }
 
@@ -93,18 +142,60 @@ impl<S: ClipboardSink + Clone> Clipboard<S> {
         Self {
             store: ClipboardText::default(),
             ready: Arc::new(AtomicBool::new(ready)),
+            files: SharedRelay::default(),
+            advertise_files: false,
             sink,
         }
     }
 
-    pub(crate) fn sink(&self) -> &S {
+    /// Carry files too. `max_bytes` is the per-copy cap, `None` until it is known (the
+    /// viewer-facing channel learns it once the target is up, see [`Self::set_file_limit`]);
+    /// `audit` reports each transfer through [`ClipboardSink::transferred`].
+    pub(crate) fn with_files(self, max_bytes: Option<u64>, audit: bool) -> Self {
+        *relay(&self.files) = FileRelay::new(max_bytes, audit);
+        Self {
+            advertise_files: true,
+            ..self
+        }
+    }
+
+    /// Turn file transfer on or off for this session. Files the remote copied while it was
+    /// off are fetched now, so a copy made before the target connected still pastes.
+    pub(crate) fn set_file_limit(&self, max_bytes: Option<u64>) {
+        let pending = {
+            let mut files = relay(&self.files);
+            files.set_limit(max_bytes);
+            files.take_unfetched_file_list()
+        };
+        if let Some(format) = pending {
+            self.sink
+                .request(ClipboardMessage::SendInitiatePaste(format));
+        }
+    }
+
+    /// A file transfer step from the other side of the session.
+    pub(crate) fn transfer(&self, transfer: ClipboardTransfer) {
+        let is_offer = matches!(transfer, ClipboardTransfer::Offer(_));
+        let outputs = relay(&self.files).peer_step(transfer);
+        if is_offer && !outputs.is_empty() {
+            // The clipboard holds files now: a later channel must not bring back the text.
+            self.store.set(String::new());
+        }
+        dispatch(&self.sink, outputs);
+    }
+
+    pub(crate) const fn sink(&self) -> &S {
         &self.sink
     }
 
     pub(crate) fn backend(&self) -> TextClipboard<S> {
+        // Stream ids and locks belong to the channel that minted them.
+        dispatch(&self.sink, relay(&self.files).reset_channel());
         TextClipboard {
             store: self.store.clone(),
             ready: Arc::clone(&self.ready),
+            files: Arc::clone(&self.files),
+            advertise_files: self.advertise_files,
             sink: self.sink.clone(),
             paste_format: None,
         }
@@ -125,6 +216,8 @@ impl<S: ClipboardSink + Clone> Clipboard<S> {
 pub(crate) struct TextClipboard<S> {
     store: ClipboardText,
     ready: Arc<AtomicBool>,
+    files: SharedRelay,
+    advertise_files: bool,
     sink: S,
     paste_format: Option<ClipboardFormatId>,
 }
@@ -145,7 +238,11 @@ impl<S: ClipboardSink> CliprdrBackend for TextClipboard<S> {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        ClipboardGeneralCapabilityFlags::empty()
+        if self.advertise_files {
+            FILE_CAPABILITIES
+        } else {
+            ClipboardGeneralCapabilityFlags::empty()
+        }
     }
 
     fn on_ready(&mut self) {
@@ -174,11 +271,24 @@ impl<S: ClipboardSink> CliprdrBackend for TextClipboard<S> {
 
     fn on_process_negotiated_capabilities(
         &mut self,
-        _capabilities: ClipboardGeneralCapabilityFlags,
+        capabilities: ClipboardGeneralCapabilityFlags,
     ) {
+        relay(&self.files).set_negotiated(
+            capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED),
+        );
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        // Only the list is fetched (delayed rendering): contents move when the other side
+        // pastes and asks for them.
+        let file_list = relay(&self.files).remote_copied(file_list_format(available_formats));
+        if let Some(format) = file_list {
+            // A file copy usually carries no text; when it does, the text is a rendering
+            // of the same copy, and offering it as well would replace the files.
+            self.sink
+                .request(ClipboardMessage::SendInitiatePaste(format));
+            return;
+        }
         if let Some(format) = preferred_text_format(available_formats) {
             self.paste_format = Some(format);
             self.sink
@@ -219,10 +329,28 @@ impl<S: ClipboardSink> CliprdrBackend for TextClipboard<S> {
         }
     }
 
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
-    fn on_lock(&mut self, _data_id: LockDataId) {}
-    fn on_unlock(&mut self, _data_id: LockDataId) {}
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        let outputs = relay(&self.files).remote_request(&request);
+        dispatch(&self.sink, outputs);
+    }
+
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+        let outputs = relay(&self.files).remote_contents(&response);
+        dispatch(&self.sink, outputs);
+    }
+
+    fn on_lock(&mut self, data_id: LockDataId) {
+        relay(&self.files).lock(data_id.0);
+    }
+
+    fn on_unlock(&mut self, data_id: LockDataId) {
+        relay(&self.files).unlock(data_id.0);
+    }
+
+    fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
+        let outputs = relay(&self.files).remote_file_list(files, clip_data_id);
+        dispatch(&self.sink, outputs);
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +363,7 @@ mod tests {
     struct TestSink {
         requests: Sender<ClipboardMessage>,
         texts: Sender<String>,
+        transfers: Sender<ClipboardTransfer>,
     }
 
     impl ClipboardSink for TestSink {
@@ -244,6 +373,10 @@ mod tests {
 
         fn text_received(&self, text: String) {
             let _ = self.texts.send(text);
+        }
+
+        fn transfer(&self, transfer: ClipboardTransfer) {
+            let _ = self.transfers.send(transfer);
         }
     }
 
@@ -265,7 +398,12 @@ mod tests {
     fn build_fixture(make: fn(TestSink) -> Clipboard<TestSink>) -> Fixture {
         let (requests, requests_rx) = channel();
         let (texts, texts_rx) = channel();
-        let clipboard = make(TestSink { requests, texts });
+        let (transfers, _) = channel();
+        let clipboard = make(TestSink {
+            requests,
+            texts,
+            transfers,
+        });
         let backend = clipboard.backend();
         (clipboard, backend, requests_rx, texts_rx)
     }

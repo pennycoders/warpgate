@@ -31,6 +31,10 @@ pub const fn _default_rdp_port() -> u16 {
     3389
 }
 
+pub const fn _default_clipboard_files_max_mb() -> u32 {
+    100
+}
+
 #[inline]
 pub fn _default_username() -> String {
     "root".to_owned()

@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use warpgate_core::{
-    DESKTOP_AUDIO_FORMAT, DesktopEvent, DesktopInput, DesktopRect, DesktopState,
+    ClipboardFile, ClipboardFileOffer, ClipboardTransfer, DESKTOP_AUDIO_FORMAT, DesktopEvent,
+    DesktopInput, DesktopRect, DesktopState, FileContentsReply, FileContentsRequest,
     MAX_CLIPBOARD_BYTES, Scancode, truncate_clipboard_contents_in_place,
 };
 use warpgate_web_clients_common::{LiveSessionPhase, SessionPhase};
@@ -24,6 +25,40 @@ impl From<DesktopRect> for WsRect {
         }
     }
 }
+
+/// One entry of a clipboard file offer, as the browser sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WsClipboardFile {
+    pub path: String,
+    pub size: u64,
+    #[serde(default)]
+    pub directory: bool,
+}
+
+impl From<ClipboardFile> for WsClipboardFile {
+    fn from(file: ClipboardFile) -> Self {
+        Self {
+            path: file.path,
+            size: file.size,
+            directory: file.directory,
+        }
+    }
+}
+
+impl From<WsClipboardFile> for ClipboardFile {
+    fn from(file: WsClipboardFile) -> Self {
+        Self {
+            path: file.path,
+            size: file.size,
+            directory: file.directory,
+        }
+    }
+}
+
+/// File bytes on the WebSocket, base64 in the JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct WsBytes(#[serde(with = "warpgate_common::helpers::serde_base64")] pub Bytes);
 
 /// Messages sent from the browser to the server.
 #[derive(Debug, Deserialize)]
@@ -64,6 +99,26 @@ pub enum ClientMessage {
     Audio {
         enabled: bool,
     },
+    /// Files the user pasted or dropped into the desktop. The browser keeps them and
+    /// serves their ranges as the target asks (`file_contents`).
+    ClipboardFiles {
+        offer: u32,
+        files: Vec<WsClipboardFile>,
+    },
+    /// A range of a file the target copied, for a download.
+    FileContentsRequest {
+        id: u32,
+        offer: u32,
+        index: u32,
+        offset: u64,
+        length: u32,
+    },
+    /// The answer to a server `file_contents_request`; `data` absent on failure.
+    FileContents {
+        id: u32,
+        #[serde(default)]
+        data: Option<WsBytes>,
+    },
 }
 
 impl From<ClientMessage> for Option<DesktopInput> {
@@ -100,6 +155,32 @@ impl From<ClientMessage> for Option<DesktopInput> {
             ClientMessage::Refresh => DesktopInput::Refresh,
             ClientMessage::Resize { width, height } => DesktopInput::Resize { width, height },
             ClientMessage::Audio { .. } => return None,
+            // Limits are applied where the transfer meets the target, as for native viewers.
+            ClientMessage::ClipboardFiles { offer, files } => {
+                DesktopInput::ClipboardTransfer(ClipboardTransfer::Offer(ClipboardFileOffer {
+                    offer,
+                    files: files.into_iter().map(Into::into).collect(),
+                }))
+            }
+            ClientMessage::FileContentsRequest {
+                id,
+                offer,
+                index,
+                offset,
+                length,
+            } => DesktopInput::ClipboardTransfer(ClipboardTransfer::Request(FileContentsRequest {
+                id,
+                offer,
+                index,
+                offset,
+                length,
+            })),
+            ClientMessage::FileContents { id, data } => {
+                DesktopInput::ClipboardTransfer(ClipboardTransfer::Reply(FileContentsReply {
+                    id,
+                    data: data.map(|data| data.0),
+                }))
+            }
         })
     }
 }
@@ -147,6 +228,29 @@ pub enum ServerMessage {
     },
     Clipboard {
         text: String,
+    },
+    /// Files the target copied, offered for download.
+    ClipboardFiles {
+        offer: u32,
+        files: Vec<WsClipboardFile>,
+    },
+    /// A range of a file the browser offered, which the target is reading.
+    FileContentsRequest {
+        id: u32,
+        offer: u32,
+        index: u32,
+        offset: u64,
+        length: u32,
+    },
+    /// The answer to a browser `file_contents_request`; `data` absent on failure.
+    FileContents {
+        id: u32,
+        data: Option<WsBytes>,
+    },
+    /// What the target allows; `clipboard_files_max_bytes` is absent when file transfer
+    /// is off.
+    Capabilities {
+        clipboard_files_max_bytes: Option<u64>,
     },
     Bell,
     /// A block of the target's sound, interleaved signed 16-bit little-endian PCM in
@@ -304,6 +408,32 @@ impl ServerMessage {
                 data,
             },
             DesktopEvent::Clipboard(text) => Self::Clipboard { text },
+            DesktopEvent::ClipboardTransfer(ClipboardTransfer::Offer(offer)) => {
+                Self::ClipboardFiles {
+                    offer: offer.offer,
+                    files: offer.files.into_iter().map(Into::into).collect(),
+                }
+            }
+            DesktopEvent::ClipboardTransfer(ClipboardTransfer::Request(request)) => {
+                Self::FileContentsRequest {
+                    id: request.id,
+                    offer: request.offer,
+                    index: request.index,
+                    offset: request.offset,
+                    length: request.length,
+                }
+            }
+            DesktopEvent::ClipboardTransfer(ClipboardTransfer::Reply(reply)) => {
+                Self::FileContents {
+                    id: reply.id,
+                    data: reply.data.map(WsBytes),
+                }
+            }
+            DesktopEvent::Capabilities(capabilities) => Self::Capabilities {
+                clipboard_files_max_bytes: capabilities.clipboard_files_max_bytes,
+            },
+            // Audit only: the recorder has it.
+            DesktopEvent::FileTransferred(_) => return None,
             DesktopEvent::Bell => Self::Bell,
             DesktopEvent::Audio(data) => Self::Audio { data },
             DesktopEvent::MicrophoneOpen {
@@ -322,10 +452,9 @@ impl ServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-    use warpgate_core::{DesktopEndReason, DesktopEvent};
+    use warpgate_core::DesktopEndReason;
 
-    use super::{ClientMessage, ServerMessage, WsPayload};
+    use super::*;
 
     #[test]
     fn sound_goes_to_the_browser_as_a_binary_frame_with_its_format() {
@@ -366,6 +495,111 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"features","audio_playback":true,"microphone":true}"#
+        );
+    }
+
+    fn input(json: &str) -> DesktopInput {
+        let message: ClientMessage = serde_json::from_str(json).unwrap();
+        Option::<DesktopInput>::from(message).unwrap()
+    }
+
+    #[test]
+    fn browser_file_messages_become_transfer_steps() {
+        let DesktopInput::ClipboardTransfer(ClipboardTransfer::Offer(offer)) =
+            input(r#"{"type":"clipboard_files","offer":3,"files":[{"path":"a.txt","size":5}]}"#)
+        else {
+            panic!("expected an offer");
+        };
+        assert_eq!(offer.offer, 3);
+        assert_eq!(
+            offer.files,
+            [ClipboardFile {
+                path: "a.txt".into(),
+                size: 5,
+                directory: false,
+            }]
+        );
+
+        let DesktopInput::ClipboardTransfer(ClipboardTransfer::Request(request)) = input(
+            r#"{"type":"file_contents_request","id":1,"offer":2,"index":0,"offset":10,"length":20}"#,
+        ) else {
+            panic!("expected a request");
+        };
+        assert_eq!(
+            (request.id, request.offer, request.offset, request.length),
+            (1, 2, 10, 20)
+        );
+
+        let DesktopInput::ClipboardTransfer(ClipboardTransfer::Reply(reply)) =
+            input(r#"{"type":"file_contents","id":4,"data":"aGVsbG8="}"#)
+        else {
+            panic!("expected a reply");
+        };
+        assert_eq!(reply.data.as_deref(), Some(&b"hello"[..]));
+
+        let DesktopInput::ClipboardTransfer(ClipboardTransfer::Reply(reply)) =
+            input(r#"{"type":"file_contents","id":4}"#)
+        else {
+            panic!("expected a reply");
+        };
+        assert_eq!(reply.data, None);
+    }
+
+    #[test]
+    fn invalid_base64_from_the_browser_is_rejected() {
+        assert!(
+            serde_json::from_str::<ClientMessage>(r#"{"type":"file_contents","id":4,"data":"%%"}"#)
+                .is_err()
+        );
+    }
+
+    fn json(event: DesktopEvent) -> serde_json::Value {
+        let message = ServerMessage::from_event(event).unwrap();
+        assert!(
+            !message.is_incremental(),
+            "file messages must never be shed"
+        );
+        match message.ws_payload() {
+            WsPayload::Text(text) => serde_json::from_str(&text).unwrap(),
+            WsPayload::Binary(_) => panic!("expected JSON"),
+        }
+    }
+
+    #[test]
+    fn target_file_steps_reach_the_browser_as_json() {
+        assert_eq!(
+            json(DesktopEvent::ClipboardTransfer(ClipboardTransfer::Offer(
+                ClipboardFileOffer {
+                    offer: 1,
+                    files: vec![ClipboardFile {
+                        path: "dir/b.bin".into(),
+                        size: 2,
+                        directory: false,
+                    }],
+                }
+            ))),
+            serde_json::json!({
+                "type": "clipboard_files",
+                "offer": 1,
+                "files": [{"path": "dir/b.bin", "size": 2, "directory": false}],
+            })
+        );
+        assert_eq!(
+            json(DesktopEvent::ClipboardTransfer(ClipboardTransfer::Reply(
+                FileContentsReply {
+                    id: 9,
+                    data: Some(Bytes::from_static(b"hi")),
+                }
+            ))),
+            serde_json::json!({"type": "file_contents", "id": 9, "data": "aGk="})
+        );
+        assert_eq!(
+            json(DesktopEvent::Capabilities(
+                warpgate_core::DesktopCapabilities {
+                    clipboard_files_max_bytes: None,
+                }
+            )),
+            serde_json::json!({"type": "capabilities", "clipboard_files_max_bytes": null})
         );
     }
 
@@ -424,5 +658,19 @@ mod tests {
             rdp_error_info: Some(5),
         });
         assert!(ServerMessage::from_event(ended).is_none());
+    }
+
+    #[test]
+    fn audit_records_stay_on_the_server() {
+        assert!(
+            ServerMessage::from_event(DesktopEvent::FileTransferred(
+                warpgate_core::FileTransferRecord {
+                    direction: warpgate_core::FileTransferDirection::Upload,
+                    path: "a".into(),
+                    size: 1,
+                }
+            ))
+            .is_none()
+        );
     }
 }

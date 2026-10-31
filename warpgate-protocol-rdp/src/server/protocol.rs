@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
-use warpgate_core::{DesktopAudioFormat, DesktopInput};
+use warpgate_core::{ClipboardTransfer, DesktopAudioFormat, DesktopCapabilities, DesktopInput};
 
 /// Warpgate's verdict on a viewer's credentials, returned through the
 /// [`Event::AuthRequest`] reply channel.
@@ -47,6 +47,10 @@ pub enum Input {
         frames_per_packet: u32,
     },
     MicrophoneClose,
+    /// A clipboard file transfer step from the target side.
+    ClipboardTransfer(ClipboardTransfer),
+    /// What the target allows, once it is up.
+    Capabilities(DesktopCapabilities),
     Shutdown,
     /// End the session, telling the viewer why with this RDP error info code.
     Disconnect(u32),

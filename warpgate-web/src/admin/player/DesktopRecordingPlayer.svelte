@@ -48,6 +48,13 @@
               buttons: number
           }
         | { type: 'wheel_input' | 'clipboard_input'; time: number }
+        | {
+              type: 'file_transfer'
+              time: number
+              direction: 'upload' | 'download'
+              path: string
+              size: number
+          }
     // Lines of the append-only `index.ndjson`: seek anchors, size changes, input
     // timestamps (heatmap only) and a final duration marker. Overlay input comes from the
     // data stream, not here.
@@ -199,6 +206,15 @@
                         },
                     ]
                 }
+                break
+            case 'file_transfer':
+                keyPresses = [
+                    ...keyPresses,
+                    {
+                        time: item.time,
+                        label: `${item.direction === 'upload' ? 'Upload' : 'Download'}: ${item.path}`,
+                    },
+                ]
                 break
             case 'pointer_input': {
                 const pressed = item.buttons & ~prevButtons

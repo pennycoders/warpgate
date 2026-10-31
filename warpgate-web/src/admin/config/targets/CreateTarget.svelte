@@ -111,6 +111,8 @@
                     interactiveLogon: false,
                     audioPlayback: false,
                     microphone: false,
+                    clipboardFiles: false,
+                    clipboardFilesMaxMb: 100,
                     tlsSecurity: RdpTlsSecurity.Tls12,
                     compression: RdpTargetCompression.Remotefx,
                 },
