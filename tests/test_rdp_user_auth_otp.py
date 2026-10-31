@@ -52,6 +52,7 @@ def _provision(api, otp_key_base64):
                     ),
                     verify_tls=False,
                     interactive_logon=False,
+                    audio_playback=False,
                 )
             ),
         )
@@ -78,6 +79,7 @@ def _provision(api, otp_key_base64):
                     ),
                     verify_tls=False,
                     interactive_logon=False,
+                    audio_playback=False,
                 )
             ),
         )

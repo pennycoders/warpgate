@@ -109,6 +109,7 @@
                     },
                     verifyTls: false,
                     interactiveLogon: false,
+                    audioPlayback: false,
                     tlsSecurity: RdpTlsSecurity.Tls12,
                     compression: RdpTargetCompression.Remotefx,
                 },

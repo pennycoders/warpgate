@@ -45,6 +45,13 @@ earlier base of this fork carried as a backport too, is the snapshot commit itse
   well. This replaces Warpgate's own patch for the same bug, which read the size without
   consuming it and cleared it once a message carrying the blocks had been built.
 
+## Audio output on `AUDIO_PLAYBACK_DVC` too
+
+With a sound factory, the server also offers `AUDIO_PLAYBACK_DVC` (`RdpsndDvcServer` from the
+vendored `ironrdp-rdpsnd`) next to the `rdpsnd` static channel, and sends each
+`ServerEvent::Rdpsnd` on the static channel when the client negotiated a format there,
+otherwise on the dynamic one. Jump Desktop takes audio only on the dynamic channel.
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the

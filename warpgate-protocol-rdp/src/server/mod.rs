@@ -43,6 +43,7 @@ mod clipboard;
 mod hold_screen;
 mod protocol;
 mod rdp;
+mod sound;
 
 use bridge::connect_backend;
 use hold_screen::{hold_while, run_banner_screen, run_hold_screen};

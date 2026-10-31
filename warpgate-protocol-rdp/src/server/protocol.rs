@@ -40,6 +40,7 @@ pub enum Input {
     CursorDefault,
     CursorHidden,
     Clipboard(String),
+    Audio(Bytes),
     Shutdown,
 }
 
