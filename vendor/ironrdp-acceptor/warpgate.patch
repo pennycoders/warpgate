@@ -1,0 +1,20 @@
+diff -ru ironrdp-acceptor-0.12.0/src/connection.rs base/src/connection.rs
+--- ironrdp-acceptor-0.12.0/src/connection.rs	2026-10-31 11:24:16
++++ base/src/connection.rs	2026-10-31 11:24:16
+@@ -1496,6 +1496,16 @@
+ 
+                         let ShareControlPdu::ClientConfirmActive(confirm) = capabilities_confirm.share_control_pdu
+                         else {
++                            // A client keeps sending until it processes the Deactivate All, so
++                            // during reactivation a PDU it sent before that can still arrive here.
++                            if self.reactivation {
++                                warn!(
++                                    pdu = ?capabilities_confirm.share_control_pdu,
++                                    "Dropping unexpected PDU during reactivation"
++                                );
++                                self.state = prev_state;
++                                return Ok(Written::Nothing);
++                            }
+                             return Err(ConnectorError::general("expected client confirm active"));
+                         };
+ 

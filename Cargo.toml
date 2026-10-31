@@ -37,6 +37,7 @@ members = [
 # credential-less CredSSP mode interactive-logon targets need; session surfaces the
 # account a target logs the session on as.
 exclude = [
+    "vendor/ironrdp-acceptor",
     "vendor/ironrdp-async",
     "vendor/ironrdp-connector",
     "vendor/ironrdp-server",
@@ -46,6 +47,7 @@ default-members = ["warpgate"]
 resolver = "2"
 
 [patch.crates-io]
+ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
 ironrdp-async = { path = "vendor/ironrdp-async" }
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 ironrdp-server = { path = "vendor/ironrdp-server" }
