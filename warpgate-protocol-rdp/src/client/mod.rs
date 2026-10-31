@@ -284,14 +284,13 @@ async fn active_loop(
             .iter()
             .any(|output| matches!(output, ActiveStageOutput::DeactivateAll));
 
-        // `SessionId` precedes the `SaveSessionInfo` of the same notification.
-        let mut session_id = None;
+        let mut logon_info = None;
         for output in &outputs {
             match output {
-                ActiveStageOutput::SessionId(id) => session_id = Some(*id),
-                ActiveStageOutput::SaveSessionInfo { logon_complete } => {
-                    logon.notify_logon(*logon_complete, session_id.take());
-                }
+                ActiveStageOutput::LogonInfo(info) => logon_info = Some(info),
+                ActiveStageOutput::SaveSessionInfo {
+                    logon_complete: true,
+                } => logon.notify_logon(logon_info.take()),
                 _ => {}
             }
         }

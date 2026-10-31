@@ -3780,8 +3780,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-session"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "962ae82b680b3e60ad2f847f74a2b94af3330aa7a146cdb1c2be13420afa8493"
 dependencies = [
  "ironrdp-bulk",
  "ironrdp-core",

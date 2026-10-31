@@ -3,7 +3,7 @@
 //! target's sign-in screen — which is where the user types credentials that Warpgate never
 //! sees, and which the recording must not keep.
 
-use tracing::debug;
+use ironrdp_pdu::rdp::session_info::LogonInfo;
 use uuid::Uuid;
 use warpgate_common::TargetSessionId;
 use warpgate_common::audit::AuditEvent;
@@ -19,14 +19,9 @@ pub(crate) struct LogonWatcher {
 }
 
 impl LogonWatcher {
-    /// `logon_complete` and `session_id` are the Save Session Info outputs of one
-    /// notification; IronRDP keeps the PDU itself (and the account it names) private.
-    pub fn notify_logon(&self, logon_complete: bool, session_id: Option<u32>) {
-        if !logon_complete {
-            debug!("Target sent extended logon info");
-            return;
-        }
-
+    /// Called for a Save Session Info PDU that reports a completed logon, with the logon
+    /// information it carries (Logon Info Version 1 or 2; a plain notification has none).
+    pub fn notify_logon(&self, info: Option<&LogonInfo>) {
         self.sign_in.mark_logged_on();
 
         AuditEvent::TargetLogon {
@@ -35,9 +30,20 @@ impl LogonWatcher {
             target_name: self.target_name.clone(),
             user_id: self.user_id,
             username: self.username.clone(),
-            target_account: None,
-            target_session_id: session_id,
+            target_account: info.and_then(account),
+            target_session_id: info.map(|info| info.session_id),
         }
         .emit();
     }
+}
+
+fn account(info: &LogonInfo) -> Option<String> {
+    if info.user_name.is_empty() {
+        return None;
+    }
+    Some(if info.domain_name.is_empty() {
+        info.user_name.clone()
+    } else {
+        format!("{}\\{}", info.domain_name, info.user_name)
+    })
 }
