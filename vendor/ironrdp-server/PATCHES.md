@@ -45,6 +45,15 @@ earlier base of this fork carried as a backport too, is the snapshot commit itse
   well. This replaces Warpgate's own patch for the same bug, which read the size without
   consuming it and cleared it once a message carrying the blocks had been built.
 
+## Bitmap scan width in bytes
+
+The legacy bitmap path (clients without Surface Commands, such as Jump Desktop) writes the
+Compressed Data Header's `cbScanWidth` as the width in pixels. MS-RDPBCGR words it that
+way, but the FreeRDP server sends `width * 4` for 32 bpp and clients read it so: Jump
+Desktop drew every bitmap at a quarter of its width and rejected widths whose quarter is
+not a multiple of 4 ("bad width - must be divisible by 4"). `src/encoder/bitmap.rs` sends
+the row length in bytes.
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the

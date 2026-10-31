@@ -77,7 +77,9 @@ impl BitmapEncoder {
                 compression_flags: Compression::BITMAP_COMPRESSION,
                 compressed_data_header: Some(bitmap::CompressedDataHeader {
                     main_body_size: cast_length!("main body size", len).map_err(BitmapEncodeError::Encode)?,
-                    scan_width: u16::from(bitmap.width),
+                    // In bytes, as the FreeRDP server sends it and clients read it, although
+                    // MS-RDPBCGR 2.2.9.1.1.3.1.2.3 words it as pixels.
+                    scan_width: row_len,
                     uncompressed_size: height * row_len,
                 }),
                 bitmap_data: &self.buffer[..len],
