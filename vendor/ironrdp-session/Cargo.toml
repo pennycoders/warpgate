@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 name = "ironrdp-session"
-version = "0.11.0"
+version = "0.13.0"
 authors = [
     "Devolutions Inc. <infos@devolutions.net>",
     "Teleport <goteleport.com>",
@@ -40,6 +40,7 @@ repository = "https://github.com/Devolutions/IronRDP"
 resolver = "2"
 
 [features]
+__test = ["dep:visibility"]
 default = []
 qoi = [
     "dep:qoicoubeh",
@@ -57,32 +58,35 @@ test = false
 doctest = false
 
 [dependencies.ironrdp-bulk]
-version = "0.1"
-
-[dependencies.ironrdp-core]
 version = "0.2"
 
-[dependencies.ironrdp-displaycontrol]
-version = "0.8"
-
-[dependencies.ironrdp-egfx]
+[dependencies.ironrdp-core]
 version = "0.3"
 
+[dependencies.ironrdp-displaycontrol]
+version = "0.10"
+
 [dependencies.ironrdp-dvc]
-version = "0.8"
+version = "0.10"
+
+[dependencies.ironrdp-egfx]
+version = "0.5"
 
 [dependencies.ironrdp-error]
 version = "0.2"
 
 [dependencies.ironrdp-graphics]
-version = "0.9"
+version = "0.11"
 
 [dependencies.ironrdp-pdu]
-version = "0.9"
+version = "0.11"
 features = ["std"]
 
+[dependencies.ironrdp-rdpei]
+version = "0.3"
+
 [dependencies.ironrdp-svc]
-version = "0.8"
+version = "0.10"
 
 [dependencies.qoicoubeh]
 version = "0.5"
@@ -91,6 +95,10 @@ optional = true
 [dependencies.tracing]
 version = "0.1"
 features = ["log"]
+
+[dependencies.visibility]
+version = "0.1"
+optional = true
 
 [dependencies.zstd-safe]
 version = "8.2"

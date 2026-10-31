@@ -3,8 +3,7 @@
 //! target's sign-in screen — which is where the user types credentials that Warpgate never
 //! sees, and which the recording must not keep.
 
-use ironrdp::pdu::rdp::session_info::{InfoData, LogonInfo, SaveSessionInfoPdu};
-use tracing::debug;
+use ironrdp_pdu::rdp::session_info::LogonInfo;
 use uuid::Uuid;
 use warpgate_common::TargetSessionId;
 use warpgate_common::audit::AuditEvent;
@@ -20,28 +19,9 @@ pub(crate) struct LogonWatcher {
 }
 
 impl LogonWatcher {
-    pub fn notify_logon_pdu(&self, pdu: &SaveSessionInfoPdu) {
-        let info = match &pdu.info_data {
-            InfoData::LogonInfoV1(info) => Some(&info.logon_info),
-            InfoData::LogonInfoV2(info) => Some(&info.logon_info),
-            InfoData::PlainNotify => None,
-            InfoData::LogonExtended(extended) => {
-                // Not `?extended`. `LogonInfoExtended` derives `Debug` over its
-                // whole shape, and the auto-reconnect packet inside it carries
-                // the sixteen random bytes a client turns into the verifier
-                // that re-attaches to this session without presenting
-                // credentials again ([MS-RDPBCGR] 2.2.10.1.1.1). Printing the
-                // struct wrote that value into the log.
-                debug!(
-                    flags = ?extended.present_fields_flags,
-                    errors = ?extended.errors_info,
-                    auto_reconnect = extended.auto_reconnect.is_some(),
-                    "Target sent extended logon info"
-                );
-                return;
-            }
-        };
-
+    /// Called for a Save Session Info PDU that reports a completed logon, with the logon
+    /// information it carries (Logon Info Version 1 or 2; a plain notification has none).
+    pub fn notify_logon(&self, info: Option<&LogonInfo>) {
         self.sign_in.mark_logged_on();
 
         AuditEvent::TargetLogon {

@@ -12,29 +12,31 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use ironrdp::cliprdr::CliprdrClient;
-use ironrdp::cliprdr::backend::ClipboardMessage;
-use ironrdp::connector::connection_activation::{
+use ironrdp_cliprdr::CliprdrClient;
+use ironrdp_cliprdr::backend::ClipboardMessage;
+use ironrdp_connector::connection_activation::{
     ConnectionActivationFactory, ConnectionActivationState,
 };
-use ironrdp::connector::credssp::KerberosConfig;
-use ironrdp::connector::{self, ConnectionResult, Credentials};
-use ironrdp::core::WriteBuf;
-use ironrdp::displaycontrol::client::DisplayControlClient;
-use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
-use ironrdp::dvc::DrdynvcClient;
-use ironrdp::graphics::image_processing::PixelFormat;
-use ironrdp::graphics::pointer::DecodedPointer;
-use ironrdp::pdu::gcc::KeyboardType;
-use ironrdp::pdu::geometry::InclusiveRectangle;
-use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
-use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
-use ironrdp::pdu::rdp::headers::ShareDataPdu;
-use ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
-use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp_connector::credssp::KerberosConfig;
+use ironrdp_connector::{ConnectionOutcome, ConnectionResult, Credentials};
+use ironrdp_core::WriteBuf;
+use ironrdp_displaycontrol::client::DisplayControlClient;
+use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
+use ironrdp_dvc::DrdynvcClient;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::pdu::{Codec1Type, GfxPdu};
+use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_graphics::pointer::DecodedPointer;
+use ironrdp_pdu::gcc::{ConnectionType, KeyboardType};
+use ironrdp_pdu::geometry::InclusiveRectangle;
+use ironrdp_pdu::rdp::capability_sets::{
+    MajorPlatformType, RailSupportLevel, client_codecs_capabilities,
+};
+use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+use ironrdp_pdu::rdp::headers::ShareDataPdu;
+use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp_session::image::DecodedImage;
+use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::{FramedWrite as _, TokioFramed};
 use tokio::net::TcpStream;
@@ -173,7 +175,7 @@ async fn active_loop(
         pointer_software_rendering: connection_result.pointer_software_rendering,
     }
     .build();
-    let mut input_db = ironrdp::input::Database::new();
+    let mut input_db = ironrdp_input::Database::new();
     // The Display Control channel only becomes usable once the target has created it and
     // sent its capabilities, which happens after the connection is already active. A
     // resize requested before then (notably the viewer's initial size) is held here and
@@ -266,7 +268,7 @@ async fn active_loop(
             pdu = framed.read_pdu() => {
                 let (action, payload) = pdu.context("reading PDU")?;
                 active_stage
-                    .process(image, action, &payload)
+                    .process(image, action, &payload, framed.last_read_at())
                     .context("processing PDU")?
             }
         };
@@ -275,9 +277,14 @@ async fn active_loop(
             .iter()
             .any(|output| matches!(output, ActiveStageOutput::DeactivateAll));
 
+        let mut logon_info = None;
         for output in &outputs {
-            if let ActiveStageOutput::SaveSessionInfo(pdu) = output {
-                logon.notify_logon_pdu(pdu);
+            match output {
+                ActiveStageOutput::LogonInfo(info) => logon_info = Some(info),
+                ActiveStageOutput::SaveSessionInfo {
+                    logon_complete: true,
+                } => logon.notify_logon(logon_info.take()),
+                _ => {}
             }
         }
 
@@ -410,7 +417,7 @@ async fn reactivate(
     active_stage: &mut ActiveStage,
     activation_factory: &ConnectionActivationFactory,
     image: &DecodedImage,
-) -> Result<Option<connector::DesktopSize>> {
+) -> Result<Option<ironrdp_connector::DesktopSize>> {
     let mut activation = activation_factory.create();
     let mut output = WriteBuf::new();
 
@@ -423,14 +430,24 @@ async fn reactivate(
             desktop_size,
             share_id,
             enable_server_pointer,
+            pointer_software_rendering,
+            static_channel_chunk_size,
             ..
         } = activation.connection_activation_state()
         else {
             continue;
         };
 
-        active_stage.set_share_id(share_id);
-        active_stage.set_enable_server_pointer(enable_server_pointer);
+        if !active_stage.reactivate(
+            activation.io_channel_id(),
+            activation.user_channel_id(),
+            share_id,
+            enable_server_pointer,
+            pointer_software_rendering,
+            static_channel_chunk_size,
+        ) {
+            anyhow::bail!("target reactivated with an invalid static channel chunk size");
+        }
         check_desktop_size(desktop_size.width, desktop_size.height)?;
 
         if image.width() != desktop_size.width || image.height() != desktop_size.height {
@@ -455,7 +472,7 @@ async fn reactivate(
 async fn send_refresh_request(
     framed: &mut Framed,
     active_stage: &mut ActiveStage,
-    size: connector::DesktopSize,
+    size: ironrdp_connector::DesktopSize,
 ) -> Result<()> {
     let (Some(right), Some(bottom)) = (size.width.checked_sub(1), size.height.checked_sub(1))
     else {
@@ -659,7 +676,7 @@ fn encode_pointer(pointer: &DecodedPointer) -> Option<DesktopEvent> {
 /// into the overlap.
 fn encode_resized_keyframe(
     image: &DecodedImage,
-    size: connector::DesktopSize,
+    size: ironrdp_connector::DesktopSize,
 ) -> Option<DesktopEvent> {
     let old_w = usize::from(image.width());
     let old_h = usize::from(image.height());
@@ -705,12 +722,12 @@ fn build_config(
     password: &str,
     width: u16,
     height: u16,
-) -> connector::Config {
+) -> ironrdp_connector::Config {
     let codec_overrides: &[&str] = match options.compression {
         RdpTargetCompression::RemoteFX | RdpTargetCompression::GraphicsPipeline => &[],
         RdpTargetCompression::Lossless => &["remotefx:off"],
     };
-    connector::Config {
+    ironrdp_connector::Config {
         credentials: Credentials::UsernamePassword {
             username: options.username.clone(),
             password: password.to_owned(),
@@ -718,13 +735,16 @@ fn build_config(
         domain: options.domain.clone(),
         enable_tls: true,
         enable_credssp: true,
+        enable_standard_rdp_security: false,
         keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
+        connection_type: ConnectionType::Lan,
         ime_file_name: String::new(),
         dig_product_id: String::new(),
-        desktop_size: connector::DesktopSize { width, height },
+        desktop_size: ironrdp_connector::DesktopSize { width, height },
+        monitor_layout: None,
         // The bitmap codec advertisement covers the legacy bitmap path: the default set
         // includes RemoteFX, while a `lossless` target advertises no codecs so it sends
         // losslessly-compressed 32bpp bitmap updates instead. A server that accepts the
@@ -736,7 +756,7 @@ fn build_config(
         // just drop the flags.)
         bitmap: client_codecs_capabilities(codec_overrides)
             .ok()
-            .map(|codecs| connector::BitmapConfig {
+            .map(|codecs| ironrdp_connector::BitmapConfig {
                 lossy_compression: false,
                 color_depth: 32,
                 codecs,
@@ -746,6 +766,8 @@ fn build_config(
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
         alternate_shell: String::new(),
         work_dir: String::new(),
+        remote_application_mode: false,
+        rail_support_level: RailSupportLevel::empty(),
         platform: MajorPlatformType::UNIX,
         hardware_id: None,
         request_data: None,
@@ -757,6 +779,7 @@ fn build_config(
         autologon: !options.interactive_logon,
         credssp_credentialless: options.interactive_logon,
         enable_audio_playback: false,
+        enable_audio_capture: false,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -767,6 +790,11 @@ fn build_config(
         enable_server_pointer: true,
         pointer_software_rendering: false,
         desktop_scale_factor: 0,
+        desktop_physical_size: None,
+        desktop_orientation: None,
+        device_scale_factor: None,
+        monitor_extended_layout: None,
+        relative_mouse_input: false,
         multitransport_flags: None,
         // `connect` registers the Graphics Pipeline channel from this flag: advertising
         // it without a processor leaves the desktop blank.
@@ -806,7 +834,7 @@ impl GraphicsPipelineHandler for GraphicsPipelineOutput {
 }
 
 async fn connect(
-    config: connector::Config,
+    config: ironrdp_connector::Config,
     server_name: String,
     port: u16,
     verify_tls: bool,
@@ -845,7 +873,7 @@ async fn connect(
             None,
         ));
     }
-    let mut connector = connector::ClientConnector::new(config, client_addr)
+    let mut connector = ironrdp_connector::ClientConnector::new(config, client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(CliprdrClient::new(Box::new(clipboard)));
 
@@ -877,6 +905,7 @@ async fn connect(
         kerberos_config,
     )
     .await
+    .and_then(ConnectionOutcome::into_connected)
     .map_err(|error| connector_error("connect_finalize", error))?;
 
     if connection_result.desktop_size.width == 0 || connection_result.desktop_size.height == 0 {
@@ -890,10 +919,14 @@ async fn connect(
     Ok((connection_result, upgraded_framed))
 }
 
-fn connector_error(step: &'static str, error: connector::ConnectorError) -> DesktopConnectionError {
+fn connector_error(
+    step: &'static str,
+    error: ironrdp_connector::ConnectorError,
+) -> DesktopConnectionError {
     let rejected = matches!(
         error.kind(),
-        connector::ConnectorErrorKind::Credssp(_) | connector::ConnectorErrorKind::AccessDenied
+        ironrdp_connector::ConnectorErrorKind::Credssp(_)
+            | ironrdp_connector::ConnectorErrorKind::AccessDenied
     );
     let chain = anyhow::Error::from(error).context(step);
     if rejected {
@@ -905,18 +938,18 @@ fn connector_error(step: &'static str, error: connector::ConnectorError) -> Desk
 
 #[cfg(test)]
 mod tests {
-    use ironrdp::graphics::image_processing::PixelFormat;
-    use ironrdp::graphics::pointer::DecodedPointer;
-    use ironrdp::session::image::DecodedImage;
+    use ironrdp_graphics::image_processing::PixelFormat;
+    use ironrdp_graphics::pointer::DecodedPointer;
+    use ironrdp_session::image::DecodedImage;
     use warpgate_core::{DesktopEvent, DesktopRect};
 
-    use super::{GraphicsPipelineOutput, connector, encode_pointer, encode_resized_keyframe};
+    use super::{GraphicsPipelineOutput, encode_pointer, encode_resized_keyframe};
 
     #[test]
     fn unhandled_graphics_are_reported_once_per_codec() {
-        use ironrdp::pdu::geometry::ExclusiveRectangle;
         use ironrdp_egfx::client::GraphicsPipelineHandler as _;
         use ironrdp_egfx::pdu::{Codec1Type, GfxPdu, PixelFormat, WireToSurface1Pdu};
+        use ironrdp_pdu::geometry::ExclusiveRectangle;
 
         let update = |codec_id| {
             GfxPdu::WireToSurface1(WireToSurface1Pdu {
@@ -944,7 +977,7 @@ mod tests {
         let image = DecodedImage::new(PixelFormat::RgbA32, 2, 2);
         let event = encode_resized_keyframe(
             &image,
-            connector::DesktopSize {
+            ironrdp_connector::DesktopSize {
                 width: 4,
                 height: 3,
             },

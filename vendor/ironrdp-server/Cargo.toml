@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 name = "ironrdp-server"
-version = "0.13.0"
+version = "0.14.0"
 authors = [
     "Devolutions Inc. <infos@devolutions.net>",
     "Teleport <goteleport.com>",
@@ -41,6 +41,7 @@ resolver = "2"
 
 [features]
 __bench = ["dep:visibility"]
+__test = ["dep:visibility"]
 default = [
     "rayon",
     "qoi",
@@ -62,15 +63,16 @@ qoiz = [
     "ironrdp-pdu/qoiz",
 ]
 rayon = ["dep:rayon"]
+usb = [
+    "dep:ironrdp-rdpeusb",
+    "dep:ironrdp-usb",
+]
 
 [lib]
 name = "ironrdp_server"
 path = "src/lib.rs"
 test = false
 doctest = true
-
-[dependencies.anyhow]
-version = "1.0"
 
 [dependencies.async-trait]
 version = "0.1"
@@ -79,57 +81,93 @@ version = "0.1"
 version = "1"
 
 [dependencies.ironrdp-acceptor]
-version = "0.10"
+version = "0.12"
 
 [dependencies.ironrdp-ainput]
-version = "0.8"
-
-[dependencies.ironrdp-async]
 version = "0.10"
 
+[dependencies.ironrdp-async]
+version = "0.12"
+
 [dependencies.ironrdp-cliprdr]
-version = "0.7"
-
-[dependencies.ironrdp-core]
-version = "0.2"
-
-[dependencies.ironrdp-displaycontrol]
-version = "0.8"
-
-[dependencies.ironrdp-dvc]
-version = "0.8"
-
-[dependencies.ironrdp-echo]
-version = "0.4"
-
-[dependencies.ironrdp-egfx]
-version = "0.3"
-optional = true
-
-[dependencies.ironrdp-graphics]
 version = "0.9"
 
-[dependencies.ironrdp-nscodec]
+[dependencies.ironrdp-connector]
+version = "0.12"
+
+[dependencies.ironrdp-core]
+version = "0.3"
+
+[dependencies.ironrdp-displaycontrol]
+version = "0.10"
+
+[dependencies.ironrdp-dvc]
+version = "0.10"
+
+[dependencies.ironrdp-echo]
+version = "0.6"
+
+[dependencies.ironrdp-egfx]
+version = "0.5"
+optional = true
+
+[dependencies.ironrdp-error]
 version = "0.2"
+features = ["std"]
+
+[dependencies.ironrdp-graphics]
+version = "0.11"
+
+[dependencies.ironrdp-nscodec]
+version = "0.4"
 features = ["encoder"]
 optional = true
 
 [dependencies.ironrdp-pdu]
+version = "0.11"
+
+[dependencies.ironrdp-rdpdr]
 version = "0.9"
+
+[dependencies.ironrdp-rdpeai]
+version = "0.2"
+
+[dependencies.ironrdp-rdpei]
+version = "0.3"
+
+[dependencies.ironrdp-rdpemt]
+version = "0.1"
+
+[dependencies.ironrdp-rdpeudp]
+version = "0.1"
+
+[dependencies.ironrdp-rdpeudp-tokio]
+version = "0.2"
+
+[dependencies.ironrdp-rdpeusb]
+version = "0.2"
+optional = true
 
 [dependencies.ironrdp-rdpsnd]
-version = "0.9"
+version = "0.11"
 
 [dependencies.ironrdp-svc]
-version = "0.8"
+version = "0.10"
 
 [dependencies.ironrdp-tokio]
-version = "0.10"
+version = "0.12"
 features = ["reqwest"]
+
+[dependencies.ironrdp-usb]
+version = "0.1"
+optional = true
 
 [dependencies.qoicoubeh]
 version = "0.5"
 optional = true
+
+[dependencies.rand]
+version = "0.9"
 
 [dependencies.rayon]
 version = "1.12"
@@ -146,6 +184,7 @@ features = [
     "macros",
     "sync",
     "rt",
+    "time",
 ]
 
 [dependencies.tokio-rustls]
@@ -160,7 +199,7 @@ version = "0.1"
 optional = true
 
 [dependencies.x509-cert]
-version = "0.2"
+version = "0.3"
 optional = true
 
 [dependencies.zstd-safe]

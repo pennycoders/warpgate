@@ -11,11 +11,22 @@ pub mod rfx; // FIXME: maybe this module should not be in this crate
 pub mod x224;
 
 mod active_stage;
+mod autodetect;
 mod palette;
+#[cfg(feature = "qoiz")]
+mod qoiz;
 
 use core::fmt;
 
-pub use active_stage::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+#[cfg(feature = "__test")]
+pub use active_stage::composite_graphics_updates;
+pub use active_stage::{
+    ActiveStage, ActiveStageBuilder, ActiveStageOutput, CompositedGraphics, GracefulDisconnectReason,
+    composite_graphics_pipeline,
+};
+pub use fast_path::{BulkDecompressionErrorKind, FastPathBulkDecompressionFailure};
+#[cfg(all(feature = "__test", feature = "qoiz"))]
+pub use qoiz::Decompressor as QoizDecompressor;
 
 pub type SessionResult<T> = Result<T, SessionError>;
 
@@ -25,6 +36,8 @@ pub enum SessionErrorKind {
     Pdu(ironrdp_pdu::PduError),
     Encode(ironrdp_core::EncodeError),
     Decode(ironrdp_core::DecodeError),
+    FastPathBulkDecompression(FastPathBulkDecompressionFailure),
+    InvalidBitmapSourceLength,
     Reason(String),
     General,
     Custom,
@@ -36,6 +49,8 @@ impl fmt::Display for SessionErrorKind {
             SessionErrorKind::Pdu(_) => write!(f, "PDU error"),
             SessionErrorKind::Encode(_) => write!(f, "encode error"),
             SessionErrorKind::Decode(_) => write!(f, "decode error"),
+            SessionErrorKind::FastPathBulkDecompression(_) => write!(f, "fast-path bulk decompression error"),
+            SessionErrorKind::InvalidBitmapSourceLength => write!(f, "invalid bitmap source length"),
             SessionErrorKind::Reason(description) => write!(f, "reason: {description}"),
             SessionErrorKind::General => write!(f, "general error"),
             SessionErrorKind::Custom => write!(f, "custom error"),
@@ -49,6 +64,8 @@ impl core::error::Error for SessionErrorKind {
             SessionErrorKind::Pdu(e) => Some(e),
             SessionErrorKind::Encode(e) => Some(e),
             SessionErrorKind::Decode(e) => Some(e),
+            SessionErrorKind::FastPathBulkDecompression(_) => None,
+            SessionErrorKind::InvalidBitmapSourceLength => None,
             SessionErrorKind::Reason(_) => None,
             SessionErrorKind::General => None,
             SessionErrorKind::Custom => None,
