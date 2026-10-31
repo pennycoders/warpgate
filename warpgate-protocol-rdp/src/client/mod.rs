@@ -5,6 +5,7 @@
 //! so the web-desktop manager and the native RDP server front end both work unchanged.
 
 mod audio;
+mod drives;
 mod input;
 mod logon;
 mod microphone;
@@ -55,15 +56,19 @@ use warpgate_common::{RdpTargetAuth, RdpTargetCompression, SecretResolver, Targe
 use warpgate_core::{
     ClipboardTransfer, DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopCapabilities,
     DesktopConnectionError, DesktopEndReason, DesktopEvent, DesktopInput, DesktopRect,
-    DesktopState, FileTransferRecord, check_desktop_size, within_deadline,
+    DesktopState, DriveUpload, DriveUploadStatus, FileTransferRecord, check_desktop_size,
+    within_deadline,
 };
 
 pub use self::audio::pcm_format;
 use self::audio::{AudioForwarder, dynamic_audio};
+use self::drives::DriveLink;
+pub(crate) use self::drives::DriveSetup;
 pub(crate) use self::logon::LogonWatcher;
 use self::microphone::{MicrophoneInput, MicrophoneRelay};
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
 use crate::desktop_size::bound_desktop_size;
+use crate::drive::DriveUpdate;
 
 type Framed = TokioFramed<tls::TargetTlsStream>;
 
@@ -111,6 +116,7 @@ impl ClipboardSink for ClientClipboardSink {
 const CLIPBOARD_TIMEOUT_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Connect to `options` and pump the session until it ends or is aborted.
+#[expect(clippy::too_many_arguments)]
 pub async fn run(
     options: TargetRdpOptions,
     (width, height): (u16, u16),
@@ -119,6 +125,7 @@ pub async fn run(
     mut abort_rx: UnboundedReceiver<()>,
     logon: LogonWatcher,
     secrets: Arc<dyn SecretResolver>,
+    drives: Option<DriveSetup>,
 ) -> Result<(), DesktopConnectionError> {
     event_tx
         .send(DesktopEvent::State(DesktopState::Connecting))
@@ -143,6 +150,17 @@ pub async fn run(
     let mut clipboard = Clipboard::deferred(ClientClipboardSink(clipboard_tx));
     let capabilities = DesktopCapabilities {
         clipboard_files_max_bytes: options.clipboard_files_max_bytes(),
+        drive_uploads_max_bytes: drives
+            .as_ref()
+            .and_then(|drives| drives.uploads.as_ref())
+            .and_then(|_| options.drive_uploads_max_bytes()),
+    };
+    let (mut drives, drive_channels) = match drives {
+        Some(setup) => {
+            let (link, rdpdr, rdpsnd) = DriveLink::new(setup);
+            (Some(link), Some((rdpdr, rdpsnd)))
+        }
+        None => (None, None),
     };
     if let Some(max_bytes) = capabilities.clipboard_files_max_bytes {
         // This is the channel every transfer crosses, whichever viewer is attached, so it
@@ -170,6 +188,7 @@ pub async fn run(
                 clipboard: clipboard.backend(),
                 audio: options.audio_playback.then(|| event_tx.clone()),
                 microphone: microphone_channel,
+                drives: drive_channels,
             },
         ),
     )
@@ -203,6 +222,7 @@ pub async fn run(
         clipboard_rx,
         microphone,
         &logon,
+        drives.as_mut(),
     )
     .await
     .map_err(DesktopConnectionError::Session)
@@ -220,6 +240,7 @@ async fn active_loop(
     mut clipboard_rx: UnboundedReceiver<ClipboardOut>,
     microphone: Option<(MicrophoneInput, UnboundedReceiver<Vec<SvcMessage>>)>,
     logon: &LogonWatcher,
+    mut drives: Option<&mut DriveLink>,
 ) -> Result<()> {
     let (microphone, mut microphone_uplink) = microphone.unzip();
     let activation_factory = connection_result.activation_factory;
@@ -289,6 +310,7 @@ async fn active_loop(
                 // window drag are wasted work.
                 let mut ops = Vec::new();
                 let mut resize = None;
+                let mut uploads = Vec::new();
                 for input in std::iter::once(first)
                     .chain(std::iter::from_fn(|| input_rx.try_recv().ok()))
                 {
@@ -301,6 +323,21 @@ async fn active_loop(
                             }
                         }
                         DesktopInput::ClipboardTransfer(transfer) => clipboard.transfer(transfer),
+                        DesktopInput::DriveUpload(step) => {
+                            // Only the browser's session drive takes uploads.
+                            let status = drives
+                                .as_ref()
+                                .and_then(|drives| drives.setup.uploads.as_ref())
+                                .map(|uploads| uploads.upload(step.clone()));
+                            match status {
+                                Some(Some(status)) => uploads.push(status),
+                                Some(None) => {}
+                                None => uploads.push(DriveUploadStatus {
+                                    id: upload_id(&step),
+                                    stored: false,
+                                }),
+                            }
+                        }
                         other => input::translate(other, &mut ops),
                     }
                 }
@@ -311,6 +348,14 @@ async fn active_loop(
                 while let Ok(out) = clipboard_rx.try_recv() {
                     if !handle_clipboard_out(out, &mut framed, &mut active_stage, event_tx, abort_rx)
                         .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                for status in uploads {
+                    if send_event(event_tx, abort_rx, DesktopEvent::DriveUpload(status))
+                        .await
+                        .is_err()
                     {
                         return Ok(());
                     }
@@ -356,6 +401,22 @@ async fn active_loop(
                     .write_all(&frame)
                     .await
                     .context("sending microphone audio")?;
+                continue;
+            }
+            update = next_drive_update(drives.as_deref_mut()) => {
+                let (Some(update), Some(link)) = (update, drives.as_deref_mut()) else {
+                    // The owner went away; its drives stay announced but idle.
+                    drives = None;
+                    continue;
+                };
+                for record in link.apply(update, &mut framed, &mut active_stage).await? {
+                    if send_event(event_tx, abort_rx, DesktopEvent::FileTransferred(record))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
                 continue;
             }
             _ = clipboard_timeouts.tick() => {
@@ -418,6 +479,21 @@ async fn recv_microphone(
     match uplink {
         Some(uplink) => uplink.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+async fn next_drive_update(drives: Option<&mut DriveLink>) -> Option<DriveUpdate> {
+    match drives {
+        Some(drives) => drives.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+const fn upload_id(step: &DriveUpload) -> u32 {
+    match step {
+        DriveUpload::Start { id, .. }
+        | DriveUpload::Chunk { id, .. }
+        | DriveUpload::Delete { id } => *id,
     }
 }
 
@@ -1003,6 +1079,9 @@ struct TargetChannels {
     audio: Option<Sender<DesktopEvent>>,
     /// The `AUDIO_INPUT` channel, when the target may record the viewer's microphone.
     microphone: Option<ironrdp_rdpeai::client::RdpeaiClient>,
+    /// Device redirection serving the viewer's drives, with the silent sound channel
+    /// Windows needs before it services it.
+    drives: Option<(ironrdp_rdpdr::Rdpdr, Rdpsnd)>,
 }
 
 fn target_connector(
@@ -1012,6 +1091,7 @@ fn target_connector(
         clipboard,
         audio,
         microphone,
+        drives,
     }: TargetChannels,
 ) -> ironrdp_connector::ClientConnector {
     // Advertise the Display Control DVC so viewer-driven resolution changes can be pushed
@@ -1037,12 +1117,20 @@ fn target_connector(
     let mut connector = ironrdp_connector::ClientConnector::new(config, client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(CliprdrClient::new(Box::new(clipboard)));
+    let (drive_rdpdr, silent_rdpsnd) = drives.unzip();
     let plays = audio.is_some();
+    // One sound channel serves both needs: the target's sound when it is played, and
+    // otherwise a silent one when drives are redirected, as Windows services device
+    // redirection only once RDPSND is present.
     if let Some(events) = audio {
         connector =
             connector.with_static_channel(Rdpsnd::new(Box::new(AudioForwarder::new(events))));
+    } else if let Some(rdpsnd) = silent_rdpsnd {
+        connector = connector.with_static_channel(rdpsnd);
     }
-    if plays || records {
+    if let Some(rdpdr) = drive_rdpdr {
+        connector = connector.with_static_channel(rdpdr);
+    } else if plays || records {
         // Windows starts sound only once the client has set up device redirection.
         let computer_name = connector.config.client_name.clone();
         connector =
@@ -1219,6 +1307,7 @@ mod tests {
                     clipboard: clipboard.backend(),
                     audio: None,
                     microphone,
+                    drives: None,
                 },
             );
             let redirects_devices = connector
@@ -1267,7 +1356,8 @@ mod tests {
 
         let options: warpgate_common::TargetRdpOptions =
             serde_json::from_str(r#"{"host":"h"}"#).unwrap();
-        let channels = |audio: Option<tokio::sync::mpsc::Sender<DesktopEvent>>| {
+        let channels = |audio: Option<tokio::sync::mpsc::Sender<DesktopEvent>>,
+                        drives: Option<(Rdpdr, Rdpsnd)>| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let clipboard = crate::clipboard::Clipboard::deferred(super::ClientClipboardSink(tx));
             let connector = super::target_connector(
@@ -1277,6 +1367,7 @@ mod tests {
                     clipboard: clipboard.backend(),
                     audio,
                     microphone: None,
+                    drives,
                 },
             );
             (
@@ -1285,9 +1376,59 @@ mod tests {
             )
         };
 
-        assert_eq!(channels(None), (false, false));
+        assert_eq!(channels(None, None), (false, false));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        assert_eq!(channels(Some(tx)), (true, true));
+        assert_eq!(channels(Some(tx), None), (true, true));
+    }
+
+    /// Drives bring a silent RDPSND, which Windows needs before it services RDPDR; with
+    /// sound on, the sound channel is that RDPSND, and drives get the one RDPDR.
+    #[test]
+    fn drives_and_sound_share_one_sound_and_one_device_channel() {
+        use ironrdp_rdpdr::Rdpdr;
+        use ironrdp_rdpdr::backend::noop::NoopRdpdrBackend;
+        use ironrdp_rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
+
+        let options: warpgate_common::TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        let drive_channels = || {
+            Some((
+                Rdpdr::new(Box::new(NoopRdpdrBackend), "drives".into()),
+                Rdpsnd::new(Box::new(NoopRdpsndBackend)),
+            ))
+        };
+        let connector = |audio: Option<tokio::sync::mpsc::Sender<DesktopEvent>>,
+                         drives: Option<(Rdpdr, Rdpsnd)>| {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let clipboard = crate::clipboard::Clipboard::deferred(super::ClientClipboardSink(tx));
+            super::target_connector(
+                build_config(&options, "pw", 1024, 768),
+                "127.0.0.1:1".parse().unwrap(),
+                super::TargetChannels {
+                    clipboard: clipboard.backend(),
+                    audio,
+                    microphone: None,
+                    drives,
+                },
+            )
+        };
+        let has = |connector: &ironrdp_connector::ClientConnector| {
+            (
+                connector.static_channels.get_by_type::<Rdpsnd>().is_some(),
+                connector.static_channels.get_by_type::<Rdpdr>().is_some(),
+                connector.static_channels.iter().count(),
+            )
+        };
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sound_only = has(&connector(Some(tx), None));
+        let drives_only = has(&connector(None, drive_channels()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let both = has(&connector(Some(tx), drive_channels()));
+        // DRDYNVC, CLIPRDR, RDPSND and RDPDR, each once.
+        assert_eq!(sound_only, (true, true, 4));
+        assert_eq!(drives_only, (true, true, 4));
+        assert_eq!(both, (true, true, 4));
     }
 
     #[test]

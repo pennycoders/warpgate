@@ -20,9 +20,10 @@ pub use desktop::{
     within_deadline,
 };
 pub use desktop_files::{
-    ClipboardFile, ClipboardFileOffer, ClipboardTransfer, DesktopCapabilities, FileContentsReply,
-    FileContentsRequest, FileTransferDirection, FileTransferRecord, MAX_FILE_CHUNK_BYTES,
-    MAX_OFFERED_FILES, clamp_file_range, limit_file_offer, sanitize_file_path,
+    ClipboardFile, ClipboardFileOffer, ClipboardTransfer, DesktopCapabilities, DriveUpload,
+    DriveUploadStatus, FileContentsReply, FileContentsRequest, FileTransferDirection,
+    FileTransferRecord, MAX_FILE_CHUNK_BYTES, MAX_OFFERED_FILES, clamp_file_range,
+    limit_file_offer, sanitize_file_path,
 };
 pub use framebuffer::{Framebuffer, PngEncodeError, Rect, decode_png_rgba};
 pub use handle::{AdmittedTarget, SessionHandle, TargetSessionStart, WarpgateServerHandle};

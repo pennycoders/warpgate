@@ -174,3 +174,37 @@
         >
     </FormGroup>
 {/if}
+
+<h4 class="mt-4">Drives</h4>
+<Input
+    type="switch"
+    label="Drive redirection"
+    bind:checked={options.driveRedirection}
+/>
+<HelpText>
+    Native RDP clients' redirected drives appear on the target, relayed by
+    Warpgate. In the browser, the target gets an Uploads drive holding files the
+    user uploads during the session. Each file read or written is logged with
+    the session.
+</HelpText>
+{#if options.driveRedirection}
+    <Input
+        type="switch"
+        label="Read-only"
+        bind:checked={options.driveReadOnly}
+    />
+    <HelpText>
+        The target can open and read files on redirected drives but not create,
+        change or delete them. The browser's Uploads drive is always read-only.
+    </HelpText>
+    <FormGroup floating label="Uploads drive capacity (MiB)">
+        <input
+            class="form-control"
+            type="number"
+            bind:value={options.driveUploadsMaxMb}
+            min="1"
+            max="65536"
+            step="1"
+        >
+    </FormGroup>
+{/if}

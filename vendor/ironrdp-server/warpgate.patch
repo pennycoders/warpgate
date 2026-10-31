@@ -1,6 +1,6 @@
 diff -ruN ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
---- ironrdp-server-0.14.0/src/capabilities.rs	2026-10-31 13:41:18
-+++ base/src/capabilities.rs	2026-10-31 13:41:18
+--- ironrdp-server-0.14.0/src/capabilities.rs	2026-10-31 13:53:07
++++ base/src/capabilities.rs	2026-10-31 13:53:07
 @@ -1,4 +1,4 @@
 -use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
 +use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags, MajorPlatformType, MinorPlatformType};
@@ -19,8 +19,8 @@ diff -ruN ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
          // Advertise that the server handles `SuppressOutput` and
          // `RefreshRectangle` (per MS-RDPBCGR 2.2.7.1.1) — spec-compliant
 diff -ruN ironrdp-server-0.14.0/src/display.rs base/src/display.rs
---- ironrdp-server-0.14.0/src/display.rs	2026-10-31 13:41:18
-+++ base/src/display.rs	2026-10-31 13:41:18
+--- ironrdp-server-0.14.0/src/display.rs	2026-10-31 13:53:07
++++ base/src/display.rs	2026-10-31 13:53:07
 @@ -329,6 +329,19 @@
      /// and then signals the event loop via `ServerEvent::Egfx`.
      #[cfg(feature = "egfx")]
@@ -51,8 +51,8 @@ diff -ruN ironrdp-server-0.14.0/src/display.rs base/src/display.rs
      }
  }
 diff -ruN ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
---- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 13:41:18
-+++ base/src/encoder/bitmap.rs	2026-10-31 13:41:18
+--- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 13:53:07
++++ base/src/encoder/bitmap.rs	2026-10-31 13:53:07
 @@ -1,6 +1,6 @@
 -use core::num::NonZeroUsize;
 +use core::iter;
@@ -143,8 +143,8 @@ diff -ruN ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
                  bitmap_data: &self.buffer[..len],
              };
 diff -ruN ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
---- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 13:41:18
-+++ base/src/encoder/fast_path.rs	2026-10-31 13:41:18
+--- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 13:53:07
++++ base/src/encoder/fast_path.rs	2026-10-31 13:53:07
 @@ -4,7 +4,8 @@
  use ironrdp_pdu::{Encode as _, WriteCursor};
  
@@ -174,8 +174,8 @@ diff -ruN ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_p
  
              1..=MAX_FASTPATH_UPDATE_SIZE => {
 diff -ruN ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 13:41:18
-+++ base/src/encoder/mod.rs	2026-10-31 13:41:18
+--- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 13:53:07
++++ base/src/encoder/mod.rs	2026-10-31 13:53:07
 @@ -16,6 +16,8 @@
  use tracing::{debug, warn};
  
@@ -621,8 +621,8 @@ diff -ruN ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
  }
  
 diff -ruN ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
---- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 13:41:18
-+++ base/src/lib.rs	2026-10-31 13:41:18
+--- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 13:53:07
++++ base/src/lib.rs	2026-10-31 13:53:07
 @@ -36,7 +36,7 @@
  #[cfg(all(feature = "__test", feature = "qoiz"))]
  pub use encoder::qoiz::Compressor as QoizCompressor;
@@ -651,8 +651,8 @@ diff -ruN ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
  #[cfg(feature = "usb")]
  pub use urbdrc::{
 diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
---- ironrdp-server-0.14.0/src/server.rs	2026-10-31 13:41:18
-+++ base/src/server.rs	2026-10-31 13:41:18
+--- ironrdp-server-0.14.0/src/server.rs	2026-10-31 13:53:07
++++ base/src/server.rs	2026-10-31 13:53:07
 @@ -50,6 +50,7 @@
  use rand::RngCore as _;
  use rdpdr::server::{RdpdrServer, RdpdrServerMessage};
@@ -828,7 +828,15 @@ diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      let Some(rdpsnd) = conn.get_svc_processor::<RdpsndServer>() else {
                          warn!("No rdpsnd channel, dropping event");
                          continue;
-@@ -4737,6 +4847,7 @@
+@@ -3955,6 +4065,7 @@
+                             input_buffer,
+                             output_buffer_length,
+                         ),
++                        RdpdrServerMessage::Forward(request) => rdpdr.forward_drive_io_request(request),
+                     }
+                     .map_err_kind("failed to send rdpdr event", ServerErrorKind::Pdu)?;
+                     let channel_id = conn
+@@ -4737,6 +4848,7 @@
          let udp_transport_for_events = Rc::clone(&udp_transport);
          let udp_transport_for_pdus = Rc::clone(&udp_transport);
          let mut cliprdr_writer = writer.clone();
@@ -836,7 +844,7 @@ diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          let write_counter = writer.write_counter();
          let ev_receiver = Arc::clone(&self.ev_receiver);
          let s = Rc::new(Mutex::new((self, conn)));
-@@ -5061,17 +5172,32 @@
+@@ -5061,17 +5173,32 @@
              }
          };
  
@@ -877,7 +885,7 @@ diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          state
      }
  
-@@ -5170,22 +5296,6 @@
+@@ -5170,22 +5297,6 @@
              });
          }
  
@@ -900,7 +908,7 @@ diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          #[cfg(feature = "egfx")]
          if let Some(gfx_handle) = conn.gfx_handle.as_ref() {
              let mut server = gfx_handle
-@@ -5224,10 +5334,12 @@
+@@ -5224,10 +5335,12 @@
          let mut update_codecs = UpdateEncoderCodecs::new();
          let mut surface_flags = CmdFlags::empty();
          let mut pointer_cache_size: u16 = 0;
@@ -913,7 +921,7 @@ diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          for c in result.capabilities {
              match c {
                  CapabilitySet::General(c) => {
-@@ -5239,7 +5351,6 @@
+@@ -5239,7 +5352,6 @@
                  CapabilitySet::Bitmap(b) => {
                      if !b.desktop_resize_flag {
                          debug!("Desktop resize is not supported by the client");
@@ -921,7 +929,7 @@ diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      }
  
                      let client_size = DesktopSize {
-@@ -5250,12 +5361,12 @@
+@@ -5250,12 +5362,12 @@
  
                      // It's problematic when the client didn't resize, as we send bitmap updates that don't fit.
                      // The client will likely drop the connection.
@@ -939,7 +947,7 @@ diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      }
                  }
                  CapabilitySet::SurfaceCommands(c) => {
-@@ -5310,6 +5421,7 @@
+@@ -5310,6 +5422,7 @@
                      // must not reference a cache slot via CachedPointer either, since nothing
                      // else in this crate populates that cache via the Color Pointer Update.
                      pointer_cache_size = p.pointer_cache_size;
@@ -947,7 +955,7 @@ diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                  }
                  CapabilitySet::LargePointer(lp) => {
                      // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
-@@ -5323,15 +5435,34 @@
+@@ -5323,15 +5436,34 @@
              }
          }
  

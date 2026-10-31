@@ -35,6 +35,10 @@ pub const fn _default_clipboard_files_max_mb() -> u32 {
     100
 }
 
+pub const fn _default_drive_uploads_max_mb() -> u32 {
+    100
+}
+
 #[inline]
 pub fn _default_username() -> String {
     "root".to_owned()

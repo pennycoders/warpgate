@@ -2,7 +2,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use warpgate_core::{
     ClipboardFile, ClipboardFileOffer, ClipboardTransfer, DESKTOP_AUDIO_FORMAT, DesktopEvent,
-    DesktopInput, DesktopRect, DesktopState, FileContentsReply, FileContentsRequest,
+    DesktopInput, DesktopRect, DesktopState, DriveUpload, FileContentsReply, FileContentsRequest,
     MAX_CLIPBOARD_BYTES, Scancode, truncate_clipboard_contents_in_place,
 };
 use warpgate_web_clients_common::{LiveSessionPhase, SessionPhase};
@@ -119,6 +119,19 @@ pub enum ClientMessage {
         #[serde(default)]
         data: Option<WsBytes>,
     },
+    /// Start uploading a file to the session drive; its chunks follow in order.
+    DriveUploadStart {
+        id: u32,
+        name: String,
+        size: u64,
+    },
+    DriveUploadChunk {
+        id: u32,
+        data: WsBytes,
+    },
+    DriveUploadDelete {
+        id: u32,
+    },
 }
 
 impl From<ClientMessage> for Option<DesktopInput> {
@@ -180,6 +193,16 @@ impl From<ClientMessage> for Option<DesktopInput> {
                     id,
                     data: data.map(|data| data.0),
                 }))
+            }
+            // Name, size and capacity are checked by the drive itself.
+            ClientMessage::DriveUploadStart { id, name, size } => {
+                DesktopInput::DriveUpload(DriveUpload::Start { id, name, size })
+            }
+            ClientMessage::DriveUploadChunk { id, data } => {
+                DesktopInput::DriveUpload(DriveUpload::Chunk { id, data: data.0 })
+            }
+            ClientMessage::DriveUploadDelete { id } => {
+                DesktopInput::DriveUpload(DriveUpload::Delete { id })
             }
         })
     }
@@ -251,6 +274,12 @@ pub enum ServerMessage {
     /// is off.
     Capabilities {
         clipboard_files_max_bytes: Option<u64>,
+        drive_uploads_max_bytes: Option<u64>,
+    },
+    /// An upload to the session drive was stored, or refused.
+    DriveUpload {
+        id: u32,
+        stored: bool,
     },
     Bell,
     /// A block of the target's sound, interleaved signed 16-bit little-endian PCM in
@@ -431,6 +460,11 @@ impl ServerMessage {
             }
             DesktopEvent::Capabilities(capabilities) => Self::Capabilities {
                 clipboard_files_max_bytes: capabilities.clipboard_files_max_bytes,
+                drive_uploads_max_bytes: capabilities.drive_uploads_max_bytes,
+            },
+            DesktopEvent::DriveUpload(status) => Self::DriveUpload {
+                id: status.id,
+                stored: status.stored,
             },
             // Audit only: the recorder has it.
             DesktopEvent::FileTransferred(_) => return None,
@@ -545,6 +579,40 @@ mod tests {
         assert_eq!(reply.data, None);
     }
 
+    fn drive_step(input: DesktopInput) -> Option<DriveUpload> {
+        match input {
+            DesktopInput::DriveUpload(step) => Some(step),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn browser_uploads_become_drive_steps() {
+        assert_eq!(
+            drive_step(input(
+                r#"{"type":"drive_upload_start","id":1,"name":"a.txt","size":2}"#
+            )),
+            Some(DriveUpload::Start {
+                id: 1,
+                name: "a.txt".into(),
+                size: 2,
+            })
+        );
+        assert_eq!(
+            drive_step(input(
+                r#"{"type":"drive_upload_chunk","id":1,"data":"aGk="}"#
+            )),
+            Some(DriveUpload::Chunk {
+                id: 1,
+                data: Bytes::from_static(b"hi"),
+            })
+        );
+        assert_eq!(
+            drive_step(input(r#"{"type":"drive_upload_delete","id":1}"#)),
+            Some(DriveUpload::Delete { id: 1 })
+        );
+    }
+
     #[test]
     fn invalid_base64_from_the_browser_is_rejected() {
         assert!(
@@ -597,9 +665,23 @@ mod tests {
             json(DesktopEvent::Capabilities(
                 warpgate_core::DesktopCapabilities {
                     clipboard_files_max_bytes: None,
+                    drive_uploads_max_bytes: Some(5),
                 }
             )),
-            serde_json::json!({"type": "capabilities", "clipboard_files_max_bytes": null})
+            serde_json::json!({
+                "type": "capabilities",
+                "clipboard_files_max_bytes": null,
+                "drive_uploads_max_bytes": 5,
+            })
+        );
+        assert_eq!(
+            json(DesktopEvent::DriveUpload(
+                warpgate_core::DriveUploadStatus {
+                    id: 3,
+                    stored: true,
+                }
+            )),
+            serde_json::json!({"type": "drive_upload", "id": 3, "stored": true})
         );
     }
 

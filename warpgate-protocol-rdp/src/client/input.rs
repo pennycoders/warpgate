@@ -64,6 +64,7 @@ pub fn translate(input: DesktopInput, ops: &mut Vec<Operation>) {
         // directly from the active loop.
         DesktopInput::Clipboard(_)
         | DesktopInput::ClipboardTransfer(_)
+        | DesktopInput::DriveUpload(_)
         | DesktopInput::Refresh
         | DesktopInput::Resize { .. }
         | DesktopInput::Microphone(_) => {}

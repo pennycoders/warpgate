@@ -21,7 +21,12 @@ export interface RemoteFileOffer {
 }
 
 export type FilesServerMessage =
-    | { type: 'capabilities'; clipboard_files_max_bytes: number | null }
+    | {
+          type: 'capabilities'
+          clipboard_files_max_bytes: number | null
+          drive_uploads_max_bytes: number | null
+      }
+    | { type: 'drive_upload'; id: number; stored: boolean }
     | { type: 'clipboard_files'; offer: number; files: DesktopFile[] }
     | {
           type: 'file_contents_request'
@@ -36,6 +41,9 @@ export type FilesServerMessage =
 // Ranges a download asks for. Small enough that one base64 JSON frame stays modest,
 // large enough that the per-range round trip doesn't dominate.
 export const DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+
+// Upload chunk size for the session drive; the upload is paced by the socket.
+export const UPLOAD_CHUNK_BYTES = 512 * 1024
 
 // Offers the page keeps serving. The newest is the clipboard; older ones stay readable
 // while a paste the target started from them may still be running.
@@ -75,6 +83,13 @@ export class DesktopFiles {
     // The target's per-copy cap; null while clipboard files are off.
     maxBytes: number | null = null
     remoteOffer: RemoteFileOffer | null = null
+    // The session drive's capacity; null while drive redirection is off.
+    driveMaxBytes: number | null = null
+    // Files on the session drive, as this page uploaded them.
+    driveFiles: { id: number; name: string; size: number }[] = []
+
+    private nextUpload = 0
+    private uploads = new Map<number, (stored: boolean) => void>()
 
     private nextOffer = 0
     private localOffers: { offer: number; files: File[] }[] = []
@@ -97,8 +112,17 @@ export class DesktopFiles {
         switch (m.type) {
             case 'capabilities':
                 this.maxBytes = m.clipboard_files_max_bytes
+                this.driveMaxBytes = m.drive_uploads_max_bytes
                 this.changed()
                 return true
+            case 'drive_upload': {
+                const resolve = this.uploads.get(m.id)
+                if (resolve) {
+                    this.uploads.delete(m.id)
+                    resolve(m.stored)
+                }
+                return true
+            }
             case 'clipboard_files':
                 this.remoteOffer = { offer: m.offer, files: m.files }
                 this.changed()
@@ -238,12 +262,70 @@ export class DesktopFiles {
         return new Blob(parts as BlobPart[])
     }
 
-    // Fail every download still waiting, e.g. when the socket goes away.
+    // Upload one file to the session drive, which the target sees as a read-only
+    // redirected drive named "Uploads". Resolves to whether Warpgate stored it.
+    async uploadToDrive(
+        file: File,
+        progress: (sent: number) => void = () => {},
+    ): Promise<boolean> {
+        if (this.driveMaxBytes === null) {
+            return false
+        }
+        this.nextUpload = (this.nextUpload + 1) >>> 0
+        const id = this.nextUpload
+        const done = new Promise<boolean>(resolve =>
+            this.uploads.set(id, resolve),
+        )
+        this.send({
+            type: 'drive_upload_start',
+            id,
+            name: file.name,
+            size: file.size,
+        })
+        for (let offset = 0; offset < file.size; ) {
+            const end = Math.min(file.size, offset + UPLOAD_CHUNK_BYTES)
+            const chunk = new Uint8Array(
+                await file.slice(offset, end).arrayBuffer(),
+            )
+            if (!this.uploads.has(id)) {
+                // Refused part-way (over capacity, bad name): stop sending.
+                break
+            }
+            this.send({
+                type: 'drive_upload_chunk',
+                id,
+                data: bytesToBase64(chunk),
+            })
+            offset = end
+            progress(offset)
+        }
+        const stored = await done
+        if (stored) {
+            this.driveFiles = [
+                ...this.driveFiles.filter(f => f.name !== file.name),
+                { id, name: file.name, size: file.size },
+            ]
+            this.changed()
+        }
+        return stored
+    }
+
+    removeFromDrive(id: number): void {
+        this.send({ type: 'drive_upload_delete', id })
+        this.driveFiles = this.driveFiles.filter(f => f.id !== id)
+        this.changed()
+    }
+
+    // Fail every download and upload still waiting, e.g. when the socket goes away.
     abort(): void {
         for (const resolve of this.pending.values()) {
             resolve(null)
         }
         this.pending.clear()
+        for (const resolve of this.uploads.values()) {
+            resolve(false)
+        }
+        this.uploads.clear()
     }
 }
 

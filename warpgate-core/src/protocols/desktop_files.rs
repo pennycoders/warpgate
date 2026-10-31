@@ -101,6 +101,27 @@ pub struct FileTransferRecord {
 pub struct DesktopCapabilities {
     /// The per-copy size cap when clipboard file transfer is enabled.
     pub clipboard_files_max_bytes: Option<u64>,
+    /// The capacity of the session drive the browser can upload files to, when the
+    /// target has drive redirection enabled.
+    pub drive_uploads_max_bytes: Option<u64>,
+}
+
+/// A step of uploading a file to the session drive, which is served to the target as a
+/// redirected drive. Chunks follow their `Start` in order; the file appears on the drive
+/// once `size` bytes have arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveUpload {
+    Start { id: u32, name: String, size: u64 },
+    Chunk { id: u32, data: Bytes },
+    Delete { id: u32 },
+}
+
+/// The outcome of an upload: stored on the drive, or refused (bad name, over capacity,
+/// overrun).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveUploadStatus {
+    pub id: u32,
+    pub stored: bool,
 }
 
 /// Normalise a peer-supplied relative path to `/`-separated components, or `None` if it

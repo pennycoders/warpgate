@@ -437,6 +437,7 @@ impl DesktopRecorder {
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::ClipboardTransfer(_)
             | DesktopEvent::Capabilities(_)
+            | DesktopEvent::DriveUpload(_)
             | DesktopEvent::Bell
             | DesktopEvent::Audio(_)
             | DesktopEvent::MicrophoneOpen { .. }
@@ -593,6 +594,9 @@ impl DesktopRecorder {
             // File transfer steps carry file contents, which are not recorded; the
             // transfer itself is recorded once as a `FileTransfer` item.
             DesktopInput::ClipboardTransfer(_) |
+            // An upload is not a transfer to the target until the target reads it, which
+            // is recorded then.
+            DesktopInput::DriveUpload(_) |
             // A key with neither representation carries nothing to replay.
             DesktopInput::Key { .. } => return Ok(()),
         };

@@ -127,6 +127,7 @@ pub(super) async fn connect_backend(
     server_in_tx: &Sender<ServerInput>,
     admitted: AdmittedTarget<TargetRdpOptions>,
     screen: warpgate_desktop_ui::Screen,
+    drives: super::ViewerDrives,
 ) -> Result<BackendBridge> {
     info!(target=%admitted.target().name, "Authorized");
 
@@ -139,10 +140,11 @@ pub(super) async fn connect_backend(
         input_tx,
         abort_tx,
         logon_state,
-    } = crate::connect(
+    } = crate::connect_with_drives(
         admitted,
         (screen.width, screen.height),
         services.secret_backends.clone(),
+        Some(drives),
     )?;
     if let Some(recorder) = &recorder {
         recorder.track_logon_state(logon_state);
