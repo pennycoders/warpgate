@@ -785,6 +785,7 @@ pub enum AcceptorState {
     BasicSettingsSendResponse {
         requested_protocol: SecurityProtocol,
         protocol: SecurityProtocol,
+        rdp_version: gcc::RdpVersion,
         early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
         channels: Vec<(u16, Option<gcc::ChannelDef>)>,
     },
@@ -1053,6 +1054,7 @@ impl Sequence for Acceptor {
                 debug!(message = ?settings_initial, "Received");
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
+                let rdp_version = common_rdp_version(gcc_blocks.core.version);
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
                 self.early_capability_flags = early_capability.unwrap_or(gcc::ClientEarlyCapabilityFlags::empty());
                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
@@ -1142,6 +1144,7 @@ impl Sequence for Acceptor {
                     AcceptorState::BasicSettingsSendResponse {
                         requested_protocol,
                         protocol,
+                        rdp_version,
                         early_capability,
                         channels,
                     },
@@ -1151,6 +1154,7 @@ impl Sequence for Acceptor {
             AcceptorState::BasicSettingsSendResponse {
                 requested_protocol,
                 protocol,
+                rdp_version,
                 early_capability,
                 channels,
             } => {
@@ -1168,6 +1172,7 @@ impl Sequence for Acceptor {
                     self.io_channel_id,
                     channel_ids.clone(),
                     requested_protocol,
+                    rdp_version,
                     skip_channel_join,
                     self.message_channel_id,
                     self.advertised_multitransport,
@@ -1599,17 +1604,24 @@ impl Sequence for Acceptor {
     }
 }
 
+/// The RDP version both sides speak (MS-RDPBCGR 2.2.1.4.2): the client's, up to the newest this
+/// server knows, as the FreeRDP server answers.
+fn common_rdp_version(client: gcc::RdpVersion) -> gcc::RdpVersion {
+    gcc::RdpVersion(u32::from(client).min(u32::from(gcc::RdpVersion::V10_12)))
+}
+
 fn create_gcc_blocks(
     io_channel: u16,
     channel_ids: Vec<u16>,
     requested: SecurityProtocol,
+    rdp_version: gcc::RdpVersion,
     skip_channel_join: bool,
     message_channel_id: Option<u16>,
     offer_multitransport: Option<gcc::MultiTransportFlags>,
 ) -> gcc::ServerGccBlocks {
     gcc::ServerGccBlocks {
         core: gcc::ServerCoreData {
-            version: gcc::RdpVersion::V5_PLUS,
+            version: rdp_version,
             optional_data: gcc::ServerCoreOptionalData {
                 client_requested_protocols: Some(requested),
                 early_capability_flags: skip_channel_join
@@ -1638,6 +1650,27 @@ fn create_gcc_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_answers_with_the_clients_rdp_version_up_to_the_newest_it_knows() {
+        assert_eq!(common_rdp_version(gcc::RdpVersion::V5_PLUS), gcc::RdpVersion::V5_PLUS);
+        assert_eq!(common_rdp_version(gcc::RdpVersion::V10_7), gcc::RdpVersion::V10_7);
+        assert_eq!(common_rdp_version(gcc::RdpVersion(0x0008_0013)), gcc::RdpVersion::V10_12);
+    }
+
+    #[test]
+    fn server_core_data_carries_the_common_rdp_version() {
+        let blocks = create_gcc_blocks(
+            1003,
+            vec![],
+            SecurityProtocol::SSL,
+            gcc::RdpVersion::V10_7,
+            false,
+            None,
+            None,
+        );
+        assert_eq!(blocks.core.version, gcc::RdpVersion::V10_7);
+    }
 
     fn credentials(username: &str) -> Credentials {
         Credentials {
