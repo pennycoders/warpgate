@@ -42,6 +42,7 @@ mod bridge;
 mod clipboard;
 mod gfx;
 mod hold_screen;
+mod microphone;
 mod protocol;
 mod rdp;
 mod sound;

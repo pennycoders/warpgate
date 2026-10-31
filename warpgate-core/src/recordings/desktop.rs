@@ -429,6 +429,8 @@ impl DesktopRecorder {
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::Bell
             | DesktopEvent::Audio(_)
+            | DesktopEvent::MicrophoneOpen { .. }
+            | DesktopEvent::MicrophoneClose
             | DesktopEvent::Error(_)
             | DesktopEvent::Ended(_) => return Ok(()),
         }
@@ -565,6 +567,8 @@ impl DesktopRecorder {
             // The target's response to a resize arrives as a recorded DesktopEvent::Resize,
             // so the request itself carries no playback value.
             DesktopInput::Refresh | DesktopInput::Resize { .. } |
+            // The viewer's voice is relayed, not kept.
+            DesktopInput::Microphone(_) |
             // A key with neither representation carries nothing to replay.
             DesktopInput::Key { .. } => return Ok(()),
         };

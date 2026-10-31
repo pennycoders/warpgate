@@ -48,6 +48,7 @@ class Test:
                             verify_tls=False,
                             interactive_logon=False,
                             audio_playback=False,
+                            microphone=False,
                         )
                     ),
                 )

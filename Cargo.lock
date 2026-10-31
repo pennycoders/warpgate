@@ -9584,6 +9584,7 @@ dependencies = [
  "ironrdp-input",
  "ironrdp-pdu",
  "ironrdp-rdpdr",
+ "ironrdp-rdpeai",
  "ironrdp-rdpsnd",
  "ironrdp-server",
  "ironrdp-session",

@@ -58,8 +58,8 @@ fn map_input(input: DesktopInput) -> Vec<X11Event> {
         }
         DesktopInput::Clipboard(text) => vec![X11Event::CopyText(text)],
         DesktopInput::Refresh => vec![X11Event::FullRefresh],
-        // Dynamic resize toward a VNC target is not supported.
-        DesktopInput::Resize { .. } => vec![],
+        // Dynamic resize toward a VNC target is not supported, and RFB carries no audio.
+        DesktopInput::Resize { .. } | DesktopInput::Microphone(_) => vec![],
     }
 }
 

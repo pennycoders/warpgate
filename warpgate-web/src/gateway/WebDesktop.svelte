@@ -2,6 +2,8 @@
     import {
         faCompress,
         faExpand,
+        faMicrophone,
+        faMicrophoneSlash,
         faVolumeHigh,
         faVolumeXmark,
     } from '@fortawesome/free-solid-svg-icons'
@@ -21,6 +23,7 @@
     } from 'common/desktopCanvas'
     import { DesktopClipboard } from 'common/desktopClipboard'
     import { codeToScancode } from 'common/desktopInput'
+    import { DesktopMicrophone } from 'common/desktopMicrophone'
     import { stringifyError } from 'common/errors'
     import { handleReauthError } from 'common/reauth'
     import WebClientStatus from 'common/WebClientStatus.svelte'
@@ -50,7 +53,14 @@
         | { type: 'cursor'; rect: Rect; data: string }
         | { type: 'clipboard'; text: string }
         | { type: 'bell' }
-        | { type: 'features'; audio_playback: boolean }
+        | { type: 'features'; audio_playback: boolean; microphone: boolean }
+        | {
+              type: 'microphone_open'
+              channels: number
+              sample_rate: number
+              frames_per_packet: number
+          }
+        | { type: 'microphone_close' }
         | { type: 'error'; message: string }
 
     // svelte-ignore state_referenced_locally
@@ -75,6 +85,12 @@
     let audioAvailable = $state(false)
     let audioOn = $state(false)
     const audioPlayer = new DesktopAudioPlayer()
+    // The viewer's microphone: offered only when the target may record it, and captured
+    // only while the viewer has it on; audio is sent only while the target records.
+    let microphoneAvailable = $state(false)
+    let microphoneOn = $state(false)
+    let microphoneRecording = $state(false)
+    const microphone = new DesktopMicrophone(frame => ws?.send(frame))
 
     // Framebuffer messages are queued off the WS thread and painted in a rAF loop so a
     // burst of updates (e.g. dragging a window) can never block the main thread. Beyond
@@ -199,6 +215,19 @@
                 break
             case 'features':
                 audioAvailable = msg.audio_playback
+                microphoneAvailable = msg.microphone
+                break
+            case 'microphone_open':
+                microphoneRecording = true
+                microphone.setFormat({
+                    channels: msg.channels,
+                    sampleRate: msg.sample_rate,
+                    framesPerPacket: msg.frames_per_packet,
+                })
+                break
+            case 'microphone_close':
+                microphoneRecording = false
+                microphone.setFormat(null)
                 break
             case 'error':
                 notice = msg.message
@@ -311,6 +340,21 @@
         }
         audioOn = true
         send({ type: 'audio', enabled: true })
+    }
+
+    async function toggleMicrophone() {
+        if (microphoneOn) {
+            microphoneOn = false
+            microphone.disable()
+            return
+        }
+        try {
+            await microphone.enable()
+        } catch (e) {
+            notice = `Could not use the microphone: ${await stringifyError(e)}`
+            return
+        }
+        microphoneOn = true
     }
 
     function toggleFullscreen() {
@@ -539,6 +583,7 @@
         resizeObserver?.disconnect()
         resizeSubscription.unsubscribe()
         audioPlayer.stop()
+        microphone.disable()
         if (rafHandle !== null) {
             cancelAnimationFrame(rafHandle)
         }
@@ -573,6 +618,22 @@
                     {notice}
                 />
             </div>
+        {/if}
+        {#if microphoneAvailable}
+            <button
+                type="button"
+                class="btn btn-link"
+                class:text-danger={microphoneOn && microphoneRecording}
+                title={microphoneOn
+                    ? microphoneRecording
+                        ? 'Microphone on, the target is recording'
+                        : 'Microphone on'
+                    : 'Use the microphone'}
+                aria-pressed={microphoneOn}
+                onclick={toggleMicrophone}
+            >
+                <Fa icon={microphoneOn ? faMicrophone : faMicrophoneSlash} fw />
+            </button>
         {/if}
         {#if audioAvailable}
             <button

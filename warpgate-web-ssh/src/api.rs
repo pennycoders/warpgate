@@ -8,7 +8,7 @@ use uuid::Uuid;
 use warpgate_common::UserSessionId;
 use warpgate_common_http::SessionKeepalive;
 use warpgate_common_http::auth::AuthenticatedRequestContext;
-use warpgate_web_clients_common::{ClientManager, run_stream_loop};
+use warpgate_web_clients_common::{ClientFrame, ClientManager, run_stream_loop};
 
 use crate::manager::WebSshClientManager;
 use crate::protocol::{ClientMessage, ServerMessage};
@@ -51,10 +51,12 @@ pub async fn ws_handler(
             registry,
             socket,
             |msg| Message::Text(serde_json::to_string(msg).unwrap_or_default()),
-            move |text| {
+            move |frame| {
                 let session = input_session.clone();
                 async move {
-                    if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                    if let ClientFrame::Text(text) = frame
+                        && let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text)
+                    {
                         handle_client_message(&session, client_msg).await;
                     }
                 }

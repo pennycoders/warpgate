@@ -459,12 +459,18 @@ impl<S: ManagedSession> ClientManager<S> {
     }
 }
 
+/// A message from the browser.
+pub enum ClientFrame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
 pub async fn run_stream_loop<S, M, Fut>(
     session: &Arc<S>,
     registry: ClientManager<S>,
     socket: WebSocketStream,
     encode: impl Fn(&M) -> Message,
-    mut decode_and_handle: impl FnMut(String) -> Fut,
+    mut decode_and_handle: impl FnMut(ClientFrame) -> Fut,
 ) where
     S: ManagedSession + Deref<Target = WebSession<M>>,
     M: Sheddable + From<SessionPhase>,
@@ -503,7 +509,10 @@ pub async fn run_stream_loop<S, M, Fut>(
 
             maybe_msg = stream.next() => {
                 match maybe_msg {
-                    Some(Ok(Message::Text(text))) => decode_and_handle(text).await,
+                    Some(Ok(Message::Text(text))) => decode_and_handle(ClientFrame::Text(text)).await,
+                    Some(Ok(Message::Binary(data))) => {
+                        decode_and_handle(ClientFrame::Binary(data)).await;
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }

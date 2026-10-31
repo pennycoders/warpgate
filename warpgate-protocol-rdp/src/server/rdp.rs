@@ -32,6 +32,7 @@ use warpgate_desktop_ui::DEFAULT_SIZE;
 
 use super::clipboard::ViewerClipboard;
 use super::gfx::{GraphicsFactory, Routed, ViewerGraphics};
+use super::microphone::ViewerMicrophone;
 use super::protocol::{AuthVerdict, Event, Input};
 use super::sound::ViewerSound;
 use super::surface::Request;
@@ -117,6 +118,7 @@ where
     let clipboard = ViewerClipboard::new(out_tx.clone());
     let sound = ViewerSound::new();
     let graphics = ViewerGraphics::new(*size.lock().await);
+    let microphone = ViewerMicrophone::new(out_tx.clone());
     let display_route = DisplayRouteState {
         size: Arc::clone(&size),
     };
@@ -157,6 +159,8 @@ where
         .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
         // Offered to every viewer: the target is not known yet when channels are joined.
         .with_sound_factory(Some(Box::new(sound.clone())))
+        // Likewise; the viewer records only once the target asks for its microphone.
+        .with_rdpeai_factory(Some(Box::new(microphone.clone())))
         .with_gfx_factory(
             graphics_pipeline.then(|| Box::new(graphics.factory()) as Box<dyn GfxServerFactory>),
         )
@@ -170,6 +174,7 @@ where
             display_route,
             clipboard,
             sound,
+            microphone,
             graphics,
             server.event_sender().clone(),
         )
@@ -244,6 +249,7 @@ async fn route_input(
     display: DisplayRouteState,
     clipboard: ViewerClipboard,
     sound: ViewerSound,
+    microphone: ViewerMicrophone,
     mut graphics: ViewerGraphics,
     server_events: mpsc::UnboundedSender<ServerEvent>,
 ) {
@@ -316,6 +322,11 @@ async fn route_input(
             }
             Input::Clipboard(text) => clipboard.offer(text),
             Input::Audio(data) => sound.play(&data),
+            Input::MicrophoneOpen {
+                format,
+                frames_per_packet,
+            } => microphone.open(format, frames_per_packet),
+            Input::MicrophoneClose => microphone.close(),
             Input::Shutdown => break,
             Input::Disconnect(code) => {
                 match decode::<ServerSetErrorInfoPdu>(&code.to_le_bytes()) {
@@ -975,7 +986,8 @@ mod disconnect_tests {
     use tokio::sync::{Mutex, mpsc};
 
     use super::{
-        DisplayRouteState, Input, ViewerClipboard, ViewerGraphics, ViewerSound, route_input,
+        DisplayRouteState, Input, ViewerClipboard, ViewerGraphics, ViewerMicrophone, ViewerSound,
+        route_input,
     };
 
     struct Router {
@@ -1001,8 +1013,9 @@ mod disconnect_tests {
             rx,
             frame_tx,
             display,
-            ViewerClipboard::new(out),
+            ViewerClipboard::new(out.clone()),
             ViewerSound::new(),
+            ViewerMicrophone::new(out),
             ViewerGraphics::new(size),
             server_events,
         ));
@@ -1082,8 +1095,8 @@ mod graphics_tests {
     use tokio::sync::{Mutex, mpsc};
 
     use super::{
-        DisplayRouteState, Input, ViewerClipboard, ViewerGraphics, ViewerSound, bitmap_codecs,
-        route_input,
+        DisplayRouteState, Input, ViewerClipboard, ViewerGraphics, ViewerMicrophone, ViewerSound,
+        bitmap_codecs, route_input,
     };
 
     struct Painter;
@@ -1140,8 +1153,9 @@ mod graphics_tests {
             rx,
             frame_tx,
             display,
-            ViewerClipboard::new(out),
+            ViewerClipboard::new(out.clone()),
             ViewerSound::new(),
+            ViewerMicrophone::new(out),
             graphics,
             server_events,
         ));

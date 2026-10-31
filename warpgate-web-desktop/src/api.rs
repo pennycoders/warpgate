@@ -8,10 +8,10 @@ use warpgate_common::UserSessionId;
 use warpgate_common_http::SessionKeepalive;
 use warpgate_common_http::auth::AuthenticatedRequestContext;
 use warpgate_core::DesktopInput;
-use warpgate_web_clients_common::{ClientManager, run_stream_loop};
+use warpgate_web_clients_common::{ClientFrame, ClientManager, run_stream_loop};
 
 use crate::manager::WebDesktopClientManager;
-use crate::protocol::{ClientMessage, WsPayload};
+use crate::protocol::{ClientMessage, WsPayload, decode_client_binary};
 
 #[handler]
 pub async fn ws_handler(
@@ -48,6 +48,9 @@ pub async fn ws_handler(
         if let Some(features) = session.features() {
             session.push(features).await;
         }
+        if let Some(microphone) = session.microphone() {
+            session.push(microphone).await;
+        }
         session.replay_phase().await;
 
         let input_session = session.clone();
@@ -59,9 +62,18 @@ pub async fn ws_handler(
                 WsPayload::Binary(bytes) => Message::Binary(bytes),
                 WsPayload::Text(json) => Message::Text(json),
             },
-            move |text| {
+            move |frame| {
                 let session = input_session.clone();
                 async move {
+                    let text = match frame {
+                        ClientFrame::Text(text) => text,
+                        ClientFrame::Binary(data) => {
+                            if let Some(input) = decode_client_binary(data) {
+                                session.send_input(input).await;
+                            }
+                            return;
+                        }
+                    };
                     if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                         // Answer a refresh from our own surface as well as asking the
                         // backend. RDP has no repaint request wired through the helper,

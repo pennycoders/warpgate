@@ -62,7 +62,10 @@ pub fn translate(input: DesktopInput, ops: &mut Vec<Operation>) {
         }
         // Resize is not a fastpath input; it is sent over the Display Control DVC
         // directly from the active loop.
-        DesktopInput::Clipboard(_) | DesktopInput::Refresh | DesktopInput::Resize { .. } => {}
+        DesktopInput::Clipboard(_)
+        | DesktopInput::Refresh
+        | DesktopInput::Resize { .. }
+        | DesktopInput::Microphone(_) => {}
     }
 }
 

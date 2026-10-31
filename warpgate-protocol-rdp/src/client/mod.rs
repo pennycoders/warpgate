@@ -7,6 +7,7 @@
 mod audio;
 mod input;
 mod logon;
+mod microphone;
 mod tls;
 
 use std::sync::Arc;
@@ -44,6 +45,7 @@ use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{
     ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason,
 };
+use ironrdp_svc::{SvcMessage, SvcProcessorMessages};
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::{FramedWrite as _, TokioFramed};
 use tokio::net::TcpStream;
@@ -58,6 +60,7 @@ use warpgate_core::{
 pub use self::audio::pcm_format;
 use self::audio::{AudioForwarder, dynamic_audio};
 pub(crate) use self::logon::LogonWatcher;
+use self::microphone::{MicrophoneInput, MicrophoneRelay};
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
 use crate::desktop_size::bound_desktop_size;
 
@@ -117,6 +120,13 @@ pub async fn run(
 
     let (clipboard_tx, clipboard_rx) = unbounded_channel();
     let clipboard = Clipboard::deferred(ClientClipboardSink(clipboard_tx));
+    let (microphone_channel, microphone) = match options
+        .microphone
+        .then(|| MicrophoneRelay::new(event_tx.clone()))
+    {
+        Some(relay) => (Some(relay.channel), Some((relay.input, relay.uplink))),
+        None => (None, None),
+    };
 
     let (connection_result, framed) = within_deadline(
         DESKTOP_HANDSHAKE_TIMEOUT,
@@ -127,8 +137,11 @@ pub async fn run(
             options.verify_tls,
             options.tls_security,
             options.kdc_url.clone().filter(|url| !url.is_empty()),
-            clipboard.backend(),
-            options.audio_playback.then(|| event_tx.clone()),
+            TargetChannels {
+                clipboard: clipboard.backend(),
+                audio: options.audio_playback.then(|| event_tx.clone()),
+                microphone: microphone_channel,
+            },
         ),
     )
     .await?;
@@ -155,6 +168,7 @@ pub async fn run(
         &mut abort_rx,
         &clipboard,
         clipboard_rx,
+        microphone,
         &logon,
     )
     .await
@@ -171,8 +185,10 @@ async fn active_loop(
     abort_rx: &mut UnboundedReceiver<()>,
     clipboard: &Clipboard<ClientClipboardSink>,
     mut clipboard_rx: UnboundedReceiver<ClipboardOut>,
+    microphone: Option<(MicrophoneInput, UnboundedReceiver<Vec<SvcMessage>>)>,
     logon: &LogonWatcher,
 ) -> Result<()> {
+    let (microphone, mut microphone_uplink) = microphone.unzip();
     let activation_factory = connection_result.activation_factory;
     let mut active_stage = ActiveStageBuilder {
         static_channels: connection_result.static_channels,
@@ -244,6 +260,11 @@ async fn active_loop(
                     match input {
                         DesktopInput::Resize { width, height } => resize = Some((width, height)),
                         DesktopInput::Clipboard(text) => clipboard.offer(text),
+                        DesktopInput::Microphone(data) => {
+                            if let Some(microphone) = &microphone {
+                                microphone.push(&data);
+                            }
+                        }
                         other => input::translate(other, &mut ops),
                     }
                 }
@@ -287,6 +308,18 @@ async fn active_loop(
                 {
                     return Ok(());
                 }
+                continue;
+            }
+            Some(messages) = recv_microphone(&mut microphone_uplink) => {
+                let frame = active_stage
+                    .process_svc_processor_messages(SvcProcessorMessages::<DrdynvcClient>::new(
+                        messages,
+                    ))
+                    .context("framing microphone audio")?;
+                framed
+                    .write_all(&frame)
+                    .await
+                    .context("sending microphone audio")?;
                 continue;
             }
             pdu = framed.read_pdu() => {
@@ -335,6 +368,16 @@ async fn active_loop(
             }
             send_refresh_request(&mut framed, &mut active_stage, size).await?;
         }
+    }
+}
+
+/// The next packets of the viewer's audio for the target; never, without a microphone.
+async fn recv_microphone(
+    uplink: &mut Option<UnboundedReceiver<Vec<SvcMessage>>>,
+) -> Option<Vec<SvcMessage>> {
+    match uplink {
+        Some(uplink) => uplink.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -828,7 +871,7 @@ fn build_config(
         autologon: !options.interactive_logon,
         credssp_credentialless: options.interactive_logon,
         enable_audio_playback: options.audio_playback,
-        enable_audio_capture: false,
+        enable_audio_capture: options.microphone,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -882,11 +925,23 @@ impl GraphicsPipelineHandler for GraphicsPipelineOutput {
     }
 }
 
+/// The channels Warpgate opens toward the target besides the screen and input.
+struct TargetChannels {
+    clipboard: TextClipboard<ClientClipboardSink>,
+    /// Where the target's sound goes, when it is played.
+    audio: Option<Sender<DesktopEvent>>,
+    /// The `AUDIO_INPUT` channel, when the target may record the viewer's microphone.
+    microphone: Option<ironrdp_rdpeai::client::RdpeaiClient>,
+}
+
 fn target_connector(
     config: ironrdp_connector::Config,
     client_addr: std::net::SocketAddr,
-    clipboard: TextClipboard<ClientClipboardSink>,
-    audio: Option<Sender<DesktopEvent>>,
+    TargetChannels {
+        clipboard,
+        audio,
+        microphone,
+    }: TargetChannels,
 ) -> ironrdp_connector::ClientConnector {
     // Advertise the Display Control DVC so viewer-driven resolution changes can be pushed
     // to the target mid-session (MS-RDPEDISP). The capabilities callback has nothing to
@@ -895,6 +950,10 @@ fn target_connector(
         .with_dynamic_channel(DisplayControlClient::new(|_caps| Ok(Vec::new())));
     if let Some(events) = &audio {
         drdynvc = drdynvc.with_dynamic_channel(dynamic_audio(AudioForwarder::new(events.clone())));
+    }
+    let records = microphone.is_some();
+    if let Some(microphone) = microphone {
+        drdynvc = drdynvc.with_dynamic_channel(microphone);
     }
     if config.support_dyn_vc_gfx_protocol {
         // With no H.264 decoder the client advertises only the non-AVC capability sets it
@@ -907,12 +966,16 @@ fn target_connector(
     let mut connector = ironrdp_connector::ClientConnector::new(config, client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(CliprdrClient::new(Box::new(clipboard)));
+    let plays = audio.is_some();
     if let Some(events) = audio {
+        connector =
+            connector.with_static_channel(Rdpsnd::new(Box::new(AudioForwarder::new(events))));
+    }
+    if plays || records {
         // Windows starts sound only once the client has set up device redirection.
         let computer_name = connector.config.client_name.clone();
-        connector = connector
-            .with_static_channel(Rdpsnd::new(Box::new(AudioForwarder::new(events))))
-            .with_static_channel(Rdpdr::new(Box::new(NoopRdpdrBackend), computer_name));
+        connector =
+            connector.with_static_channel(Rdpdr::new(Box::new(NoopRdpdrBackend), computer_name));
     }
     connector
 }
@@ -924,8 +987,7 @@ async fn connect(
     verify_tls: bool,
     tls_security: warpgate_common::RdpTlsSecurity,
     kdc_url: Option<String>,
-    clipboard: TextClipboard<ClientClipboardSink>,
-    audio: Option<Sender<DesktopEvent>>,
+    channels: TargetChannels,
 ) -> Result<(ConnectionResult, Framed), DesktopConnectionError> {
     // Without a Kerberos config IronRDP runs CredSSP over NTLM only.
     let kerberos_config = kdc_url
@@ -945,7 +1007,7 @@ async fn connect(
         .map_err(DesktopConnectionError::Io)?;
 
     let mut framed = TokioFramed::new(tcp_stream);
-    let mut connector = target_connector(config, client_addr, clipboard, audio);
+    let mut connector = target_connector(config, client_addr, channels);
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
@@ -1054,6 +1116,80 @@ mod tests {
     }
 
     #[test]
+    fn the_target_may_record_only_when_the_option_is_on() {
+        let mut options: warpgate_common::TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        assert!(!build_config(&options, "pw", 1024, 768).enable_audio_capture);
+        options.microphone = true;
+        assert!(build_config(&options, "pw", 1024, 768).enable_audio_capture);
+    }
+
+    #[test]
+    fn the_microphone_channel_is_offered_only_with_the_option() {
+        use ironrdp_dvc::DrdynvcClient;
+        use ironrdp_rdpeai::client::RdpeaiClient;
+
+        let options: warpgate_common::TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        let offers_audio_input = |microphone: Option<RdpeaiClient>| {
+            use ironrdp_core::{Decode as _, ReadCursor, encode_vec};
+            use ironrdp_dvc::pdu::{
+                CapabilitiesRequestPdu, CapsVersion, CreateRequestPdu, CreationStatus,
+                DrdynvcClientPdu, DrdynvcServerPdu,
+            };
+            use ironrdp_svc::SvcProcessor as _;
+
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let clipboard = crate::clipboard::Clipboard::deferred(super::ClientClipboardSink(tx));
+            let mut connector = super::target_connector(
+                build_config(&options, "pw", 1024, 768),
+                "127.0.0.1:1".parse().unwrap(),
+                super::TargetChannels {
+                    clipboard: clipboard.backend(),
+                    audio: None,
+                    microphone,
+                },
+            );
+            let redirects_devices = connector
+                .static_channels
+                .get_by_type::<ironrdp_rdpdr::Rdpdr>()
+                .is_some();
+            let drdynvc = connector
+                .static_channels
+                .get_by_type_mut::<DrdynvcClient>()
+                .and_then(|channel| channel.channel_processor_downcast_mut::<DrdynvcClient>())
+                .unwrap();
+            let mut process = |pdu: DrdynvcServerPdu| drdynvc.process(&encode_vec(&pdu).unwrap());
+            process(DrdynvcServerPdu::Capabilities(CapabilitiesRequestPdu::new(
+                CapsVersion::V3,
+                None,
+            )))
+            .unwrap();
+            let [reply] = process(DrdynvcServerPdu::Create(CreateRequestPdu::new(
+                9,
+                ironrdp_rdpeai::CHANNEL_NAME.to_owned(),
+            )))
+            .unwrap()
+            .try_into()
+            .unwrap();
+            let reply = reply.encode_unframed_pdu().unwrap();
+            let offered = matches!(
+                DrdynvcClientPdu::decode(&mut ReadCursor::new(&reply)).unwrap(),
+                DrdynvcClientPdu::Create(r) if r.creation_status() == CreationStatus::OK
+            );
+            (offered, redirects_devices)
+        };
+
+        assert_eq!(offers_audio_input(None), (false, false));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // Device redirection too, which Windows sets audio redirection up behind.
+        assert_eq!(
+            offers_audio_input(Some(super::MicrophoneRelay::new(tx).channel)),
+            (true, true)
+        );
+    }
+
+    #[test]
     fn sound_comes_with_device_redirection_for_windows() {
         use ironrdp_rdpdr::Rdpdr;
         use ironrdp_rdpsnd::client::Rdpsnd;
@@ -1066,8 +1202,11 @@ mod tests {
             let connector = super::target_connector(
                 build_config(&options, "pw", 1024, 768),
                 "127.0.0.1:1".parse().unwrap(),
-                clipboard.backend(),
-                audio,
+                super::TargetChannels {
+                    clipboard: clipboard.backend(),
+                    audio,
+                    microphone: None,
+                },
             );
             (
                 connector.static_channels.get_by_type::<Rdpsnd>().is_some(),
