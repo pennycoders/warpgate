@@ -191,6 +191,8 @@ async fn active_loop(
     // resize requested before then (notably the viewer's initial size) is held here and
     // retried each iteration until `encode_resize` accepts it.
     let mut pending_resize: Option<(u32, u32)> = None;
+    // Whether the wait for the channel was logged for the pending resize.
+    let mut waiting_logged = false;
     // The size the target was last asked for, starting with the one it connected at. Asking
     // for it again is dropped: the target would still answer with a reactivation or a
     // graphics reset, and the viewer re-sends its size right after connecting.
@@ -204,11 +206,22 @@ async fn active_loop(
     }
 
     loop {
-        if let Some((width, height)) = pending_resize
-            && send_resize(&mut framed, &mut active_stage, width, height).await?
-        {
-            requested_size = (width, height);
-            pending_resize = None;
+        if let Some((width, height)) = pending_resize {
+            if send_resize(&mut framed, &mut active_stage, width, height).await? {
+                debug!(
+                    requested = ?(width, height),
+                    "asked the target for the viewer's size over Display Control"
+                );
+                requested_size = (width, height);
+                pending_resize = None;
+            } else if !waiting_logged {
+                // GNOME Remote Desktop sharing a desktop (mirror-primary) never opens it.
+                debug!(
+                    requested = ?(width, height),
+                    "target has not opened Display Control; the resize waits for it"
+                );
+                waiting_logged = true;
+            }
         }
 
         let outputs = tokio::select! {
@@ -253,6 +266,7 @@ async fn active_loop(
                         u32::from(height),
                     );
                     pending_resize = (size != requested_size).then_some(size);
+                    waiting_logged = false;
                 }
                 if ops.is_empty() {
                     continue;
@@ -597,6 +611,7 @@ async fn report_size(
 ) -> Result<(), Aborted> {
     let size = (image.width(), image.height());
     if *reported_size != Some(size) {
+        debug!(from = ?*reported_size, to = ?size, "target desktop size");
         *reported_size = Some(size);
         send_event(
             event_tx,
