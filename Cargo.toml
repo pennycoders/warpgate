@@ -36,6 +36,8 @@ members = [
 exclude = [
     "vendor/ironrdp-async",
     "vendor/ironrdp-connector",
+    "vendor/ironrdp-dvc",
+    "vendor/ironrdp-rdpsnd",
     "vendor/ironrdp-server",
     "vendor/ironrdp-session",
 ]
@@ -45,6 +47,8 @@ resolver = "2"
 [patch.crates-io]
 ironrdp-async = { path = "vendor/ironrdp-async" }
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
+ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
+ironrdp-rdpsnd = { path = "vendor/ironrdp-rdpsnd" }
 ironrdp-server = { path = "vendor/ironrdp-server" }
 ironrdp-session = { path = "vendor/ironrdp-session" }
 

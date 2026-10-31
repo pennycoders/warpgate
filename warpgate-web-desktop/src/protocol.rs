@@ -220,7 +220,10 @@ impl ServerMessage {
         Some(match event {
             // The browser client doesn't draw the target's cursor shape, so there is nothing
             // to tell it when the cursor reverts or hides.
-            DesktopEvent::State(_) | DesktopEvent::CursorDefault | DesktopEvent::CursorHidden => {
+            DesktopEvent::State(_)
+            | DesktopEvent::CursorDefault
+            | DesktopEvent::CursorHidden
+            | DesktopEvent::Audio(_) => {
                 return None;
             }
             DesktopEvent::Resize { width, height } => Self::Resize { width, height },
@@ -249,5 +252,20 @@ impl ServerMessage {
             DesktopEvent::Bell => Self::Bell,
             DesktopEvent::Error(message) => Self::Error { message },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use warpgate_core::DesktopEvent;
+
+    use super::ServerMessage;
+
+    #[test]
+    fn sound_is_not_sent_to_the_browser() {
+        assert!(
+            ServerMessage::from_event(DesktopEvent::Audio(Bytes::from_static(&[0; 4]))).is_none()
+        );
     }
 }

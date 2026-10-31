@@ -70,6 +70,7 @@ async fn frame_bridge(
             DesktopEvent::CursorDefault => ServerInput::CursorDefault,
             DesktopEvent::CursorHidden => ServerInput::CursorHidden,
             DesktopEvent::Clipboard(text) => ServerInput::Clipboard(text),
+            DesktopEvent::Audio(data) => ServerInput::Audio(data),
             DesktopEvent::State(DesktopState::Disconnected) => {
                 let _ = server_in.send(ServerInput::Shutdown).await;
                 return;
@@ -128,4 +129,42 @@ pub(super) async fn connect_backend(
         recorder,
         dialed_at: Some(screen),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+    use warpgate_core::{DesktopEvent, DesktopState};
+
+    use super::frame_bridge;
+    use crate::server::protocol::Input;
+
+    #[tokio::test]
+    async fn sound_reaches_the_viewer_in_order_with_the_frames() {
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (server_tx, mut server_rx) = mpsc::channel(8);
+        event_tx
+            .send(DesktopEvent::Resize {
+                width: 1,
+                height: 1,
+            })
+            .await
+            .unwrap();
+        event_tx
+            .send(DesktopEvent::Audio(Bytes::from_static(&[1, 2, 3, 4])))
+            .await
+            .unwrap();
+        event_tx
+            .send(DesktopEvent::State(DesktopState::Disconnected))
+            .await
+            .unwrap();
+        frame_bridge(event_rx, server_tx, None).await;
+
+        assert!(matches!(server_rx.recv().await, Some(Input::Resize { .. })));
+        assert!(
+            matches!(server_rx.recv().await, Some(Input::Audio(data)) if data[..] == [1, 2, 3, 4])
+        );
+        assert!(matches!(server_rx.recv().await, Some(Input::Shutdown)));
+    }
 }
