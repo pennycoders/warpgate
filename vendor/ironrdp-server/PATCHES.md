@@ -79,6 +79,18 @@ ends with an MCS Disconnect Provider Ultimatum (`ProviderInitiated`) at the end 
 `client_loop` in `src/server.rs`. Warpgate uses this to pass the target's reason for ending
 a session on to the viewer.
 
+## A pointer the client cannot take becomes its default pointer
+
+The base already carries upstream's large pointer support (#1786, #1787): the server reads
+the client's `pointerCacheSize` and Large Pointer Capability Set, advertises its own, and
+the encoder promotes an `RGBAPointer` above the client's New Pointer ceiling to a Large
+Pointer Update when the client takes those. Where it cannot send the shape at all (no New
+Pointer Update support, larger than the client takes, or a `LargePointer` the client has no
+384x384 support for), upstream drops the update and the client keeps showing the previous
+shape. `warpgate.patch` sends the default pointer instead (`EncoderIter::next` in
+`src/encoder/mod.rs`), so a viewer never keeps a shape the target has left. Warpgate does
+not know a viewer's pointer capabilities when it builds the update; the encoder does.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same
