@@ -1,0 +1,10 @@
+#![cfg_attr(doc, doc = include_str!("../README.md"))]
+#![doc(html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg")]
+
+pub mod client;
+pub mod codec;
+pub mod dvc;
+pub mod pcm;
+pub mod pdu;
+pub mod playout;
+pub mod server;

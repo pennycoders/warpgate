@@ -40,6 +40,7 @@ pub enum Input {
     CursorDefault,
     CursorHidden,
     Clipboard(String),
+    Audio(Bytes),
     Shutdown,
     /// End the session, telling the viewer why with this RDP error info code.
     Disconnect(u32),

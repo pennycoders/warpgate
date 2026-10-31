@@ -31,6 +31,7 @@ use warpgate_desktop_ui::DEFAULT_SIZE;
 
 use super::clipboard::ViewerClipboard;
 use super::protocol::{AuthVerdict, Event, Input};
+use super::sound::ViewerSound;
 use crate::desktop_size::{MAX_DESKTOP_DIM, bound_desktop_size};
 #[cfg(test)]
 use crate::desktop_size::{MAX_FRAME_BYTES, MIN_DESKTOP_DIM};
@@ -99,6 +100,7 @@ where
     }));
 
     let clipboard = ViewerClipboard::new(out_tx.clone());
+    let sound = ViewerSound::new();
     let display_route = DisplayRouteState {
         size: Arc::clone(&size),
         out: out_tx.clone(),
@@ -136,6 +138,8 @@ where
         }))
         .with_credential_validator(Some(validator))
         .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
+        // Offered to every viewer: the target is not known yet when channels are joined.
+        .with_sound_factory(Some(Box::new(sound.clone())))
         .build();
 
     let router = tokio::spawn(
@@ -144,6 +148,7 @@ where
             frame_tx,
             display_route,
             clipboard,
+            sound,
             server.event_sender().clone(),
         )
         .in_current_span(),
@@ -195,6 +200,7 @@ async fn route_input(
     frame_tx: mpsc::Sender<DisplayUpdate>,
     display: DisplayRouteState,
     clipboard: ViewerClipboard,
+    sound: ViewerSound,
     server_events: mpsc::UnboundedSender<ServerEvent>,
 ) {
     while let Some(msg) = rx.recv().await {
@@ -254,6 +260,7 @@ async fn route_input(
                 }
             }
             Input::Clipboard(text) => clipboard.offer(text),
+            Input::Audio(data) => sound.play(&data),
             Input::Shutdown => break,
             Input::Disconnect(code) => {
                 match decode::<ServerSetErrorInfoPdu>(&code.to_le_bytes()) {
@@ -880,7 +887,7 @@ mod disconnect_tests {
     use ironrdp_server::{DesktopSize, DisplayUpdate, ServerEvent};
     use tokio::sync::{Mutex, mpsc};
 
-    use super::{DisplayRouteState, Input, ViewerClipboard, route_input};
+    use super::{DisplayRouteState, Input, ViewerClipboard, ViewerSound, route_input};
 
     struct Router {
         input: mpsc::Sender<Input>,
@@ -906,6 +913,7 @@ mod disconnect_tests {
             frame_tx,
             display,
             ViewerClipboard::new(out),
+            ViewerSound::new(),
             server_events,
         ));
         Router {
