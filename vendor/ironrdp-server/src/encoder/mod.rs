@@ -560,7 +560,7 @@ pub(crate) struct EncoderIter<'a> {
 impl EncoderIter<'_> {
     #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
     pub(crate) async fn next(&mut self) -> Option<ServerResult<UpdateFragmenter>> {
-        loop {
+        'updates: loop {
             let state = core::mem::take(&mut self.state);
             let pointer = matches!(
                 state,
@@ -593,21 +593,24 @@ impl EncoderIter<'_> {
                         continue;
                     }
                     DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
-                    DisplayUpdate::RGBAPointer(ptr) => {
+                    // Warpgate fork: a shape the client cannot take goes out as its default
+                    // pointer rather than being dropped, so the client never keeps showing a
+                    // shape the display has already left.
+                    DisplayUpdate::RGBAPointer(ptr) => 'shape: {
                         if encoder.pointer_cache_size == 0 {
-                            debug!("Dropping RGBAPointer update: client did not advertise New Pointer Update support");
-                            continue;
+                            debug!("Sending the default pointer: client did not advertise New Pointer Update support");
+                            break 'shape UpdateEncoder::default_pointer();
                         }
                         let Some(large) = encoder.pointer_needs_large_update(ptr.width, ptr.height) else {
                             debug!(
-                                "Dropping RGBAPointer update: {}x{} exceeds the client's negotiated pointer size \
+                                "Sending the default pointer: {}x{} exceeds the client's negotiated pointer size \
                                  ceiling",
                                 ptr.width, ptr.height,
                             );
-                            continue;
+                            break 'shape UpdateEncoder::default_pointer();
                         };
                         if !UpdateEncoder::cache_index_ok("RGBAPointer", ptr.cache_index, encoder.pointer_cache_size) {
-                            continue;
+                            continue 'updates;
                         }
                         if large {
                             UpdateEncoder::large_pointer(LargePointer {
@@ -622,27 +625,27 @@ impl EncoderIter<'_> {
                             UpdateEncoder::rgba_pointer(ptr)
                         }
                     }
-                    DisplayUpdate::LargePointer(ptr) => {
+                    DisplayUpdate::LargePointer(ptr) => 'shape: {
                         if encoder.pointer_cache_size == 0 {
-                            debug!("Dropping LargePointer update: client did not advertise New Pointer Update support");
-                            continue;
+                            debug!("Sending the default pointer: client did not advertise New Pointer Update support");
+                            break 'shape UpdateEncoder::default_pointer();
                         }
                         if !encoder.large_pointer_update_supported() {
                             debug!(
-                                "Dropping LargePointer update: client did not advertise \
+                                "Sending the default pointer: client did not advertise \
                                  LARGE_POINTER_FLAG_384x384 support"
                             );
-                            continue;
+                            break 'shape UpdateEncoder::default_pointer();
                         }
                         if 384 < ptr.width || 384 < ptr.height {
                             debug!(
-                                "Dropping LargePointer update: {}x{} exceeds the 384x384 protocol maximum",
+                                "Sending the default pointer: {}x{} exceeds the 384x384 protocol maximum",
                                 ptr.width, ptr.height,
                             );
-                            continue;
+                            break 'shape UpdateEncoder::default_pointer();
                         }
                         if !UpdateEncoder::cache_index_ok("LargePointer", ptr.cache_index, encoder.pointer_cache_size) {
-                            continue;
+                            continue 'updates;
                         }
                         UpdateEncoder::large_pointer(ptr)
                     }

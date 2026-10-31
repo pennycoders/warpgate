@@ -383,9 +383,12 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
              let mut x = rect.x;
              let x_end = rect.x + rect.width;
              while x < x_end {
-@@ -473,6 +562,18 @@
+@@ -471,8 +560,20 @@
+ impl EncoderIter<'_> {
+     #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
      pub(crate) async fn next(&mut self) -> Option<ServerResult<UpdateFragmenter>> {
-         loop {
+-        loop {
++        'updates: loop {
              let state = core::mem::take(&mut self.state);
 +            let pointer = matches!(
 +                state,
@@ -402,21 +405,34 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
              let encoder = &mut self.encoder;
  
              let res = match state {
-@@ -497,15 +598,29 @@
-                             debug!("Dropping RGBAPointer update: client did not advertise New Pointer Update support");
-                             continue;
+@@ -492,43 +593,81 @@
+                         continue;
+                     }
+                     DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
+-                    DisplayUpdate::RGBAPointer(ptr) => {
++                    // Warpgate fork: a shape the client cannot take goes out as its default
++                    // pointer rather than being dropped, so the client never keeps showing a
++                    // shape the display has already left.
++                    DisplayUpdate::RGBAPointer(ptr) => 'shape: {
+                         if encoder.pointer_cache_size == 0 {
+-                            debug!("Dropping RGBAPointer update: client did not advertise New Pointer Update support");
+-                            continue;
++                            debug!("Sending the default pointer: client did not advertise New Pointer Update support");
++                            break 'shape UpdateEncoder::default_pointer();
                          }
 -                        if !encoder.color_or_new_pointer_size_ok(ptr.width, ptr.height) {
 +                        let Some(large) = encoder.pointer_needs_large_update(ptr.width, ptr.height) else {
                              debug!(
-                                 "Dropping RGBAPointer update: {}x{} exceeds the client's negotiated pointer size \
+-                                "Dropping RGBAPointer update: {}x{} exceeds the client's negotiated pointer size \
++                                "Sending the default pointer: {}x{} exceeds the client's negotiated pointer size \
                                   ceiling",
                                  ptr.width, ptr.height,
                              );
-                             continue;
+-                            continue;
++                            break 'shape UpdateEncoder::default_pointer();
 +                        };
 +                        if !UpdateEncoder::cache_index_ok("RGBAPointer", ptr.cache_index, encoder.pointer_cache_size) {
-+                            continue;
++                            continue 'updates;
 +                        }
 +                        if large {
 +                            UpdateEncoder::large_pointer(LargePointer {
@@ -432,15 +448,35 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
                          }
 -                        UpdateEncoder::rgba_pointer(ptr)
                      }
-                     DisplayUpdate::LargePointer(ptr) => {
+-                    DisplayUpdate::LargePointer(ptr) => {
++                    DisplayUpdate::LargePointer(ptr) => 'shape: {
                          if encoder.pointer_cache_size == 0 {
-@@ -526,9 +641,30 @@
-                             );
-                             continue;
+-                            debug!("Dropping LargePointer update: client did not advertise New Pointer Update support");
+-                            continue;
++                            debug!("Sending the default pointer: client did not advertise New Pointer Update support");
++                            break 'shape UpdateEncoder::default_pointer();
                          }
-+                        if !UpdateEncoder::cache_index_ok("LargePointer", ptr.cache_index, encoder.pointer_cache_size) {
-+                            continue;
+                         if !encoder.large_pointer_update_supported() {
+                             debug!(
+-                                "Dropping LargePointer update: client did not advertise \
++                                "Sending the default pointer: client did not advertise \
+                                  LARGE_POINTER_FLAG_384x384 support"
+                             );
+-                            continue;
++                            break 'shape UpdateEncoder::default_pointer();
+                         }
+                         if 384 < ptr.width || 384 < ptr.height {
+                             debug!(
+-                                "Dropping LargePointer update: {}x{} exceeds the 384x384 protocol maximum",
++                                "Sending the default pointer: {}x{} exceeds the 384x384 protocol maximum",
+                                 ptr.width, ptr.height,
+                             );
+-                            continue;
++                            break 'shape UpdateEncoder::default_pointer();
 +                        }
++                        if !UpdateEncoder::cache_index_ok("LargePointer", ptr.cache_index, encoder.pointer_cache_size) {
++                            continue 'updates;
+                         }
                          UpdateEncoder::large_pointer(ptr)
                      }
 -                    DisplayUpdate::ColorPointer(ptr) => UpdateEncoder::color_pointer(ptr),
@@ -466,7 +502,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
                      DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
                      DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
                      DisplayUpdate::CachedPointer(idx) => {
-@@ -538,6 +674,11 @@
+@@ -538,6 +677,11 @@
                              );
                              continue;
                          }
@@ -478,7 +514,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
                          UpdateEncoder::cached_pointer(idx)
                      }
                      DisplayUpdate::Resize(_) => return None,
-@@ -617,7 +758,32 @@
+@@ -617,7 +761,32 @@
                  State::Ended => return None,
              };
  
@@ -512,7 +548,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
          }
      }
  }
-@@ -772,6 +938,7 @@
+@@ -772,6 +941,7 @@
      codec_id: u8,
      desktop_size: Option<DesktopSize>,
      command: SurfaceBitsCommand,
@@ -520,7 +556,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
  }
  
  impl RemoteFxHandler {
-@@ -787,6 +954,7 @@
+@@ -787,6 +957,7 @@
              desktop_size: Some(desktop_size),
              codec_id,
              command,
@@ -528,7 +564,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
          }
      }
  
-@@ -797,16 +965,19 @@
+@@ -797,16 +968,19 @@
  
  impl BitmapUpdateHandler for RemoteFxHandler {
      fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
@@ -555,7 +591,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
                      }
                      _ => return Err(ServerError::encode(e)).with_context("RemoteFX encode error"),
                  },
-@@ -814,7 +985,7 @@
+@@ -814,7 +988,7 @@
              }
          };
  
