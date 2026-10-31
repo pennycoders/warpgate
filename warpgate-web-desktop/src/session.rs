@@ -161,7 +161,10 @@ impl WebDesktopSession {
         {
             warn!(%error, "Failed to record web-desktop viewer input");
         }
-        if matches!(input, DesktopInput::ClipboardTransfer(_)) {
+        if matches!(
+            input,
+            DesktopInput::ClipboardTransfer(_) | DesktopInput::DriveUpload(_)
+        ) {
             // A lost file step would stall a transfer until it times out; these are paced
             // by the pull model, so waiting for room is cheap.
             let _ = backend.input_tx.send(input).await;

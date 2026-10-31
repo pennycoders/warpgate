@@ -4,6 +4,8 @@
         faDownload,
         faExpand,
         faFile,
+        faHardDrive,
+        faXmark,
     } from '@fortawesome/free-solid-svg-icons'
     import { Button } from '@sveltestrap/sveltestrap'
     import {
@@ -121,6 +123,33 @@
                   .filter(({ file }) => !file.directory)
             : [],
     )
+    const driveEnabled = $derived(
+        filesVersion >= 0 && files.driveMaxBytes !== null,
+    )
+    const driveFiles = $derived(filesVersion >= 0 ? files.driveFiles : [])
+    let driveOpen = $state(false)
+    let uploading = $state<{ name: string; sent: number; size: number } | null>(
+        null,
+    )
+    let driveInput: HTMLInputElement | undefined = $state()
+
+    async function uploadToDrive(list: FileList | null | undefined) {
+        const picked = Array.from(list ?? [])
+        for (const file of picked) {
+            uploading = { name: file.name, sent: 0, size: file.size }
+            const stored = await files.uploadToDrive(file, sent => {
+                uploading = { name: file.name, sent, size: file.size }
+            })
+            if (!stored) {
+                filesNotice = `${file.name} was not stored on the Uploads drive`
+            }
+        }
+        uploading = null
+        if (driveInput) {
+            driveInput.value = ''
+        }
+    }
+
     let filesOpen = $state(false)
     let filesNotice: string | null = $state(null)
     let download = $state<DownloadProgress | null>(null)
@@ -172,7 +201,10 @@
     }
 
     function onDragOver(e: DragEvent) {
-        if (filesEnabled && e.dataTransfer?.types.includes('Files')) {
+        if (
+            (filesEnabled || driveEnabled) &&
+            e.dataTransfer?.types.includes('Files')
+        ) {
             e.preventDefault()
             e.dataTransfer.dropEffect = 'copy'
         }
@@ -182,6 +214,11 @@
     // clipboard and the user pastes them where they want them.
     function onDrop(e: DragEvent) {
         if (!filesEnabled) {
+            // Without the clipboard, a drop goes to the Uploads drive.
+            if (driveEnabled) {
+                e.preventDefault()
+                void uploadToDrive(e.dataTransfer?.files)
+            }
             return
         }
         e.preventDefault()
@@ -622,6 +659,16 @@
         {#if filesNotice}
             <span class="text-muted small">{filesNotice}</span>
         {/if}
+        {#if driveEnabled}
+            <button
+                type="button"
+                class="btn btn-link"
+                title="Files on the remote's Uploads drive"
+                onclick={() => (driveOpen = !driveOpen)}
+            >
+                <Fa icon={faHardDrive} fw />
+            </button>
+        {/if}
         {#if filesEnabled}
             <button
                 type="button"
@@ -648,6 +695,55 @@
             Disconnect
         </Button>
     </div>
+
+    {#if driveOpen && driveEnabled}
+        <div class="files-panel small p-2">
+            <div class="d-flex align-items-center gap-2 mb-1">
+                <span class="me-auto text-muted"
+                    >Uploads drive on the remote (read-only there)</span
+                >
+                <button
+                    type="button"
+                    class="btn btn-sm btn-outline-secondary"
+                    disabled={!!uploading}
+                    onclick={() => driveInput?.click()}
+                >
+                    Upload files
+                </button>
+                <input
+                    bind:this={driveInput}
+                    type="file"
+                    multiple
+                    hidden
+                    onchange={e => uploadToDrive(e.currentTarget.files)}
+                >
+            </div>
+            {#each driveFiles as file (file.id)}
+                <div class="d-flex align-items-center gap-2">
+                    <span class="me-auto text-truncate" title={file.name}
+                        >{file.name}</span
+                    >
+                    <span class="text-muted">{formatSize(file.size)}</span>
+                    <button
+                        type="button"
+                        class="btn btn-link btn-sm"
+                        title="Remove from the drive"
+                        onclick={() => files.removeFromDrive(file.id)}
+                    >
+                        <Fa icon={faXmark} fw />
+                    </button>
+                </div>
+            {/each}
+            {#if uploading}
+                <div class="text-truncate">{uploading.name}</div>
+                <progress
+                    class="w-100"
+                    max={uploading.size}
+                    value={uploading.sent}
+                ></progress>
+            {/if}
+        </div>
+    {/if}
 
     {#if filesOpen && remoteFiles.length}
         <div class="files-panel small p-2">
