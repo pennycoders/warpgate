@@ -54,6 +54,7 @@ pub fn run_on_thread<S>(
     graphics_pipeline: bool,
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
+    drives: super::ViewerDrives,
 ) -> oneshot::Receiver<Result<()>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -82,6 +83,7 @@ where
                 graphics_pipeline,
                 out_tx,
                 in_rx,
+                drives,
             )
             .instrument(span),
         );
@@ -99,6 +101,7 @@ async fn run<S>(
     graphics_pipeline: bool,
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
+    drives: super::ViewerDrives,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -165,6 +168,7 @@ where
             graphics_pipeline.then(|| Box::new(graphics.factory()) as Box<dyn GfxServerFactory>),
         )
         .with_bitmap_codecs(bitmap_codecs(graphics_pipeline))
+        .with_rdpdr_factory(Some(Box::new(drives)))
         .build();
 
     let router = tokio::spawn(

@@ -40,7 +40,10 @@ use crate::session_handle::RdpSessionHandle;
 
 mod bridge;
 mod clipboard;
+mod drives;
 mod gfx;
+
+pub(crate) use drives::ViewerDrives;
 mod hold_screen;
 mod microphone;
 mod protocol;
@@ -177,6 +180,9 @@ async fn handle_connection(
     // (TLS) RDP bytes across.
     let (server_side, mut relay_side) = tokio::io::duplex(RELAY_BUFFER_BYTES);
     let graphics_pipeline = services.config.lock().await.store.rdp.graphics_pipeline;
+    // The viewer's redirected drives, accepted as it announces them and relayed only once
+    // a target that allows drive redirection is up.
+    let drives = ViewerDrives::default();
     let mut rdp_done = rdp::run_on_thread(
         server_side,
         cert_pem,
@@ -185,12 +191,13 @@ async fn handle_connection(
         graphics_pipeline,
         server_out_tx,
         server_in_rx,
+        drives.clone(),
     );
 
     // Run the RDP server and the control loop concurrently; whichever ends first tears
     // the session down.
     tokio::select! {
-        result = control_loop(services, server_handle, remote_address, server_out_rx, server_in_tx) => {
+        result = control_loop(services, server_handle, remote_address, server_out_rx, server_in_tx, drives) => {
             result?;
         }
         result = &mut rdp_done => {
@@ -218,6 +225,7 @@ async fn control_loop(
     remote_address: SocketAddr,
     mut events: UnboundedReceiver<ServerEvent>,
     server_in_tx: Sender<ServerInput>,
+    drives: ViewerDrives,
 ) -> Result<()> {
     let mut backend: Option<BackendBridge> = None;
     // Authorized target awaiting the first `Size` event before we dial it. The RDP
@@ -292,6 +300,7 @@ async fn control_loop(
                                     remote_address,
                                     &mut events,
                                     &mut screen,
+                                    &drives,
                                 )
                                 .await?
                                 {
@@ -350,6 +359,7 @@ async fn control_loop(
                                             remote_address,
                                             &mut events,
                                             &mut screen,
+                                            &drives,
                                         )
                                         .await?
                                         {
@@ -397,6 +407,7 @@ async fn control_loop(
                     remote_address,
                     &mut events,
                     &mut screen,
+                    &drives,
                 )
                 .await?
                 {
@@ -465,6 +476,7 @@ async fn control_loop(
             remote_address,
             &mut events,
             &mut screen,
+            &drives,
         )
         .await?
         {
@@ -537,6 +549,7 @@ async fn dial_if_pending(
     remote_address: SocketAddr,
     events: &mut UnboundedReceiver<ServerEvent>,
     screen: &mut warpgate_desktop_ui::Screen,
+    drives: &ViewerDrives,
 ) -> Result<bool> {
     if backend.is_none()
         && let Some(authorization) = pending.take()
@@ -567,7 +580,8 @@ async fn dial_if_pending(
             }
             Err(error) => return Err(error.into()),
         };
-        *backend = Some(connect_backend(services, server_in_tx, admitted, *screen).await?);
+        *backend =
+            Some(connect_backend(services, server_in_tx, admitted, *screen, drives.clone()).await?);
     }
     Ok(true)
 }

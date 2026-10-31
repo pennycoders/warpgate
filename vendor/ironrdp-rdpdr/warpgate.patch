@@ -1,0 +1,221 @@
+diff -ru ironrdp-rdpdr-0.9.0/src/pdu/efs.rs base/src/pdu/efs.rs
+--- ironrdp-rdpdr-0.9.0/src/pdu/efs.rs	2026-10-31 11:45:53.907016527 +0200
++++ base/src/pdu/efs.rs	2026-10-31 11:45:53.918581070 +0200
+@@ -1525,7 +1525,7 @@
+         self.preferred_dos_name.0.strip_prefix("PRN")?.parse().ok()
+     }
+ 
+-    pub(crate) fn device_type(&self) -> DeviceType {
++    pub fn device_type(&self) -> DeviceType {
+         self.device_type
+     }
+ 
+@@ -5593,9 +5593,9 @@
+ /// [2.2.3.4.9]: https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpefs/16b893d5-5d8b-49d1-8dcb-ee21e7612970
+ #[derive(Debug, PartialEq, Clone)]
+ pub struct ClientDriveSetInformationResponse {
+-    pub(crate) device_io_reply: DeviceIoResponse,
++    pub device_io_reply: DeviceIoResponse,
+     /// This field MUST be equal to the Length field in the Server Drive Set Information Request (section 2.2.3.3.9).
+-    pub(crate) length: u32,
++    pub length: u32,
+ }
+ 
+ impl ClientDriveSetInformationResponse {
+diff -ru ironrdp-rdpdr-0.9.0/src/server.rs base/src/server.rs
+--- ironrdp-rdpdr-0.9.0/src/server.rs	2026-10-31 11:45:53.901313527 +0200
++++ base/src/server.rs	2026-10-31 11:45:53.914332789 +0200
+@@ -32,7 +32,7 @@
+     SecurityInformation, ServerDeviceAnnounceResponse, ServerDriveLockControlRequest,
+     ServerDriveNotifyChangeDirectoryRequest, ServerDriveQueryDirectoryRequest, ServerDriveQueryInformationRequest,
+     ServerDriveQuerySecurityRequest, ServerDriveQueryVolumeInformationRequest, ServerDriveSetInformationRequest,
+-    ServerDriveSetSecurityRequest, SharedAccess, VERSION_MAJOR, VERSION_MINOR_13, VersionAndIdPdu, VersionAndIdPduKind,
++    ServerDriveIoRequest, ServerDriveSetSecurityRequest, SharedAccess, VERSION_MAJOR, VERSION_MINOR_13, VersionAndIdPdu, VersionAndIdPduKind,
+ };
+ use crate::pdu::{Component, PacketId, RdpdrPdu, SharedHeader};
+ 
+@@ -165,6 +165,18 @@
+         }
+     }
+ 
++    /// Registers `irp` under a `CompletionId` chosen by the caller. Returns `false`, and
++    /// registers nothing, if that id is already pending.
++    fn register_as(&mut self, completion_id: u32, irp: PendingIrp) -> bool {
++        match self.pending.entry(completion_id) {
++            std::collections::hash_map::Entry::Vacant(entry) => {
++                entry.insert(irp);
++                true
++            }
++            std::collections::hash_map::Entry::Occupied(_) => false,
++        }
++    }
++
+     /// Looks up and removes the pending IRP for `completion_id`, if any.
+     ///
+     /// `None` means the completion doesn't match anything this server sent: an
+@@ -230,6 +242,13 @@
+     fn on_query_security_complete(&mut self, response: &ClientDriveQuerySecurityResponse) -> PduResult<()>;
+     fn on_set_security_complete(&mut self, response: &ClientDriveSetSecurityResponse) -> PduResult<()>;
+ 
++    /// A request given to [`RdpdrServer::forward_drive_io_request`] could not be sent.
++    ///
++    /// Defaulted to a no-op for backends that never forward.
++    fn on_forward_rejected(&mut self, request: ServerDriveIoRequest) {
++        let _ = request;
++    }
++
+     /// Notifies the backend that the RDPDR channel is closing.
+     ///
+     /// Defaulted to a no-op: this module has no call site for it yet. `SvcProcessor`
+@@ -413,6 +432,9 @@
+         input_buffer: Vec<u8>,
+         output_buffer_length: u32,
+     },
++    /// A drive request taken from another RDPDR channel, sent with
++    /// [`RdpdrServer::forward_drive_io_request`].
++    Forward(ServerDriveIoRequest),
+ }
+ 
+ /// Server-side [\[MS-RDPEFS\]] channel handler.
+@@ -545,7 +567,11 @@
+             "received ClientCoreCapabilityResponse"
+         );
+         self.state = RdpdrServerState::Active;
+-        Ok(Vec::new())
++        // [MS-RDPEFS] 3.2.5.1.6: a client announces its drives (anything but smart
++        // cards) only after the Server User Logged On PDU. This server has no logon of its
++        // own to wait for -- it serves an already-authenticated session -- so it says so
++        // as soon as the channel is up; without it no drive is ever announced.
++        Ok(vec![SvcMessage::from(RdpdrPdu::UserLoggedon)])
+     }
+ 
+     fn handle_device_list_announce(&mut self, src: &mut ReadCursor<'_>) -> PduResult<Vec<SvcMessage>> {
+@@ -675,6 +701,110 @@
+         Ok(vec![SvcMessage::from(bytes)])
+     }
+ 
++    /// Sends a drive request decoded from another RDPDR channel, keeping its `DeviceId`,
++    /// `FileId` and `CompletionId`.
++    ///
++    /// This is what a proxy terminating RDPDR on both sides needs: the request a server
++    /// sent it is re-encoded whole to the client that owns the drive, rather than rebuilt
++    /// through the `drive_*` methods, which pick their own completion ids and fix some
++    /// fields (create attributes and share access). Keeping the server's ids means the
++    /// client's completion can be handed back to that server unchanged.
++    ///
++    /// The device must have been announced by this client and accepted, and the
++    /// `CompletionId` must not already be pending. Device control is not forwarded: its
++    /// input buffer is not part of [`ServerDriveIoRequest`]. A request that can't be sent
++    /// goes to [`RdpdrServerBackend::on_forward_rejected`] instead of failing the channel,
++    /// so the proxy can complete it toward the server it came from.
++    pub fn forward_drive_io_request(&mut self, request: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
++        match self.try_forward_drive_io_request(&request) {
++            Ok(messages) => Ok(messages),
++            Err(error) => {
++                warn!(%error, "not forwarding drive request");
++                self.backend.on_forward_rejected(request);
++                Ok(Vec::new())
++            }
++        }
++    }
++
++    fn try_forward_drive_io_request(&mut self, request: &ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
++        if self.state != RdpdrServerState::Active {
++            return Err(pdu_other_err!("RdpdrServer", "drive I/O requires an active session"));
++        }
++        let (header, pending) = match request {
++            ServerDriveIoRequest::ServerCreateDriveRequest(r) => (&r.device_io_request, PendingIrp::Create),
++            ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => (
++                &r.device_io_request,
++                PendingIrp::QueryInformation {
++                    info_class: r.file_info_class_lvl.clone(),
++                },
++            ),
++            ServerDriveIoRequest::DeviceCloseRequest(r) => (&r.device_io_request, PendingIrp::Close),
++            ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) => (
++                &r.device_io_request,
++                PendingIrp::QueryDirectory {
++                    info_class: r.file_info_class_lvl.clone(),
++                },
++            ),
++            ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(r) => {
++                (&r.device_io_request, PendingIrp::NotifyChangeDirectory)
++            }
++            ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(r) => (
++                &r.device_io_request,
++                PendingIrp::QueryVolumeInformation {
++                    volume_info_class: r.fs_info_class_lvl.clone(),
++                },
++            ),
++            ServerDriveIoRequest::DeviceControlRequest(_) => {
++                return Err(pdu_other_err!("RdpdrServer", "device control requests are not forwarded"));
++            }
++            ServerDriveIoRequest::DeviceReadRequest(r) => (&r.device_io_request, PendingIrp::Read),
++            ServerDriveIoRequest::DeviceWriteRequest(r) => (&r.device_io_request, PendingIrp::Write),
++            ServerDriveIoRequest::DeviceFlushBuffersRequest(r) => (&r.device_io_request, PendingIrp::FlushBuffers),
++            ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => {
++                (&r.device_io_request, PendingIrp::SetInformation)
++            }
++            ServerDriveIoRequest::ServerDriveLockControlRequest(r) => (&r.device_io_request, PendingIrp::LockControl),
++            ServerDriveIoRequest::ServerDriveQuerySecurityRequest(r) => {
++                (&r.device_io_request, PendingIrp::QuerySecurity)
++            }
++            ServerDriveIoRequest::ServerDriveSetSecurityRequest(r) => (&r.device_io_request, PendingIrp::SetSecurity),
++        };
++        let (device_id, completion_id) = (header.device_id, header.completion_id);
++        if !self.devices.contains_key(&device_id) {
++            return Err(pdu_other_err!(
++                "RdpdrServer",
++                "drive request for a device the client did not announce"
++            ));
++        }
++        if !self.pending_irps.register_as(completion_id, pending) {
++            return Err(pdu_other_err!("RdpdrServer", "forwarded CompletionId is already pending"));
++        }
++        let encoded = match request {
++            ServerDriveIoRequest::ServerCreateDriveRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::DeviceCloseRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::DeviceReadRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::DeviceWriteRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::DeviceFlushBuffersRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::ServerDriveLockControlRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::ServerDriveQuerySecurityRequest(r) => encode_drive_request(r),
++            ServerDriveIoRequest::ServerDriveSetSecurityRequest(r) => encode_drive_request(r),
++            // Returned above.
++            ServerDriveIoRequest::DeviceControlRequest(_) => Ok(Vec::new()),
++        };
++        match encoded {
++            Ok(bytes) => Ok(vec![SvcMessage::from(bytes)]),
++            Err(error) => {
++                self.pending_irps.complete(completion_id);
++                Err(encode_err!(error))
++            }
++        }
++    }
++
+     /// Opens or creates a file on a client-redirected drive.
+     ///
+     /// `file_attributes` is fixed at none (the client applies its own defaults) and
+@@ -1010,6 +1140,17 @@
+     }
+ }
+ 
++/// A `PAKID_CORE_DEVICE_IOREQUEST` carrying `request`, framed as
++/// [`RdpdrServer::send_device_io_request`] frames it.
++fn encode_drive_request<T: DriveRequestBody>(request: &T) -> EncodeResult<Vec<u8>> {
++    let mut bytes = vec![0u8; SHARED_HEADER_SIZE + request.wire_size()];
++    let mut dst = WriteCursor::new(&mut bytes);
++    dst.write_u16(Component::RdpdrCtypCore.into());
++    dst.write_u16(PacketId::CoreDeviceIoRequest.into());
++    request.encode_into(&mut dst)?;
++    Ok(bytes)
++}
++
+ /// A drive request type whose `.encode()`/`.size()` already include its
+ /// [`DeviceIoRequest`] header, letting [`RdpdrServer::send_device_io_request`] treat
+ /// every request type uniformly.

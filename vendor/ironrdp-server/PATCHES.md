@@ -102,6 +102,12 @@ Upstream leaves the server's platform unspecified. Windows and xrdp report Windo
 the device only on servers it takes for Windows 8.1 or later. The fork reports Windows NT
 (`general_capabilities` in `src/capabilities.rs`).
 
+## Forwarded drive requests
+
+`RdpdrServerMessage::Forward` (added by the `ironrdp-rdpdr` fork, see its PATCHES.md) is
+dispatched to `RdpdrServer::forward_drive_io_request`, next to the other RDPDR messages.
+Drop with the `ironrdp-rdpdr` fork.
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the

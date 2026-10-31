@@ -4065,6 +4065,7 @@ impl RdpServer {
                             input_buffer,
                             output_buffer_length,
                         ),
+                        RdpdrServerMessage::Forward(request) => rdpdr.forward_drive_io_request(request),
                     }
                     .map_err_kind("failed to send rdpdr event", ServerErrorKind::Pdu)?;
                     let channel_id = conn

@@ -8331,6 +8331,24 @@
             "default": 100,
             "maximum": 65536.0,
             "minimum": 1.0
+          },
+          "drive_redirection": {
+            "type": "boolean",
+            "description": "Redirect drives to the target: a native client's own redirected drives, relayed\nby Warpgate, or in the browser a session drive holding files the user uploads.",
+            "default": false
+          },
+          "drive_read_only": {
+            "type": "boolean",
+            "description": "Let the target only read redirected drives, never create, change or delete files\non them. The browser's session drive is always read-only.",
+            "default": true
+          },
+          "drive_uploads_max_mb": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "Capacity of the browser's session drive, in MiB.",
+            "default": 100,
+            "maximum": 65536.0,
+            "minimum": 1.0
           }
         }
       },
