@@ -16,8 +16,8 @@ use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntr
 use ironrdp_pdu::rdp::server_error_info::ServerSetErrorInfoPdu;
 use ironrdp_server::{
     BitmapUpdate, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
-    DesktopSize, DisplayContext, DisplayUpdate, KeyboardEvent, MouseButton, MouseEvent,
-    PixelFormat, RGBAPointer, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
+    DesktopSize, DisplayContext, DisplayUpdate, GfxServerFactory, KeyboardEvent, MouseButton,
+    MouseEvent, PixelFormat, RGBAPointer, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
     RdpServerInputHandler, ServerEvent, ServerResult,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -30,6 +30,7 @@ use warpgate_core::{DesktopInput, Scancode};
 use warpgate_desktop_ui::DEFAULT_SIZE;
 
 use super::clipboard::ViewerClipboard;
+use super::gfx::{Signal, ViewerGraphics};
 use super::protocol::{AuthVerdict, Event, Input};
 use super::sound::ViewerSound;
 use crate::desktop_size::{MAX_DESKTOP_DIM, bound_desktop_size};
@@ -47,6 +48,7 @@ pub fn run_on_thread<S>(
     cert_pem: String,
     key_pem: String,
     size: (u16, u16),
+    graphics_pipeline: bool,
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
 ) -> oneshot::Receiver<Result<()>>
@@ -68,8 +70,18 @@ where
                 return;
             }
         };
-        let result =
-            runtime.block_on(run(stream, cert_pem, key_pem, size, out_tx, in_rx).instrument(span));
+        let result = runtime.block_on(
+            run(
+                stream,
+                cert_pem,
+                key_pem,
+                size,
+                graphics_pipeline,
+                out_tx,
+                in_rx,
+            )
+            .instrument(span),
+        );
         let _ = done_tx.send(result);
     });
     done_rx
@@ -81,6 +93,7 @@ async fn run<S>(
     cert_pem: String,
     key_pem: String,
     size: (u16, u16),
+    graphics_pipeline: bool,
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
 ) -> Result<()>
@@ -101,6 +114,7 @@ where
 
     let clipboard = ViewerClipboard::new(out_tx.clone());
     let sound = ViewerSound::new();
+    let graphics = graphics_pipeline.then(ViewerGraphics::new);
     let display_route = DisplayRouteState {
         size: Arc::clone(&size),
         out: out_tx.clone(),
@@ -140,6 +154,11 @@ where
         .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
         // Offered to every viewer: the target is not known yet when channels are joined.
         .with_sound_factory(Some(Box::new(sound.clone())))
+        .with_gfx_factory(
+            graphics
+                .as_ref()
+                .map(|graphics| Box::new(graphics.factory()) as Box<dyn GfxServerFactory>),
+        )
         .build();
 
     let router = tokio::spawn(
@@ -149,6 +168,7 @@ where
             display_route,
             clipboard,
             sound,
+            graphics,
             server.event_sender().clone(),
         )
         .in_current_span(),
@@ -201,9 +221,26 @@ async fn route_input(
     display: DisplayRouteState,
     clipboard: ViewerClipboard,
     sound: ViewerSound,
+    mut graphics: Option<ViewerGraphics>,
     server_events: mpsc::UnboundedSender<ServerEvent>,
 ) {
-    while let Some(msg) = rx.recv().await {
+    loop {
+        let msg = tokio::select! {
+            msg = rx.recv() => msg,
+            Some(signal) = next_signal(graphics.as_mut()) => {
+                let size = *display.size.lock().await;
+                let updates = graphics.as_mut().map(|g| g.handle(signal, size));
+                for update in updates.unwrap_or_default() {
+                    if frame_tx.send(update).await.is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
+        };
+        let Some(msg) = msg else {
+            break;
+        };
         match msg {
             Input::Frame {
                 x,
@@ -212,6 +249,12 @@ async fn route_input(
                 height,
                 data,
             } => {
+                if let Some(graphics) = graphics.as_mut() {
+                    let size = *display.size.lock().await;
+                    if graphics.frame(size, x, y, width, height, &data) {
+                        continue;
+                    }
+                }
                 if let Some(update) = frame_to_update(x, y, width, height, data)
                     && frame_tx.send(update).await.is_err()
                 {
@@ -229,7 +272,8 @@ async fn route_input(
                     continue;
                 }
                 debug!(?previous, ?new, "viewer surface resized");
-                if frame_tx.send(DisplayUpdate::Resize(new)).await.is_err() {
+                let piped = graphics.as_mut().is_some_and(|g| g.resize(new));
+                if !piped && frame_tx.send(DisplayUpdate::Resize(new)).await.is_err() {
                     break;
                 }
                 let _ = display.out.send(Event::Size {
@@ -274,6 +318,13 @@ async fn route_input(
                 break;
             }
         }
+    }
+}
+
+async fn next_signal(graphics: Option<&mut ViewerGraphics>) -> Option<Signal> {
+    match graphics {
+        Some(graphics) => graphics.signal().await,
+        None => core::future::pending().await,
     }
 }
 
@@ -914,6 +965,7 @@ mod disconnect_tests {
             display,
             ViewerClipboard::new(out),
             ViewerSound::new(),
+            None,
             server_events,
         ));
         Router {
@@ -975,6 +1027,96 @@ mod disconnect_tests {
             .unwrap()
             .unwrap();
         assert!(router.events.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod graphics_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use ironrdp_core::encode_vec;
+    use ironrdp_dvc::DvcProcessor as _;
+    use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+    use ironrdp_server::{DesktopSize, DisplayUpdate, ServerEvent, ServerEventSender as _};
+    use tokio::sync::{Mutex, mpsc};
+
+    use super::{
+        DisplayRouteState, Input, ViewerClipboard, ViewerGraphics, ViewerSound, route_input,
+    };
+
+    struct Painter;
+
+    impl GraphicsPipelineHandler for Painter {}
+
+    fn frame() -> Input {
+        Input::Frame {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 12,
+            data: Bytes::from(vec![0x40; 8 * 12 * 4]),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_pipeline_takes_frames_and_resizes_from_the_bitmap_path() {
+        let graphics = ViewerGraphics::new();
+        let mut factory = graphics.factory();
+        let (server_events, mut events) = mpsc::unbounded_channel();
+        factory.set_sender(server_events.clone());
+        let (mut bridge, _) = factory.pipeline();
+        bridge.start(7).unwrap();
+
+        let (input, rx) = mpsc::channel(4);
+        let (frame_tx, mut frames) = mpsc::channel(4);
+        let (out, _) = mpsc::unbounded_channel();
+        let display = DisplayRouteState {
+            size: Arc::new(Mutex::new(DesktopSize {
+                width: 16,
+                height: 8,
+            })),
+            out: out.clone(),
+        };
+        tokio::spawn(route_input(
+            rx,
+            frame_tx,
+            display,
+            ViewerClipboard::new(out),
+            ViewerSound::new(),
+            Some(graphics),
+            server_events,
+        ));
+
+        input.send(frame()).await.unwrap();
+        assert!(matches!(
+            frames.recv().await,
+            Some(DisplayUpdate::Bitmap(_))
+        ));
+
+        let mut client = GraphicsPipelineClient::new(Box::new(Painter), None);
+        for advertise in client.start(7).unwrap() {
+            bridge
+                .process(7, &encode_vec(advertise.as_ref()).unwrap())
+                .unwrap();
+        }
+        assert!(matches!(events.recv().await, Some(ServerEvent::Egfx(_))));
+
+        input
+            .send(Input::Resize {
+                width: 8,
+                height: 12,
+            })
+            .await
+            .unwrap();
+        input.send(frame()).await.unwrap();
+        assert!(matches!(events.recv().await, Some(ServerEvent::Egfx(_))));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            frames.try_recv().is_err(),
+            "the bitmap path must not reactivate or paint under the pipeline"
+        );
     }
 }
 
