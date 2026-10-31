@@ -1,0 +1,20 @@
+Fork of `ironrdp-acceptor` 0.12.0.
+
+## Stray PDUs during reactivation
+
+During a deactivation-reactivation the acceptor waits for the Confirm Active, but a client
+keeps sending until it has processed the Deactivate All, so a Share Control PDU it sent
+before that can arrive first. Upstream already drops what does not decode as a Share
+Control PDU during reactivation, but ends the connection on one that does ("expected client
+confirm active"). Jump Desktop on macOS hits this every time Warpgate resizes the viewer
+to the target right after connecting; Windows App on iOS sometimes. The fork drops it too
+and logs it at `warn` (`AcceptorState::CapabilitiesWaitConfirm` in `src/connection.rs`).
+
+IronRDP master still ends the connection there; drop this fork once a release does not.
+
+(The `RDP` Demand Active source descriptor the 0.10.0 fork also carried is in 0.12.0,
+upstream #2119.)
+
+`Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
+so this vendored path dependency's warnings don't surface in Warpgate's builds. This is
+not in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
