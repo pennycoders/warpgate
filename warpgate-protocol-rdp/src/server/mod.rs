@@ -40,6 +40,7 @@ use crate::session_handle::RdpSessionHandle;
 
 mod bridge;
 mod clipboard;
+mod gfx;
 mod hold_screen;
 mod protocol;
 mod rdp;
@@ -173,11 +174,13 @@ async fn handle_connection(
     // stream is not, so the server runs against an in-memory duplex and we relay the raw
     // (TLS) RDP bytes across.
     let (server_side, mut relay_side) = tokio::io::duplex(RELAY_BUFFER_BYTES);
+    let graphics_pipeline = services.config.lock().await.store.rdp.graphics_pipeline;
     let mut rdp_done = rdp::run_on_thread(
         server_side,
         cert_pem,
         key_pem,
         (DEFAULT_SCREEN_W, DEFAULT_SCREEN_H),
+        graphics_pipeline,
         server_out_tx,
         server_in_rx,
     );

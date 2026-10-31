@@ -83,6 +83,7 @@
         "enable": false,
         "external_host": null,
         "external_port": null,
+        "graphics_pipeline": false,
         "key": "",
         "listen": "[::]:3389",
         "proxy_protocol": false
@@ -391,6 +392,11 @@
           "default": null,
           "maximum": 65535,
           "minimum": 0
+        },
+        "graphics_pipeline": {
+          "description": "Offer native viewers the Graphics Pipeline (MS-RDPEGFX), which resizes without a reactivation.",
+          "type": "boolean",
+          "default": false
         },
         "key": {
           "type": "string",
