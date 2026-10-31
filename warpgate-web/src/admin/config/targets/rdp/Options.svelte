@@ -140,3 +140,13 @@
     Plays sound from the target in native RDP clients, and in the web client
     once the viewer turns sound on.
 </HelpText>
+<Input
+    type="switch"
+    label="Let the target use the viewer's microphone"
+    bind:checked={options.microphone}
+/>
+<HelpText>
+    Lets the target record from the viewer's microphone in native RDP clients
+    that redirect it, and in the web client once the viewer turns the microphone
+    on.
+</HelpText>

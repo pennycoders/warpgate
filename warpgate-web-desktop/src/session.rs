@@ -46,6 +46,8 @@ pub struct WebDesktopSession {
     features: OnceLock<ServerMessage>,
     /// A viewer turned sound on. Sound is not sent before, as nothing would play it.
     audio_enabled: AtomicBool,
+    /// The target's recording, replayed to every viewer that attaches while it lasts.
+    microphone: std::sync::Mutex<Option<ServerMessage>>,
 }
 
 /// Buffers reused across refinement encodes. A settling screen refines many regions back to
@@ -81,6 +83,7 @@ impl WebDesktopSession {
             framebuffer: Mutex::new((Framebuffer::default(), RefineScratch::default())),
             features: OnceLock::new(),
             audio_enabled: AtomicBool::new(false),
+            microphone: std::sync::Mutex::new(None),
         }
     }
 
@@ -89,8 +92,11 @@ impl WebDesktopSession {
     }
 
     /// Tell viewers what the target offers; see [`ServerMessage::Features`].
-    pub async fn announce_features(&self, audio_playback: bool) {
-        let features = ServerMessage::Features { audio_playback };
+    pub async fn announce_features(&self, audio_playback: bool, microphone: bool) {
+        let features = ServerMessage::Features {
+            audio_playback,
+            microphone,
+        };
         if self.features.set(features.clone()).is_ok() {
             self.push(features).await;
         }
@@ -99,6 +105,27 @@ impl WebDesktopSession {
     /// The features for a viewer that just attached, once the backend has announced them.
     pub fn features(&self) -> Option<ServerMessage> {
         self.features.get().cloned()
+    }
+
+    /// Remember whether the target records, for viewers that attach later.
+    pub fn track_microphone(&self, message: &ServerMessage) {
+        let state = match message {
+            ServerMessage::MicrophoneOpen { .. } => Some(message.clone()),
+            ServerMessage::MicrophoneClose => None,
+            _ => return,
+        };
+        *self
+            .microphone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+    }
+
+    /// Whether the target records, for a viewer that just attached.
+    pub fn microphone(&self) -> Option<ServerMessage> {
+        self.microphone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {

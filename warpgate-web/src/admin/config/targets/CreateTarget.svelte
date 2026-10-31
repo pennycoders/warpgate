@@ -110,6 +110,7 @@
                     verifyTls: false,
                     interactiveLogon: false,
                     audioPlayback: false,
+                    microphone: false,
                     tlsSecurity: RdpTlsSecurity.Tls12,
                     compression: RdpTargetCompression.Remotefx,
                 },

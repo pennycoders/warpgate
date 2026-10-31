@@ -328,6 +328,11 @@ pub struct TargetRdpOptions {
     #[serde(default)]
     pub audio_playback: bool,
 
+    /// Let the target record from the viewer's microphone (audio input redirection,
+    /// MS-RDPEAI), on RDP viewers and in the web client.
+    #[serde(default)]
+    pub microphone: bool,
+
     // TLS compatibility/security profile used for the target-facing RDP connection.
     // Kept as a plain comment so OpenAPI emits a direct enum reference. A field
     // description wraps the enum in allOf, which typescript-fetch misgenerates.
@@ -929,5 +934,15 @@ mod tests {
         let on: TargetRdpOptions =
             serde_json::from_str(r#"{"host":"h","audio_playback":true}"#).unwrap();
         assert!(on.audio_playback);
+    }
+
+    #[test]
+    fn rdp_microphone_is_off_unless_asked_for() {
+        let default: TargetRdpOptions = serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        assert!(!default.microphone);
+        let on: TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h","microphone":true}"#).unwrap();
+        assert!(on.microphone);
+        assert!(!on.audio_playback);
     }
 }

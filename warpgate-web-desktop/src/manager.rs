@@ -129,9 +129,9 @@ async fn connect(
     size: Option<(u16, u16)>,
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>, bool), WarpgateError> {
     let target_session_id = admitted.id();
-    let audio_playback = match &admitted.target().options {
-        TargetOptions::Rdp(options) => options.audio_playback,
-        _ => false,
+    let (audio_playback, microphone) = match &admitted.target().options {
+        TargetOptions::Rdp(options) => (options.audio_playback, options.microphone),
+        _ => (false, false),
     };
     let (handles, encode_jpeg) = match session.target_kind() {
         TargetKind::Vnc => {
@@ -183,7 +183,7 @@ async fn connect(
         input_tx: handles.input_tx.clone(),
         recorder: recorder.clone(),
     });
-    session.announce_features(audio_playback).await;
+    session.announce_features(audio_playback, microphone).await;
     Ok((handles, recorder, encode_jpeg))
 }
 
@@ -229,6 +229,7 @@ async fn emit(
         DesktopEvent::Audio(_) if !session.audio_enabled() => Ok(()),
         event => {
             if let Some(msg) = ServerMessage::from_event(event) {
+                session.track_microphone(&msg);
                 session.push(msg).await;
             }
             Ok(())

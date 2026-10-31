@@ -160,7 +160,18 @@ pub enum ServerMessage {
     /// attaches later.
     Features {
         audio_playback: bool,
+        microphone: bool,
     },
+    /// The target records the viewer's microphone: the viewer sends interleaved signed
+    /// 16-bit little-endian PCM at `sample_rate` with `channels` channels, as binary frames
+    /// (see [`decode_client_binary`]), ideally `frames_per_packet` sample frames at a time.
+    MicrophoneOpen {
+        channels: u16,
+        sample_rate: u32,
+        frames_per_packet: u32,
+    },
+    /// The target stopped recording.
+    MicrophoneClose,
     /// A non-fatal notice; the session ends through [`ServerMessage::State`] alone.
     Error {
         message: String,
@@ -234,6 +245,21 @@ fn encode_audio(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The binary frame kind for the viewer's microphone: `[7][interleaved s16le samples…]`.
+const MICROPHONE_FRAME: u8 = 7;
+
+/// The most microphone audio one frame may carry: a second of 48 kHz stereo.
+const MAX_MICROPHONE_FRAME_BYTES: usize = 48_000 * 4;
+
+/// A binary frame from the browser. The only kind is the viewer's microphone.
+pub fn decode_client_binary(mut frame: Vec<u8>) -> Option<DesktopInput> {
+    if frame.first() != Some(&MICROPHONE_FRAME) || frame.len() > 1 + MAX_MICROPHONE_FRAME_BYTES {
+        return None;
+    }
+    frame.remove(0);
+    (!frame.is_empty()).then(|| DesktopInput::Microphone(frame.into()))
+}
+
 /// A backend state change as a session phase; `None` for the backend's own end, which
 /// the lifecycle reports once with a reason.
 pub const fn phase_for(state: DesktopState) -> Option<LiveSessionPhase> {
@@ -280,6 +306,15 @@ impl ServerMessage {
             DesktopEvent::Clipboard(text) => Self::Clipboard { text },
             DesktopEvent::Bell => Self::Bell,
             DesktopEvent::Audio(data) => Self::Audio { data },
+            DesktopEvent::MicrophoneOpen {
+                format,
+                frames_per_packet,
+            } => Self::MicrophoneOpen {
+                channels: format.channels,
+                sample_rate: format.samples_per_sec,
+                frames_per_packet,
+            },
+            DesktopEvent::MicrophoneClose => Self::MicrophoneClose,
             DesktopEvent::Error(message) => Self::Error { message },
         })
     }
@@ -313,19 +348,64 @@ mod tests {
         assert!(audio.is_incremental());
         let features = ServerMessage::Features {
             audio_playback: true,
+            microphone: false,
         };
         assert!(!features.is_incremental());
+        assert!(!ServerMessage::MicrophoneClose.is_incremental());
     }
 
     #[test]
     fn features_are_sent_as_json() {
         let WsPayload::Text(json) = (ServerMessage::Features {
             audio_playback: true,
+            microphone: true,
         })
         .ws_payload() else {
             panic!("features are text");
         };
-        assert_eq!(json, r#"{"type":"features","audio_playback":true}"#);
+        assert_eq!(
+            json,
+            r#"{"type":"features","audio_playback":true,"microphone":true}"#
+        );
+    }
+
+    #[test]
+    fn the_browser_is_told_the_format_the_target_records_in() {
+        let message = ServerMessage::from_event(DesktopEvent::MicrophoneOpen {
+            format: warpgate_core::DESKTOP_MICROPHONE_FORMATS[6],
+            frames_per_packet: 160,
+        })
+        .unwrap();
+        let WsPayload::Text(json) = message.ws_payload() else {
+            panic!("microphone control is text");
+        };
+        assert_eq!(
+            json,
+            r#"{"type":"microphone_open","channels":1,"sample_rate":16000,"frames_per_packet":160}"#
+        );
+        let WsPayload::Text(json) = ServerMessage::from_event(DesktopEvent::MicrophoneClose)
+            .unwrap()
+            .ws_payload()
+        else {
+            panic!("microphone control is text");
+        };
+        assert_eq!(json, r#"{"type":"microphone_close"}"#);
+    }
+
+    #[test]
+    fn microphone_frames_from_the_browser_become_input() {
+        let Some(warpgate_core::DesktopInput::Microphone(data)) =
+            super::decode_client_binary(vec![7, 1, 2, 3, 4])
+        else {
+            panic!("expected microphone input");
+        };
+        assert_eq!(&data[..], &[1, 2, 3, 4]);
+        assert!(super::decode_client_binary(vec![7]).is_none());
+        assert!(super::decode_client_binary(vec![1, 1, 2]).is_none());
+        assert!(super::decode_client_binary(vec![]).is_none());
+        let mut oversized = vec![7];
+        oversized.resize(2 + 48_000 * 4, 0);
+        assert!(super::decode_client_binary(oversized).is_none());
     }
 
     #[test]

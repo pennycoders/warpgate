@@ -130,6 +130,15 @@ pub enum DesktopEvent {
     Bell,
     /// A block of the remote's sound, as interleaved PCM in [`DESKTOP_AUDIO_FORMAT`].
     Audio(Bytes),
+    /// The remote started recording: it takes the viewer's microphone as interleaved PCM
+    /// in `format` (one of [`DESKTOP_MICROPHONE_FORMATS`]), in packets of
+    /// `frames_per_packet` sample frames. A later one changes the format.
+    MicrophoneOpen {
+        format: DesktopAudioFormat,
+        frames_per_packet: u32,
+    },
+    /// The remote stopped recording.
+    MicrophoneClose,
     /// A non-fatal error message.
     Error(String),
     /// The remote ended the session and said why.
@@ -171,6 +180,27 @@ impl DesktopAudioFormat {
         self.samples_per_sec * self.block_align() as u32
     }
 }
+
+const fn pcm16(channels: u16, samples_per_sec: u32) -> DesktopAudioFormat {
+    DesktopAudioFormat {
+        channels,
+        samples_per_sec,
+        bits_per_sample: 16,
+    }
+}
+
+/// The 16-bit PCM formats a viewer's microphone is relayed in, best first. Both ends
+/// negotiate from this list, so the audio passes through unchanged.
+pub const DESKTOP_MICROPHONE_FORMATS: [DesktopAudioFormat; 8] = [
+    pcm16(2, 44_100),
+    pcm16(1, 44_100),
+    pcm16(2, 48_000),
+    pcm16(1, 48_000),
+    pcm16(2, 22_050),
+    pcm16(1, 22_050),
+    pcm16(1, 16_000),
+    pcm16(1, 8_000),
+];
 
 pub const DESKTOP_AUDIO_FORMAT: DesktopAudioFormat = DesktopAudioFormat {
     channels: 2,
@@ -273,6 +303,9 @@ pub enum DesktopInput {
     /// The viewer's available display area changed; request the target resize its
     /// desktop to `width`×`height`. Backends without dynamic-resize support ignore it.
     Resize { width: u16, height: u16 },
+    /// Audio from the viewer's microphone, as interleaved PCM in the format of the last
+    /// [`DesktopEvent::MicrophoneOpen`]. Backends that are not recording drop it.
+    Microphone(Bytes),
 }
 
 #[cfg(test)]

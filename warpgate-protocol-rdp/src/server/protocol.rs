@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
-use warpgate_core::DesktopInput;
+use warpgate_core::{DesktopAudioFormat, DesktopInput};
 
 /// Warpgate's verdict on a viewer's credentials, returned through the
 /// [`Event::AuthRequest`] reply channel.
@@ -41,6 +41,12 @@ pub enum Input {
     CursorHidden,
     Clipboard(String),
     Audio(Bytes),
+    /// The target records the viewer's microphone, in `format`.
+    MicrophoneOpen {
+        format: DesktopAudioFormat,
+        frames_per_packet: u32,
+    },
+    MicrophoneClose,
     Shutdown,
     /// End the session, telling the viewer why with this RDP error info code.
     Disconnect(u32),

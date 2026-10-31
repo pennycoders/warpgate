@@ -49,6 +49,7 @@ def _provision(api, viewer_password="123"):
                     verify_tls=False,
                     interactive_logon=False,
                     audio_playback=False,
+                    microphone=False,
                 )
             ),
         )

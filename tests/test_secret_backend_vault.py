@@ -764,6 +764,7 @@ class TestSecretBackendVault:
                             tls_security=sdk.RdpTlsSecurity.TLS12,
                             interactive_logon=False,
                             audio_playback=False,
+                            microphone=False,
                             host="localhost",
                             port=rdp_backend_port,
                             username="user",  # the xrdp login baked into the image

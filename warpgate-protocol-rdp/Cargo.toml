@@ -20,6 +20,7 @@ ironrdp-graphics = "0.11"
 ironrdp-input = "0.9"
 ironrdp-pdu = "0.11"
 ironrdp-rdpdr = "0.9"
+ironrdp-rdpeai = "0.2"
 ironrdp-rdpsnd = "0.11"
 ironrdp-server = { version = "0.14", features = ["egfx"] }
 ironrdp-session = "0.13"

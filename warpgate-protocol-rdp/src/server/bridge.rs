@@ -72,6 +72,14 @@ async fn frame_bridge(
             DesktopEvent::CursorHidden => ServerInput::CursorHidden,
             DesktopEvent::Clipboard(text) => ServerInput::Clipboard(text),
             DesktopEvent::Audio(data) => ServerInput::Audio(data),
+            DesktopEvent::MicrophoneOpen {
+                format,
+                frames_per_packet,
+            } => ServerInput::MicrophoneOpen {
+                format,
+                frames_per_packet,
+            },
+            DesktopEvent::MicrophoneClose => ServerInput::MicrophoneClose,
             DesktopEvent::State(DesktopState::Disconnected) => {
                 let shutdown = match end {
                     Some(code) => ServerInput::Disconnect(code),
@@ -221,6 +229,39 @@ mod tests {
         assert!(matches!(
             shutdown_after(vec![]).await,
             ServerInput::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_targets_recording_reaches_the_viewer() {
+        let format = warpgate_core::DESKTOP_MICROPHONE_FORMATS[0];
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (server_tx, mut server_rx) = mpsc::channel(8);
+        event_tx
+            .send(DesktopEvent::MicrophoneOpen {
+                format,
+                frames_per_packet: 441,
+            })
+            .await
+            .unwrap();
+        event_tx.send(DesktopEvent::MicrophoneClose).await.unwrap();
+        event_tx
+            .send(DesktopEvent::State(DesktopState::Disconnected))
+            .await
+            .unwrap();
+        frame_bridge(event_rx, server_tx, None).await;
+
+        assert!(matches!(
+            server_rx.recv().await,
+            Some(ServerInput::MicrophoneOpen { format: f, frames_per_packet: 441 }) if f == format
+        ));
+        assert!(matches!(
+            server_rx.recv().await,
+            Some(ServerInput::MicrophoneClose)
+        ));
+        assert!(matches!(
+            server_rx.recv().await,
+            Some(ServerInput::Shutdown)
         ));
     }
 }
