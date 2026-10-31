@@ -1,21 +1,22 @@
 diff -ru ironrdp-session-0.13.0/src/active_stage.rs base/src/active_stage.rs
---- ironrdp-session-0.13.0/src/active_stage.rs	2026-10-31 03:31:24
-+++ base/src/active_stage.rs	2026-10-31 03:31:24
-@@ -945,6 +945,13 @@
+--- ironrdp-session-0.13.0/src/active_stage.rs	2026-10-31 10:47:26
++++ base/src/active_stage.rs	2026-10-31 10:47:26
+@@ -945,6 +945,14 @@
      ///
      /// [\[MS-RDPBCGR\] 2.2.10.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
      SessionId(u32),
 +    /// The account the server logged the session on as, reported with a completed logon
 +    /// ([\[MS-RDPBCGR\] 2.2.10.1.1]).
 +    ///
-+    /// It follows the [`ActiveStageOutput::SessionId`] output of the same notification.
++    /// It follows the [`ActiveStageOutput::SessionId`] output and precedes the
++    /// [`ActiveStageOutput::SaveSessionInfo`] output of the same notification.
 +    ///
 +    /// [\[MS-RDPBCGR\] 2.2.10.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
 +    LogonInfo(ironrdp_pdu::rdp::session_info::LogonInfo),
      /// Received a Server Deactivate All PDU. The consumer should execute the [Deactivation-Reactivation Sequence].
      ///
      /// [Deactivation-Reactivation Sequence]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
-@@ -1009,6 +1016,7 @@
+@@ -1009,6 +1017,7 @@
              }
              x224::ProcessorOutput::SaveSessionInfo { logon_complete } => Ok(Self::SaveSessionInfo { logon_complete }),
              x224::ProcessorOutput::SessionId(session_id) => Ok(Self::SessionId(session_id)),
@@ -24,8 +25,8 @@ diff -ru ironrdp-session-0.13.0/src/active_stage.rs base/src/active_stage.rs
              x224::ProcessorOutput::MultitransportRequest(pdu) => Ok(Self::MultitransportRequest(pdu)),
              x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
 diff -ru ironrdp-session-0.13.0/src/x224/mod.rs base/src/x224/mod.rs
---- ironrdp-session-0.13.0/src/x224/mod.rs	2026-10-31 03:31:24
-+++ base/src/x224/mod.rs	2026-10-31 03:31:24
+--- ironrdp-session-0.13.0/src/x224/mod.rs	2026-10-31 10:47:26
++++ base/src/x224/mod.rs	2026-10-31 10:47:26
 @@ -13,7 +13,7 @@
  use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
  use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
@@ -35,19 +36,20 @@ diff -ru ironrdp-session-0.13.0/src/x224/mod.rs base/src/x224/mod.rs
  };
  use ironrdp_pdu::x224::X224;
  use ironrdp_svc::{
-@@ -51,6 +51,11 @@
+@@ -51,6 +51,12 @@
      ///
      /// [\[MS-RDPBCGR\] 2.2.10.1.1.1 and 2.2.10.1.1.2]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
      SessionId(u32),
 +    /// The logon information of a Save Session Info PDU that carries it (Logon Info Version 1
 +    /// or 2), so a consumer can tell which account the server logged the session on as.
 +    ///
-+    /// It follows the [`ProcessorOutput::SessionId`] output of the same PDU.
++    /// It follows the [`ProcessorOutput::SessionId`] output and precedes the
++    /// [`ProcessorOutput::SaveSessionInfo`] output of the same PDU.
 +    LogonInfo(LogonInfo),
      /// Server Initiate Multitransport Request. The application should establish a
      /// sideband UDP transport using the request ID and security cookie, then send
      /// a [`MultitransportResponsePdu`] back on the message channel.
-@@ -406,6 +411,7 @@
+@@ -406,6 +412,7 @@
                  | InfoData::LogonInfoV2(LogonInfoVersion2 { logon_info }) = &session_info.info_data
                  {
                      outputs.push(ProcessorOutput::SessionId(logon_info.session_id));
