@@ -223,6 +223,10 @@ impl ServerMessage {
             DesktopEvent::State(_) | DesktopEvent::CursorDefault | DesktopEvent::CursorHidden => {
                 return None;
             }
+            // The browser has no file clipboard yet.
+            DesktopEvent::ClipboardTransfer(_)
+            | DesktopEvent::FileTransferred(_)
+            | DesktopEvent::Capabilities(_) => return None,
             DesktopEvent::Resize { width, height } => Self::Resize { width, height },
             DesktopEvent::RawImage { rect, data } => Self::RawImage {
                 rect: rect.into(),

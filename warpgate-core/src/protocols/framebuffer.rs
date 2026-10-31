@@ -259,6 +259,9 @@ impl Framebuffer {
             | DesktopEvent::CursorHidden
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
+            | DesktopEvent::ClipboardTransfer(_)
+            | DesktopEvent::FileTransferred(_)
+            | DesktopEvent::Capabilities(_)
             | DesktopEvent::Bell
             | DesktopEvent::Error(_) => {}
         }

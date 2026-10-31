@@ -9403,6 +9403,7 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-server",
  "ironrdp-session",
+ "ironrdp-svc",
  "ironrdp-tokio",
  "libz-sys",
  "openssl",

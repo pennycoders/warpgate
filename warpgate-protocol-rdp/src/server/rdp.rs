@@ -249,6 +249,10 @@ async fn route_input(
                 }
             }
             Input::Clipboard(text) => clipboard.offer(text),
+            Input::ClipboardTransfer(transfer) => clipboard.transfer(transfer),
+            Input::Capabilities(capabilities) => {
+                clipboard.set_file_limit(capabilities.clipboard_files_max_bytes);
+            }
             Input::Shutdown => break,
         }
     }
