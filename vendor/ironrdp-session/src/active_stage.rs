@@ -948,7 +948,8 @@ pub enum ActiveStageOutput {
     /// The account the server logged the session on as, reported with a completed logon
     /// ([\[MS-RDPBCGR\] 2.2.10.1.1]).
     ///
-    /// It follows the [`ActiveStageOutput::SessionId`] output of the same notification.
+    /// It follows the [`ActiveStageOutput::SessionId`] output and precedes the
+    /// [`ActiveStageOutput::SaveSessionInfo`] output of the same notification.
     ///
     /// [\[MS-RDPBCGR\] 2.2.10.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
     LogonInfo(ironrdp_pdu::rdp::session_info::LogonInfo),

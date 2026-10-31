@@ -54,7 +54,8 @@ pub enum ProcessorOutput {
     /// The logon information of a Save Session Info PDU that carries it (Logon Info Version 1
     /// or 2), so a consumer can tell which account the server logged the session on as.
     ///
-    /// It follows the [`ProcessorOutput::SessionId`] output of the same PDU.
+    /// It follows the [`ProcessorOutput::SessionId`] output and precedes the
+    /// [`ProcessorOutput::SaveSessionInfo`] output of the same PDU.
     LogonInfo(LogonInfo),
     /// Server Initiate Multitransport Request. The application should establish a
     /// sideband UDP transport using the request ID and security cookie, then send

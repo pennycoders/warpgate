@@ -8,7 +8,11 @@ logon_complete }`; the account the server logged the session on as is not surfac
 `warpgate-protocol-rdp` audits that account with the target's own logon. The fork adds
 `ProcessorOutput::LogonInfo` / `ActiveStageOutput::LogonInfo`, carrying the PDU's
 `LogonInfo` (session ID, user name and domain; nothing else) for Logon Info Version 1
-and 2, emitted right after `SessionId`.
+and 2. It is emitted between the `SessionId` and the `SaveSessionInfo` outputs of the same
+PDU, so a consumer pairs it with the `SaveSessionInfo` that follows it in the same batch
+(`completed_logons` in `warpgate-protocol-rdp/src/client/logon.rs`). The value-free
+`SaveSessionInfo` stays as upstream has it: the extended logon info, which carries the
+auto-reconnect cookie, is still not surfaced.
 
 Drop this fork once a release surfaces the logon account.
 

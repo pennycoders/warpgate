@@ -277,16 +277,7 @@ async fn active_loop(
             .iter()
             .any(|output| matches!(output, ActiveStageOutput::DeactivateAll));
 
-        let mut logon_info = None;
-        for output in &outputs {
-            match output {
-                ActiveStageOutput::LogonInfo(info) => logon_info = Some(info),
-                ActiveStageOutput::SaveSessionInfo {
-                    logon_complete: true,
-                } => logon.notify_logon(logon_info.take()),
-                _ => {}
-            }
-        }
+        logon.observe(&outputs);
 
         match process_outputs(
             &mut framed,
