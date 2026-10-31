@@ -327,11 +327,13 @@ pub struct TargetRdpOptions {
     /// Play the target's sound on RDP viewers and in the web client (audio output
     /// redirection, MS-RDPEA).
     #[serde(default)]
+    #[oai(default)]
     pub audio_playback: bool,
 
     /// Let the target record from the viewer's microphone (audio input redirection,
     /// MS-RDPEAI), on RDP viewers and in the web client.
     #[serde(default)]
+    #[oai(default)]
     pub microphone: bool,
 
     // TLS compatibility/security profile used for the target-facing RDP connection.
@@ -763,6 +765,24 @@ mod tests {
     /// These fields stopped being `Option`, and m00087 drops the explicit nulls
     /// left behind rather than translating them. Their defaults therefore have to
     /// keep producing what the old `unwrap_or` did.
+    /// API clients written against upstream (the Kubernetes operator among them)
+    /// send only the fields upstream has. A switch added here must be optional in the
+    /// API too, or creating any RDP target fails with "found null".
+    #[test]
+    fn an_rdp_target_from_an_upstream_client_is_accepted() {
+        use poem_openapi::types::{ParseFromJSON, ToJSON};
+
+        let defaults: TargetRdpOptions = serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        let mut upstream = defaults.to_json().unwrap();
+        let fields = upstream.as_object_mut().unwrap();
+        fields.remove("audio_playback");
+        fields.remove("microphone");
+        let rdp = TargetRdpOptions::parse_from_json(Some(upstream)).unwrap();
+
+        assert!(!rdp.audio_playback);
+        assert!(!rdp.microphone);
+    }
+
     #[test]
     fn an_omitted_field_defaults_to_what_the_option_fell_back_to() {
         let ssh: TargetSSHOptions = serde_json::from_str(r#"{"host":"h"}"#).unwrap();
