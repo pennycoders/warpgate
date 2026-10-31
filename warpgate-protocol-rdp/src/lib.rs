@@ -12,6 +12,10 @@ mod clipboard_files;
 #[cfg(test)]
 mod clipboard_relay_tests;
 mod desktop_size;
+mod drive;
+#[cfg(test)]
+mod drive_tests;
+mod drive_uploads;
 mod server;
 mod session_handle;
 
@@ -79,11 +83,24 @@ impl std::fmt::Debug for RdpProtocolServer {
     }
 }
 
-/// Start an RDP client for a target and bridge it to normalised desktop streams.
+/// Start an RDP client for a target and bridge it to normalised desktop streams. The
+/// browser desktop calls this; with drive redirection on, the target gets the session
+/// drive the browser uploads to.
 pub fn connect(
     admitted: AdmittedTarget<TargetRdpOptions>,
     size: (u16, u16),
     secrets: Arc<dyn SecretResolver>,
+) -> Result<DesktopClientHandles, WarpgateError> {
+    connect_with_drives(admitted, size, secrets, None)
+}
+
+/// [`connect`], with the drives a native viewer redirected to relay when the target
+/// allows drive redirection.
+pub(crate) fn connect_with_drives(
+    admitted: AdmittedTarget<TargetRdpOptions>,
+    size: (u16, u16),
+    secrets: Arc<dyn SecretResolver>,
+    viewer_drives: Option<server::ViewerDrives>,
 ) -> Result<DesktopClientHandles, WarpgateError> {
     let target_session_id = admitted.id();
     let (user_info, target) = admitted.into_approved().into_parts();
@@ -108,6 +125,29 @@ pub fn connect(
         sign_in: sign_in.clone(),
     };
 
+    let drives = options.drive_redirection.then(|| {
+        if let Some(viewer) = viewer_drives {
+            client::DriveSetup {
+                service: Arc::new(viewer),
+                policy: drive::DrivePolicy {
+                    read_only: options.drive_read_only,
+                },
+                uploads: None,
+            }
+        } else {
+            let uploads = drive_uploads::UploadDrive::new(
+                options.drive_uploads_max_bytes().unwrap_or_default(),
+            );
+            client::DriveSetup {
+                service: Arc::new(uploads.clone()),
+                // The session drive holds what the user chose to share; the target only
+                // reads it.
+                policy: drive::DrivePolicy { read_only: true },
+                uploads: Some(uploads),
+            }
+        }
+    });
+
     let span = info_span!("RDP-client", host = %options.host, port = options.port);
     tokio::spawn(
         async move {
@@ -119,6 +159,7 @@ pub fn connect(
                 abort_rx,
                 logon,
                 secrets,
+                drives,
             )
             .await
             {

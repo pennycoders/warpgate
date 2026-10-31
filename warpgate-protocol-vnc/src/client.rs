@@ -61,7 +61,7 @@ fn map_input(input: DesktopInput) -> Vec<X11Event> {
         // Dynamic resize toward a VNC target is not supported.
         DesktopInput::Resize { .. } => vec![],
         // RFB has no file clipboard.
-        DesktopInput::ClipboardTransfer(_) => vec![],
+        DesktopInput::ClipboardTransfer(_) | DesktopInput::DriveUpload(_) => vec![],
     }
 }
 

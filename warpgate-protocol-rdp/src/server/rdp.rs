@@ -46,6 +46,7 @@ pub fn run_on_thread<S>(
     size: (u16, u16),
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
+    drives: super::ViewerDrives,
 ) -> oneshot::Receiver<Result<()>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -65,8 +66,8 @@ where
                 return;
             }
         };
-        let result =
-            runtime.block_on(run(stream, cert_pem, key_pem, size, out_tx, in_rx).instrument(span));
+        let result = runtime
+            .block_on(run(stream, cert_pem, key_pem, size, out_tx, in_rx, drives).instrument(span));
         let _ = done_tx.send(result);
     });
     done_rx
@@ -80,6 +81,7 @@ async fn run<S>(
     size: (u16, u16),
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
+    drives: super::ViewerDrives,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -143,6 +145,7 @@ where
         }))
         .with_credential_validator(Some(validator))
         .with_cliprdr_factory(Some(Box::new(clipboard)))
+        .with_rdpdr_factory(Some(Box::new(drives)))
         .build();
 
     if let Err(error) = server.run_connection(stream).await {

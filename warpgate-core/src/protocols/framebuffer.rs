@@ -262,6 +262,7 @@ impl Framebuffer {
             | DesktopEvent::ClipboardTransfer(_)
             | DesktopEvent::FileTransferred(_)
             | DesktopEvent::Capabilities(_)
+            | DesktopEvent::DriveUpload(_)
             | DesktopEvent::Bell
             | DesktopEvent::Error(_) => {}
         }

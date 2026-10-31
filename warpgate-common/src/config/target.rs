@@ -6,10 +6,10 @@ use uuid::Uuid;
 use warpgate_tls::TlsMode;
 
 use super::defaults::{
-    _default_clipboard_files_max_mb, _default_empty_string, _default_empty_vec,
-    _default_mysql_port, _default_postgres_idle_timeout_str, _default_postgres_port,
-    _default_rdp_port, _default_ssh_ca_mount, _default_ssh_port, _default_username,
-    _default_vnc_port,
+    _default_clipboard_files_max_mb, _default_drive_uploads_max_mb, _default_empty_string,
+    _default_empty_vec, _default_mysql_port, _default_postgres_idle_timeout_str,
+    _default_postgres_port, _default_rdp_port, _default_ssh_ca_mount, _default_ssh_port,
+    _default_true, _default_username, _default_vnc_port,
 };
 use crate::secrets::{MaybeSecretRef, SecretRef, StoredSecrets};
 use crate::{Protocol, Secret, StoredSecret};
@@ -345,9 +345,35 @@ pub struct TargetRdpOptions {
         validator(minimum(value = "1"), maximum(value = "65536"))
     )]
     pub clipboard_files_max_mb: u32,
+
+    /// Redirect drives to the target: a native client's own redirected drives, relayed
+    /// by Warpgate, or in the browser a session drive holding files the user uploads.
+    #[serde(default)]
+    #[oai(default)]
+    pub drive_redirection: bool,
+
+    /// Let the target only read redirected drives, never create, change or delete files
+    /// on them. The browser's session drive is always read-only.
+    #[serde(default = "_default_true")]
+    #[oai(default = "_default_true")]
+    pub drive_read_only: bool,
+
+    /// Capacity of the browser's session drive, in MiB.
+    #[serde(default = "_default_drive_uploads_max_mb")]
+    #[oai(
+        default = "_default_drive_uploads_max_mb",
+        validator(minimum(value = "1"), maximum(value = "65536"))
+    )]
+    pub drive_uploads_max_mb: u32,
 }
 
 impl TargetRdpOptions {
+    /// The browser session drive's capacity in bytes, or `None` when drives are off.
+    pub fn drive_uploads_max_bytes(&self) -> Option<u64> {
+        self.drive_redirection
+            .then(|| u64::from(self.drive_uploads_max_mb.max(1)) * 1024 * 1024)
+    }
+
     /// The clipboard file cap in bytes, or `None` when clipboard files are off.
     pub fn clipboard_files_max_bytes(&self) -> Option<u64> {
         self.clipboard_files
@@ -768,6 +794,12 @@ mod tests {
         assert_eq!(rdp.tls_security, RdpTlsSecurity::Tls12);
         assert!(!rdp.clipboard_files);
         assert_eq!(rdp.clipboard_files_max_bytes(), None);
+        assert!(!rdp.drive_redirection);
+        assert!(
+            rdp.drive_read_only,
+            "a drive, once enabled, starts read-only"
+        );
+        assert_eq!(rdp.drive_uploads_max_bytes(), None);
         let empty_password = DatabaseTargetAuth::Password(DatabaseTargetPasswordAuth::default());
         assert_eq!(mysql.auth, empty_password);
         assert_eq!(postgres.auth, empty_password);

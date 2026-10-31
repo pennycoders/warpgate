@@ -13,7 +13,9 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use warpgate_common::{UserFacingReason, WarpgateError, io_connect_reason};
 
-use super::desktop_files::{ClipboardTransfer, DesktopCapabilities, FileTransferRecord};
+use super::desktop_files::{
+    ClipboardTransfer, DesktopCapabilities, DriveUpload, DriveUploadStatus, FileTransferRecord,
+};
 
 pub const DESKTOP_INPUT_CHANNEL_CAPACITY: usize = 256;
 
@@ -135,6 +137,8 @@ pub enum DesktopEvent {
     FileTransferred(FileTransferRecord),
     /// What the target connection allows; sent once it is up.
     Capabilities(DesktopCapabilities),
+    /// An upload to the session drive finished or was refused.
+    DriveUpload(DriveUploadStatus),
     /// The remote rang the bell.
     Bell,
     /// A non-fatal error message.
@@ -243,6 +247,8 @@ pub enum DesktopInput {
     /// A clipboard file transfer step from the viewer: files it copied, a range it wants
     /// of files the target offered, or a range the target asked it for.
     ClipboardTransfer(ClipboardTransfer),
+    /// A step of uploading a file to the session drive.
+    DriveUpload(DriveUpload),
     /// Request a full framebuffer refresh.
     Refresh,
     /// The viewer's available display area changed; request the target resize its
