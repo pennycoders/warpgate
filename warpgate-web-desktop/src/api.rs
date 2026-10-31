@@ -45,6 +45,9 @@ pub async fn ws_handler(
         if let Some(keyframe) = session.keyframe().await {
             session.push(keyframe).await;
         }
+        if let Some(features) = session.features() {
+            session.push(features).await;
+        }
         session.replay_phase().await;
 
         let input_session = session.clone();
@@ -63,6 +66,9 @@ pub async fn ws_handler(
                         // Answer a refresh from our own surface as well as asking the
                         // backend. RDP has no repaint request wired through the helper,
                         // so forwarding alone would leave the viewer stuck on black.
+                        if let ClientMessage::Audio { enabled } = client_msg {
+                            session.set_audio_enabled(enabled);
+                        }
                         if matches!(client_msg, ClientMessage::Refresh)
                             && let Some(keyframe) = session.keyframe().await
                         {

@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use warpgate_core::{
-    DesktopEvent, DesktopInput, DesktopRect, DesktopState, MAX_CLIPBOARD_BYTES, Scancode,
-    truncate_clipboard_contents_in_place,
+    DESKTOP_AUDIO_FORMAT, DesktopEvent, DesktopInput, DesktopRect, DesktopState,
+    MAX_CLIPBOARD_BYTES, Scancode, truncate_clipboard_contents_in_place,
 };
 use warpgate_web_clients_common::{LiveSessionPhase, SessionPhase};
 
@@ -59,6 +59,11 @@ pub enum ClientMessage {
         width: u16,
         height: u16,
     },
+    /// Whether this viewer plays the target's sound. Sound is sent only while a viewer
+    /// asked for it, which it can do only after a user gesture.
+    Audio {
+        enabled: bool,
+    },
 }
 
 impl From<ClientMessage> for Option<DesktopInput> {
@@ -94,6 +99,7 @@ impl From<ClientMessage> for Option<DesktopInput> {
             }
             ClientMessage::Refresh => DesktopInput::Refresh,
             ClientMessage::Resize { width, height } => DesktopInput::Resize { width, height },
+            ClientMessage::Audio { .. } => return None,
         })
     }
 }
@@ -143,6 +149,18 @@ pub enum ServerMessage {
         text: String,
     },
     Bell,
+    /// A block of the target's sound, interleaved signed 16-bit little-endian PCM in
+    /// [`DESKTOP_AUDIO_FORMAT`].
+    Audio {
+        #[serde(with = "warpgate_common::helpers::serde_base64")]
+        data: Bytes,
+    },
+    /// What the target offers beyond the screen, so the viewer shows only the controls
+    /// that do something. Sent as the backend connects, and again to every viewer that
+    /// attaches later.
+    Features {
+        audio_playback: bool,
+    },
     /// A non-fatal notice; the session ends through [`ServerMessage::State`] alone.
     Error {
         message: String,
@@ -156,9 +174,9 @@ impl From<SessionPhase> for ServerMessage {
 }
 
 impl ServerMessage {
-    /// Whether this is an incremental framebuffer delta that may be dropped under
-    /// output-buffer pressure, as opposed to a structural message (resize, clipboard,
-    /// connection state) whose loss would corrupt or desync the client.
+    /// Whether this is an incremental framebuffer delta or a block of sound, which may be
+    /// dropped under output-buffer pressure, as opposed to a structural message (resize,
+    /// clipboard, connection state) whose loss would corrupt or desync the client.
     pub const fn is_incremental(&self) -> bool {
         matches!(
             self,
@@ -167,6 +185,7 @@ impl ServerMessage {
                 | Self::PngImage { .. }
                 | Self::CopyRect { .. }
                 | Self::Cursor { .. }
+                | Self::Audio { .. }
         )
     }
 
@@ -181,6 +200,7 @@ impl ServerMessage {
             Self::Cursor { rect, data } => WsPayload::Binary(encode_image(3, *rect, data)),
             Self::Keyframe { rect, data } => WsPayload::Binary(encode_image(4, *rect, data)),
             Self::PngImage { rect, data } => WsPayload::Binary(encode_image(5, *rect, data)),
+            Self::Audio { data } => WsPayload::Binary(encode_audio(data)),
             other => WsPayload::Text(serde_json::to_string(other).unwrap_or_default()),
         }
     }
@@ -200,6 +220,16 @@ fn encode_image(kind: u8, rect: WsRect, data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&rect.y.to_le_bytes());
     out.extend_from_slice(&rect.width.to_le_bytes());
     out.extend_from_slice(&rect.height.to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// `[kind = 6: u8][channels: u8][sample rate: u32 LE][interleaved s16le samples…]`.
+fn encode_audio(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + data.len());
+    out.push(6);
+    out.push(u8::try_from(DESKTOP_AUDIO_FORMAT.channels).unwrap_or(u8::MAX));
+    out.extend_from_slice(&DESKTOP_AUDIO_FORMAT.samples_per_sec.to_le_bytes());
     out.extend_from_slice(data);
     out
 }
@@ -224,7 +254,6 @@ impl ServerMessage {
             DesktopEvent::State(_)
             | DesktopEvent::CursorDefault
             | DesktopEvent::CursorHidden
-            | DesktopEvent::Audio(_)
             | DesktopEvent::Ended(_) => return None,
             DesktopEvent::Resize { width, height } => Self::Resize { width, height },
             DesktopEvent::RawImage { rect, data } => Self::RawImage {
@@ -250,6 +279,7 @@ impl ServerMessage {
             },
             DesktopEvent::Clipboard(text) => Self::Clipboard { text },
             DesktopEvent::Bell => Self::Bell,
+            DesktopEvent::Audio(data) => Self::Audio { data },
             DesktopEvent::Error(message) => Self::Error { message },
         })
     }
@@ -260,13 +290,50 @@ mod tests {
     use bytes::Bytes;
     use warpgate_core::{DesktopEndReason, DesktopEvent};
 
-    use super::ServerMessage;
+    use super::{ClientMessage, ServerMessage, WsPayload};
 
     #[test]
-    fn sound_is_not_sent_to_the_browser() {
-        assert!(
-            ServerMessage::from_event(DesktopEvent::Audio(Bytes::from_static(&[0; 4]))).is_none()
-        );
+    fn sound_goes_to_the_browser_as_a_binary_frame_with_its_format() {
+        let Some(message) =
+            ServerMessage::from_event(DesktopEvent::Audio(Bytes::from_static(&[1, 2, 3, 4])))
+        else {
+            panic!("sound is relayed");
+        };
+        let WsPayload::Binary(frame) = message.ws_payload() else {
+            panic!("sound is sent as binary");
+        };
+        assert_eq!(frame, [6, 2, 0x44, 0xAC, 0, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sound_is_shed_like_frame_deltas() {
+        let audio = ServerMessage::Audio {
+            data: Bytes::from_static(&[0; 4]),
+        };
+        assert!(audio.is_incremental());
+        let features = ServerMessage::Features {
+            audio_playback: true,
+        };
+        assert!(!features.is_incremental());
+    }
+
+    #[test]
+    fn features_are_sent_as_json() {
+        let WsPayload::Text(json) = (ServerMessage::Features {
+            audio_playback: true,
+        })
+        .ws_payload() else {
+            panic!("features are text");
+        };
+        assert_eq!(json, r#"{"type":"features","audio_playback":true}"#);
+    }
+
+    #[test]
+    fn the_sound_switch_is_not_forwarded_to_the_target() {
+        let message: ClientMessage =
+            serde_json::from_str(r#"{"type":"audio","enabled":true}"#).unwrap();
+        assert!(matches!(message, ClientMessage::Audio { enabled: true }));
+        assert!(Option::<warpgate_core::DesktopInput>::from(message).is_none());
     }
 
     /// The end reaches the browser as the session's closing phase, not as a message.

@@ -137,6 +137,6 @@
     bind:checked={options.audioPlayback}
 />
 <HelpText>
-    Plays sound from the target in native RDP clients. The web client stays
-    silent.
+    Plays sound from the target in native RDP clients, and in the web client
+    once the viewer turns sound on.
 </HelpText>

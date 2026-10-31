@@ -323,7 +323,8 @@ pub struct TargetRdpOptions {
     #[serde(default)]
     pub interactive_logon: bool,
 
-    /// Play the target's sound on native RDP viewers (audio output redirection, MS-RDPEA).
+    /// Play the target's sound on RDP viewers and in the web client (audio output
+    /// redirection, MS-RDPEA).
     #[serde(default)]
     pub audio_playback: bool,
 
