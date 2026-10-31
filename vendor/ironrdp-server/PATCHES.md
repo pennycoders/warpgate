@@ -98,6 +98,13 @@ vendored `ironrdp-rdpsnd`) next to the `rdpsnd` static channel, and sends each
 `ServerEvent::Rdpsnd` on the static channel when the client negotiated a format there,
 otherwise on the dynamic one. Jump Desktop takes audio only on the dynamic channel.
 
+## A Windows NT platform in the General capability set
+
+Upstream leaves the server's platform unspecified. Windows and xrdp report Windows NT
+(`OSMAJORTYPE_WINDOWS`, `OSMINORTYPE_WINDOWS_NT`), and Windows App on iOS turns a session with
+the device only on servers it takes for Windows 8.1 or later. The fork reports Windows NT
+(`general_capabilities` in `src/capabilities.rs`).
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same

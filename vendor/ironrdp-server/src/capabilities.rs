@@ -1,4 +1,4 @@
-use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
+use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags, MajorPlatformType, MinorPlatformType};
 
 use crate::{DesktopSize, RdpServerOptions};
 
@@ -24,6 +24,10 @@ pub(crate) fn capabilities(opts: &RdpServerOptions, size: DesktopSize) -> Vec<ca
 
 fn general_capabilities() -> capability_sets::General {
     capability_sets::General {
+        // The platform Windows and xrdp report. Windows App on iOS turns a session with the
+        // device only on servers it takes for Windows 8.1 or later.
+        major_platform_type: MajorPlatformType::WINDOWS,
+        minor_platform_type: MinorPlatformType::WINDOWS_NT,
         extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED,
         // Advertise that the server handles `SuppressOutput` and
         // `RefreshRectangle` (per MS-RDPBCGR 2.2.7.1.1) — spec-compliant

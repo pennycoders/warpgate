@@ -1,6 +1,26 @@
+diff -ruN ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
+--- ironrdp-server-0.14.0/src/capabilities.rs	2026-10-31 13:41:18
++++ base/src/capabilities.rs	2026-10-31 13:41:18
+@@ -1,4 +1,4 @@
+-use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
++use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags, MajorPlatformType, MinorPlatformType};
+ 
+ use crate::{DesktopSize, RdpServerOptions};
+ 
+@@ -24,6 +24,10 @@
+ 
+ fn general_capabilities() -> capability_sets::General {
+     capability_sets::General {
++        // The platform Windows and xrdp report. Windows App on iOS turns a session with the
++        // device only on servers it takes for Windows 8.1 or later.
++        major_platform_type: MajorPlatformType::WINDOWS,
++        minor_platform_type: MinorPlatformType::WINDOWS_NT,
+         extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED,
+         // Advertise that the server handles `SuppressOutput` and
+         // `RefreshRectangle` (per MS-RDPBCGR 2.2.7.1.1) — spec-compliant
 diff -ruN ironrdp-server-0.14.0/src/display.rs base/src/display.rs
---- ironrdp-server-0.14.0/src/display.rs	2026-10-31 13:40:04
-+++ base/src/display.rs	2026-10-31 13:40:04
+--- ironrdp-server-0.14.0/src/display.rs	2026-10-31 13:41:18
++++ base/src/display.rs	2026-10-31 13:41:18
 @@ -329,6 +329,19 @@
      /// and then signals the event loop via `ServerEvent::Egfx`.
      #[cfg(feature = "egfx")]
@@ -31,8 +51,8 @@ diff -ruN ironrdp-server-0.14.0/src/display.rs base/src/display.rs
      }
  }
 diff -ruN ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
---- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 13:40:04
-+++ base/src/encoder/bitmap.rs	2026-10-31 13:40:04
+--- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-10-31 13:41:18
++++ base/src/encoder/bitmap.rs	2026-10-31 13:41:18
 @@ -1,6 +1,6 @@
 -use core::num::NonZeroUsize;
 +use core::iter;
@@ -123,8 +143,8 @@ diff -ruN ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
                  bitmap_data: &self.buffer[..len],
              };
 diff -ruN ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
---- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 13:40:04
-+++ base/src/encoder/fast_path.rs	2026-10-31 13:40:04
+--- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-10-31 13:41:18
++++ base/src/encoder/fast_path.rs	2026-10-31 13:41:18
 @@ -4,7 +4,8 @@
  use ironrdp_pdu::{Encode as _, WriteCursor};
  
@@ -154,8 +174,8 @@ diff -ruN ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_p
  
              1..=MAX_FASTPATH_UPDATE_SIZE => {
 diff -ruN ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 13:40:04
-+++ base/src/encoder/mod.rs	2026-10-31 13:40:04
+--- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-10-31 13:41:18
++++ base/src/encoder/mod.rs	2026-10-31 13:41:18
 @@ -16,6 +16,8 @@
  use tracing::{debug, warn};
  
@@ -601,8 +621,8 @@ diff -ruN ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
  }
  
 diff -ruN ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
---- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 13:40:04
-+++ base/src/lib.rs	2026-10-31 13:40:04
+--- ironrdp-server-0.14.0/src/lib.rs	2026-10-31 13:41:18
++++ base/src/lib.rs	2026-10-31 13:41:18
 @@ -36,7 +36,7 @@
  #[cfg(all(feature = "__test", feature = "qoiz"))]
  pub use encoder::qoiz::Compressor as QoizCompressor;
@@ -631,8 +651,8 @@ diff -ruN ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
  #[cfg(feature = "usb")]
  pub use urbdrc::{
 diff -ruN ironrdp-server-0.14.0/src/server.rs base/src/server.rs
---- ironrdp-server-0.14.0/src/server.rs	2026-10-31 13:40:04
-+++ base/src/server.rs	2026-10-31 13:40:04
+--- ironrdp-server-0.14.0/src/server.rs	2026-10-31 13:41:18
++++ base/src/server.rs	2026-10-31 13:41:18
 @@ -50,6 +50,7 @@
  use rand::RngCore as _;
  use rdpdr::server::{RdpdrServer, RdpdrServerMessage};
