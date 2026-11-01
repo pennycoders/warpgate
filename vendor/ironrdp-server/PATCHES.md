@@ -45,6 +45,14 @@ earlier base of this fork carried as a backport too, is the snapshot commit itse
   well. This replaces Warpgate's own patch for the same bug, which read the size without
   consuming it and cleared it once a message carrying the blocks had been built.
 
+## A Display Control layout that does not decode is dropped
+
+`DisplayControlServer` returns its decode error, which ends the client loop, so a single
+monitor layout outside MS-RDPEDISP's 200..=8192 pixel range ended the session. Jump
+Desktop on macOS sends such layouts, and its sessions ended with a protocol error. The
+channel is wrapped in `TolerantDisplayControl`, which logs the PDU and ignores it; a
+layout is only a resize request, so the session keeps its size.
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the
