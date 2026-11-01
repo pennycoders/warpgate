@@ -321,4 +321,140 @@ mod tests {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3389);
         assert_eq!(sideband_bind_addr(bind, None), bind);
     }
+
+    /// A client's datagrams as an embedder listening on one shared socket hands them over.
+    struct SharedSocketDatagrams {
+        socket: Arc<UdpSocket>,
+        peer: SocketAddr,
+        incoming: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    }
+
+    impl SidebandDatagrams for SharedSocketDatagrams {
+        fn peer_addr(&self) -> SocketAddr {
+            self.peer
+        }
+
+        fn local_addr(&self) -> Option<SocketAddr> {
+            self.socket.local_addr().ok()
+        }
+
+        fn send<'a>(&'a self, buf: &'a [u8]) -> SidebandFuture<'a, io::Result<usize>> {
+            Box::pin(self.socket.send_to(buf, self.peer))
+        }
+
+        fn recv<'a>(&'a self, buf: &'a mut [u8]) -> SidebandFuture<'a, io::Result<usize>> {
+            Box::pin(async move {
+                let datagram = self
+                    .incoming
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::ConnectionAborted))?;
+                let len = datagram.len().min(buf.len());
+                buf[..len].copy_from_slice(&datagram[..len]);
+                Ok(len)
+            })
+        }
+    }
+
+    fn request(security_cookie: [u8; 16]) -> MultitransportRequestPdu {
+        use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+        use ironrdp_pdu::rdp::multitransport::RequestedProtocol;
+
+        MultitransportRequestPdu {
+            security_header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::TRANSPORT_REQ,
+            },
+            request_id: 3,
+            requested_protocol: RequestedProtocol::UdpFecR,
+            security_cookie,
+        }
+    }
+
+    fn tls_config() -> Arc<rustls::ServerConfig> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+        let certificate = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).expect("key");
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate], key)
+                .expect("server TLS config"),
+        )
+    }
+
+    #[tokio::test]
+    async fn sideband_without_datagrams_continues_tcp_only() {
+        let none: SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>> = Box::pin(async { None });
+        assert!(
+            accept_sideband(none, tls_config(), &request([0x44; 16]))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sideband_gives_up_on_a_client_that_never_sends() {
+        let never: SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>> =
+            Box::pin(core::future::pending());
+        assert!(
+            accept_sideband(never, tls_config(), &request([0x44; 16]))
+                .await
+                .is_none()
+        );
+    }
+
+    // oracle: spec MS-RDPEUDP 2.1 / 3.1.3, MS-RDPEMT 3.2.5.1
+    #[tokio::test]
+    async fn sideband_establishes_the_transport_over_the_embedders_socket() {
+        use ironrdp_rdpeudp_tokio::{UdpTransportConfig, connect_udp};
+
+        let security_cookie = [0x44; 16];
+        let request = request(security_cookie);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let server_addr = socket.local_addr().expect("address");
+
+        // What the embedder does: learn the client from its SYN, then pass its datagrams on.
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let listening = Arc::clone(&socket);
+        let datagrams: SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>> = Box::pin(async move {
+            let mut buf = vec![0u8; 9000];
+            let (len, peer) = listening.recv_from(&mut buf).await.ok()?;
+            tx.send(buf[..len].to_vec()).await.ok()?;
+            let pump_socket = Arc::clone(&listening);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 9000];
+                while let Ok((len, from)) = pump_socket.recv_from(&mut buf).await {
+                    if from == peer && tx.send(buf[..len].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Some(Box::new(SharedSocketDatagrams {
+                socket: listening,
+                peer,
+                incoming: Mutex::new(rx),
+            }) as Box<dyn SidebandDatagrams>)
+        });
+
+        let client = connect_udp(UdpTransportConfig::new(
+            server_addr,
+            "localhost".into(),
+            TunnelConfig {
+                request_id: request.request_id,
+                security_cookie,
+            },
+        ));
+        let (server, client) = tokio::join!(accept_sideband(datagrams, tls_config(), &request), client);
+        let server = server.expect("sideband transport");
+        let mut client = client.expect("client transport");
+
+        client.send(b"over udp".to_vec()).await.expect("client sends");
+        let message = server.recv().await.expect("server receives");
+        assert_eq!(message.data, b"over udp");
+        server.send(b"and back".to_vec()).await;
+        assert_eq!(client.recv().await.as_deref(), Some(&b"and back"[..]));
+    }
 }

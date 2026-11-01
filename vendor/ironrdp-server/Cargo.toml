@@ -74,7 +74,8 @@ qoicoubeh = { version = "0.5", optional = true }
 zstd-safe = { version = "8.2", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync"] }
+rcgen = "0.14"
+tokio = { version = "1", features = ["sync", "test-util"] }
 
 [lints.rust]
 warnings = { level = "allow", priority = 1 }
