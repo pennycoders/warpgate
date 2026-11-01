@@ -118,6 +118,16 @@ pub async fn bind_server(
         match UdpServices::global().acquire(&address).await {
             Ok(udp) => {
                 info!(address = %address.address(), "Offering RDP viewers the UDP transport");
+                if address.address().ip().is_unspecified() {
+                    // See `RdpConfig::udp` and `udp::FlowDatagrams`.
+                    warn!(
+                        address = %address.address(),
+                        "rdp.listen is a wildcard address: UDP replies leave from whichever \
+                         address the system routes them from, so on a host with several \
+                         addresses viewers may not get them and stay on TCP; set rdp.listen \
+                         to the address viewers connect to"
+                    );
+                }
                 Some(udp)
             }
             // The transport is optional: viewers stay on TCP, as they do with rdp.udp off.
