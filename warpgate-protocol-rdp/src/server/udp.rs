@@ -57,7 +57,7 @@ use ironrdp_rdpeudp::pdu::{FecHeader, UdpVersion, V1Datagram, V1Flags};
 use ironrdp_server::{SidebandDatagrams, SidebandFuture, UdpSideband};
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tracing::{debug, info, trace, warn};
 use warpgate_common::{ListenEndpoint, WarpgateError};
 
@@ -133,6 +133,8 @@ struct Routes {
     flows: HashMap<SocketAddr, Flow>,
     pending: HashMap<u64, Pending>,
     next_id: u64,
+    /// Set once the listener closes for good: it takes no more requests.
+    closed: bool,
 }
 
 struct Flow {
@@ -421,6 +423,16 @@ impl UdpListener {
         self.routes().is_empty()
     }
 
+    /// Takes no more requests from now on, if no request waits and no flow is open; returns
+    /// whether it did. Its sockets are then used by nothing but its receive loop.
+    fn close_if_idle(&self) -> bool {
+        let mut routes = self.routes();
+        if routes.is_empty() {
+            routes.closed = true;
+        }
+        routes.closed
+    }
+
     /// Receive on `sockets` for as long as the server runs.
     pub async fn serve(self, sockets: Vec<UdpSocket>) {
         let tasks = sockets.into_iter().map(|socket| {
@@ -643,6 +655,9 @@ impl UdpListener {
         cookie_hash: [u8; 32],
     ) -> Result<(u64, Handover), &'static str> {
         let mut routes = self.routes();
+        if routes.closed {
+            return Err("The RDP UDP listener has closed, continuing over TCP");
+        }
         if routes.pending.len() >= MAX_PENDING {
             return Err("Too many viewers waiting for their RDP UDP SYN, continuing over TCP");
         }
@@ -893,6 +908,13 @@ impl SidebandDatagrams for FlowDatagrams {
 /// new bind fails while the old socket, no longer read, starves the flows. Instead a UDP
 /// listener is kept here by address for as long as an accept loop holds it ([`UdpHold`]) or
 /// a request or flow uses it, and the restarted accept loop takes the same one back.
+///
+/// A listener that closes stays here until its sockets are closed, so an accept loop that
+/// asks for its address meanwhile waits for the port rather than fail to bind it. A changed
+/// listen address on the same port (`[::]:3389` to `0.0.0.0:3389`, say) would fail to bind
+/// while the old listener lingers, so binding closes the port's other listeners at once when
+/// nothing holds or uses them; one that viewers still use keeps the port, and the new
+/// address is served over TCP only until the listener next restarts.
 pub struct UdpServices {
     listeners: Mutex<HashMap<SocketAddr, Service>>,
     linger: Duration,
@@ -903,6 +925,28 @@ struct Service {
     holders: usize,
     /// Consecutive checks that found it unheld and unused.
     idle_checks: u8,
+    /// Whether it is closing: it is no longer handed out, and its task is told through
+    /// `close` to stop receiving and close its sockets.
+    closing: bool,
+    close: Arc<Notify>,
+    /// Closes (its sender is dropped) once the sockets are closed and the listener is out
+    /// of the map.
+    closed: watch::Receiver<()>,
+}
+
+impl Service {
+    fn start_closing(&mut self) {
+        self.closing = true;
+        self.close.notify_one();
+    }
+}
+
+/// What [`UdpServices::hold_existing`] found for an address.
+enum Existing {
+    Held(UdpHold),
+    /// A listener that is closing; bind once it has.
+    Closing(watch::Receiver<()>),
+    None,
 }
 
 static SERVICES: LazyLock<Arc<UdpServices>> = LazyLock::new(|| UdpServices::with_linger(LINGER));
@@ -933,27 +977,44 @@ impl UdpServices {
         endpoint: &ListenEndpoint,
     ) -> Result<UdpHold, WarpgateError> {
         let key = endpoint.address();
-        if let Some(hold) = self.hold_existing(key) {
-            return Ok(hold);
+        loop {
+            match self.hold_existing(key) {
+                Existing::Held(hold) => return Ok(hold),
+                Existing::Closing(closed) => wait_closed(closed).await,
+                Existing::None => break,
+            }
+        }
+        for closed in self.close_unused_on_port(key) {
+            wait_closed(closed).await;
         }
         let sockets = endpoint.udp_sockets().await?;
         let listener = UdpListener::new();
+        let close = Arc::new(Notify::new());
+        let (closed_tx, closed) = watch::channel(());
         self.listeners().insert(
             key,
             Service {
                 listener: listener.clone(),
                 holders: 1,
                 idle_checks: 0,
+                closing: false,
+                close: Arc::clone(&close),
+                closed,
             },
         );
         tokio::spawn({
             let services = Arc::clone(self);
             let listener = listener.clone();
             async move {
+                let mut serve = Box::pin(listener.clone().serve(sockets));
                 tokio::select! {
-                    () = listener.clone().serve(sockets) => {}
-                    () = services.linger_until_unused(key, &listener) => {}
+                    () = &mut serve => {}
+                    () = services.linger_until_unused(key, &listener, &close) => {}
                 }
+                // Closes the sockets before the address is free to bind again.
+                drop(serve);
+                services.remove(key, &listener);
+                drop(closed_tx);
                 debug!(address = %key, "Closed the RDP UDP listener");
             }
         });
@@ -964,32 +1025,59 @@ impl UdpServices {
         })
     }
 
-    fn hold_existing(self: &Arc<Self>, key: SocketAddr) -> Option<UdpHold> {
+    fn hold_existing(self: &Arc<Self>, key: SocketAddr) -> Existing {
         let mut listeners = self.listeners();
-        let service = listeners.get_mut(&key)?;
+        let Some(service) = listeners.get_mut(&key) else {
+            return Existing::None;
+        };
+        if service.closing {
+            return Existing::Closing(service.closed.clone());
+        }
         service.holders += 1;
         service.idle_checks = 0;
-        Some(UdpHold {
+        Existing::Held(UdpHold {
             services: Arc::clone(self),
             key,
             listener: service.listener.clone(),
         })
     }
 
-    async fn linger_until_unused(&self, key: SocketAddr, listener: &UdpListener) {
+    /// Starts closing the listeners on `key`'s port at other addresses that nothing holds or
+    /// uses, and returns what to wait on for them and for those already closing.
+    fn close_unused_on_port(&self, key: SocketAddr) -> Vec<watch::Receiver<()>> {
+        let mut listeners = self.listeners();
+        listeners
+            .iter_mut()
+            .filter(|(address, _)| **address != key && address.port() == key.port())
+            .filter_map(|(address, service)| {
+                if !service.closing && service.holders == 0 && service.listener.close_if_idle()
+                {
+                    debug!(address = %address, rebinding = %key, "Closing an unused RDP UDP listener on the same port");
+                    service.start_closing();
+                }
+                service.closing.then(|| service.closed.clone())
+            })
+            .collect()
+    }
+
+    async fn linger_until_unused(&self, key: SocketAddr, listener: &UdpListener, close: &Notify) {
         let mut checks = tokio::time::interval(self.linger);
         checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         checks.tick().await;
         loop {
-            checks.tick().await;
-            if self.release_if_unused(key, listener) {
-                return;
+            tokio::select! {
+                _ = checks.tick() => {
+                    if self.release_if_unused(key, listener) {
+                        return;
+                    }
+                }
+                () = close.notified() => return,
             }
         }
     }
 
-    /// Whether `listener` is no longer kept for `key`, taking it out once two checks in a
-    /// row have found it unheld and unused.
+    /// Whether `listener` is closing or no longer kept for `key`, starting to close it once
+    /// two checks in a row have found it unheld and unused.
     fn release_if_unused(&self, key: SocketAddr, listener: &UdpListener) -> bool {
         let mut listeners = self.listeners();
         let Some(service) = listeners
@@ -998,17 +1086,37 @@ impl UdpServices {
         else {
             return true;
         };
+        if service.closing {
+            return true;
+        }
         if service.holders > 0 || !listener.is_idle() {
             service.idle_checks = 0;
             return false;
         }
         service.idle_checks += 1;
-        if service.idle_checks < 2 {
+        if service.idle_checks < 2 || !listener.close_if_idle() {
             return false;
         }
-        listeners.remove(&key);
+        service.start_closing();
         true
     }
+
+    /// Takes `listener`, whose sockets are closed, out of the map.
+    fn remove(&self, key: SocketAddr, listener: &UdpListener) {
+        let mut listeners = self.listeners();
+        if listeners
+            .get(&key)
+            .is_some_and(|service| service.listener.same_as(listener))
+        {
+            listeners.remove(&key);
+        }
+    }
+}
+
+/// Waits until the closing listener whose `closed` this is has closed its sockets.
+async fn wait_closed(mut closed: watch::Receiver<()>) {
+    // Nothing is ever sent: this returns once the sender is dropped.
+    while closed.changed().await.is_ok() {}
 }
 
 /// An RDP listener's hold on its UDP listener, released when the RDP listener stops.
