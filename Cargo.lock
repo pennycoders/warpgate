@@ -3825,8 +3825,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-rdpeudp-tokio"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7785fb57f1d0a90a40e588b811492f270879fbb755646d73064a441eb7b3f723"
 dependencies = [
  "bytes",
  "ironrdp-async",
