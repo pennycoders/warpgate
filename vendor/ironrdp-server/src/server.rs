@@ -1851,6 +1851,30 @@ struct NegotiatedConnection<S> {
     authenticated_credentials: Option<Credentials>,
 }
 
+/// Aborts the tasks it tracks when dropped.
+///
+/// `accept_finalize` holds one for its UDP multitransport accepts: dropping a
+/// `JoinHandle` only detaches its task, and an accept has no reason to outlive
+/// the connection it was started for (MS-RDPEMT 1.3.3).
+#[derive(Default)]
+struct AbortOnDrop(Vec<task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn track<T>(&mut self, handle: task::JoinHandle<T>) -> task::JoinHandle<T> {
+        self.0.retain(|tracked| !tracked.is_finished());
+        self.0.push(handle.abort_handle());
+        handle
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 /// State that belongs to a single client connection.
 ///
 /// Created when a [`NegotiatedConnection`] enters finalization and dropped
@@ -5187,7 +5211,8 @@ impl RdpServer {
             // an accepted narrow-window tradeoff; the alternative is
             // persisting in-flight `JoinHandle`s across reactivation, which
             // this integration does not attempt. The orphaned task also keeps
-            // `udp_bind_addr` bound for up to `UDP_ACCEPT_TIMEOUT`, so a NEXT
+            // `udp_bind_addr` bound for up to `UDP_ACCEPT_TIMEOUT`, or until
+            // the connection ends (`accept_finalize` aborts it then), so a NEXT
             // connection's own bind attempt during that window can collide
             // with it too, not only a concurrently preempted session's (see
             // `multitransport::accept`'s own doc comment on that failure
@@ -6022,6 +6047,12 @@ impl RdpServer {
         // synchronously as part of finalize, so establishing it must never
         // block the RDP handshake finalize itself is driving.
         let mut pending_udp_accept: Option<task::JoinHandle<Option<multitransport::UdpTransportHandle>>> = None;
+        // Dropping a `JoinHandle` detaches its task, so without this an accept
+        // still running when the connection ends would keep its socket (or the
+        // embedder's request, see `UdpSideband::open`) until
+        // `UDP_ACCEPT_TIMEOUT`. MS-RDPEMT 1.3.3: the multitransport connection
+        // goes with the main RDP connection.
+        let mut udp_accept_guard = AbortOnDrop::default();
         loop {
             // Bounded: see `FINALIZE_TIMEOUT`. The bound belongs on THIS call
             // and not on `accept_finalize` itself or its callers — the loop
@@ -6055,13 +6086,13 @@ impl RdpServer {
                         // embedder has to be ready for the client's SYN,
                         // which may already be on its way.
                         let datagrams = sideband.open(&request);
-                        pending_udp_accept = Some(task::spawn(async move {
+                        pending_udp_accept = Some(udp_accept_guard.track(task::spawn(async move {
                             multitransport::accept_sideband(datagrams, tls_config, &request).await
-                        }));
+                        })));
                     } else if let Some(udp_bind_addr) = udp_bind_addr {
-                        pending_udp_accept = Some(task::spawn(async move {
+                        pending_udp_accept = Some(udp_accept_guard.track(task::spawn(async move {
                             multitransport::accept(udp_bind_addr, tls_config, &request).await
-                        }));
+                        })));
                     }
                 },
             );
@@ -6813,6 +6844,18 @@ mod preempt_tests {
         // Negotiated, and the success arrives after finalization.
         RdpServer::handle_message_channel_data(&mut conn, response(&MultitransportResponsePdu::success(1)));
         assert!(conn.udp_migration_allowed);
+    }
+
+    // oracle: spec MS-RDPEMT 1.3.3
+    #[tokio::test]
+    async fn a_udp_accept_still_running_ends_with_its_connection() {
+        let mut guard = AbortOnDrop::default();
+        let finished = guard.track(task::spawn(async {}));
+        finished.await.expect("a finished accept");
+        let running = guard.track(task::spawn(core::future::pending::<()>()));
+        assert_eq!(guard.0.len(), 1, "finished accepts are not kept");
+        drop(guard);
+        assert!(running.await.expect_err("aborted").is_cancelled());
     }
 
     #[tokio::test]
