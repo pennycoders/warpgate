@@ -17,9 +17,11 @@
 //! * a SYN whose `SYNDATAEX` offers version 1 or 2 carries no `cookieHash` (2.2.2.9 forbids
 //!   one). It goes to a pending request only when exactly one is waiting for its source
 //!   address, and only on a guess: the request stays open, and a version 3 SYN whose
-//!   `cookieHash` names it takes it over for as long as the guessed flow's handshake runs
-//!   ([`SidebandDatagrams::replacement`]). A SYN with a forged source address therefore
-//!   cannot keep a viewer that sends its cookie off UDP;
+//!   `cookieHash` names it takes it over until the connection's UDP accept is over
+//!   ([`SidebandDatagrams::replacement`]): while the guessed flow's handshake runs, and
+//!   after it failed, until the accept's deadline. A SYN with a forged source address
+//!   therefore cannot keep a viewer that sends its cookie off UDP, whether its sender
+//!   leaves the handshake hanging or breaks it at once;
 //! * a SYN without `SYNDATAEX` offers only version 1 (3.1.5.1.1 step 4), and a version 3
 //!   offer without `cookieHash` breaks 2.2.2.9. `ironrdp-rdpeudp`'s accept refuses both (it
 //!   needs `SYNDATAEX`, and a version 3 SYN's hash), so they are dropped here rather than
@@ -152,8 +154,8 @@ enum PendingState {
     /// No SYN yet; the connection waits for its datagrams here.
     Waiting(oneshot::Sender<Box<dyn SidebandDatagrams>>),
     /// Handed the flow of `peer` on a guess (a SYN without `cookieHash`, by source
-    /// address); a SYN with the request's `cookieHash` replaces it through `replace` while
-    /// that flow's handshake runs.
+    /// address); a SYN with the request's `cookieHash` replaces it through `replace` until
+    /// the connection's UDP accept is over, even once that flow's handshake failed.
     Guessed {
         peer: SocketAddr,
         replace: oneshot::Sender<Box<dyn SidebandDatagrams>>,
@@ -701,7 +703,8 @@ impl Drop for PendingRegistration {
     }
 }
 
-/// Withdraws a request handed a flow on a guess once the handshake over that flow is over.
+/// Withdraws a request handed a flow on a guess once the connection's UDP accept is over:
+/// the transport is up, or the deadline passed, or the connection ended.
 struct GuessRegistration {
     listener: UdpListener,
     id: u64,
@@ -841,8 +844,8 @@ impl SidebandDatagrams for FlowDatagrams {
             .take();
         Box::pin(async move {
             let Replacement { rx, registration } = replacement?;
-            // Held for as long as the server waits here, which is as long as the handshake
-            // over the guessed flow runs.
+            // Held for as long as the server waits here: until the transport is up or the
+            // accept's deadline, past a failed handshake over the guessed flow.
             let datagrams = rx.await.ok();
             drop(registration);
             datagrams
