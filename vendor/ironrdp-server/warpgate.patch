@@ -1,6 +1,6 @@
 diff -ru ironrdp-server-0.14.0/src/builder.rs base/src/builder.rs
---- ironrdp-server-0.14.0/src/builder.rs	2026-11-01 22:22:27
-+++ base/src/builder.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/builder.rs	2026-11-02 00:46:02
++++ base/src/builder.rs	2026-11-02 00:59:08
 @@ -16,6 +16,7 @@
      RdpServerSecurity, StaticChannelFactory,
  };
@@ -66,8 +66,8 @@ diff -ru ironrdp-server-0.14.0/src/builder.rs base/src/builder.rs
              self.state.handler,
              self.state.display,
 diff -ru ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
---- ironrdp-server-0.14.0/src/capabilities.rs	2026-11-01 22:22:27
-+++ base/src/capabilities.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/capabilities.rs	2026-11-02 00:46:02
++++ base/src/capabilities.rs	2026-11-02 00:59:08
 @@ -1,4 +1,4 @@
 -use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
 +use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags, MajorPlatformType, MinorPlatformType};
@@ -86,8 +86,8 @@ diff -ru ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
          // Advertise that the server handles `SuppressOutput` and
          // `RefreshRectangle` (per MS-RDPBCGR 2.2.7.1.1) — spec-compliant
 diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
---- ironrdp-server-0.14.0/src/display.rs	2026-11-01 22:22:27
-+++ base/src/display.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/display.rs	2026-11-02 00:46:02
++++ base/src/display.rs	2026-11-02 00:59:08
 @@ -329,6 +329,19 @@
      /// and then signals the event loop via `ServerEvent::Egfx`.
      #[cfg(feature = "egfx")]
@@ -118,8 +118,8 @@ diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
      }
  }
 diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
---- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-11-01 22:22:27
-+++ base/src/encoder/bitmap.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-11-02 00:46:02
++++ base/src/encoder/bitmap.rs	2026-11-02 00:59:08
 @@ -1,6 +1,6 @@
 -use core::num::NonZeroUsize;
 +use core::iter;
@@ -210,8 +210,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
                  bitmap_data: &self.buffer[..len],
              };
 diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
---- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-11-01 22:22:27
-+++ base/src/encoder/fast_path.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-11-02 00:46:02
++++ base/src/encoder/fast_path.rs	2026-11-02 00:59:08
 @@ -4,7 +4,8 @@
  use ironrdp_pdu::{Encode as _, WriteCursor};
  
@@ -241,8 +241,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_pa
  
              1..=MAX_FASTPATH_UPDATE_SIZE => {
 diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-11-01 22:22:27
-+++ base/src/encoder/mod.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-11-02 00:46:02
++++ base/src/encoder/mod.rs	2026-11-02 00:59:08
 @@ -16,6 +16,8 @@
  use tracing::{debug, warn};
  
@@ -688,8 +688,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
  }
  
 diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
---- ironrdp-server-0.14.0/src/lib.rs	2026-11-01 22:22:27
-+++ base/src/lib.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/lib.rs	2026-11-02 00:46:02
++++ base/src/lib.rs	2026-11-02 00:59:08
 @@ -28,6 +28,7 @@
  mod urbdrc;
  
@@ -726,8 +726,8 @@ diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
  #[cfg(feature = "usb")]
  pub use urbdrc::{
 diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
---- ironrdp-server-0.14.0/src/multitransport.rs	2026-11-01 22:22:27
-+++ base/src/multitransport.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/multitransport.rs	2026-11-02 00:46:02
++++ base/src/multitransport.rs	2026-11-02 00:59:08
 @@ -9,14 +9,20 @@
  //!
  //! [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b8e7c588-51cb-455b-bb73-92d480903133
@@ -750,7 +750,7 @@ diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
  use tokio::net::UdpSocket;
  use tokio::sync::Mutex;
  use tokio_rustls::rustls;
-@@ -27,6 +33,101 @@
+@@ -27,6 +33,107 @@
  /// continuing TCP-only.
  const UDP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
  
@@ -780,22 +780,28 @@ diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
 +
 +    /// Resolves to another client's datagrams when the embedder learns that
 +    /// the request these were handed over for belongs to that client instead,
-+    /// or to `None` (or never) when it has no such client to offer.
++    /// or to `None` when it has no such client to offer.
 +    ///
 +    /// An embedder that can only guess which client answers a request (a SYN
 +    /// without a `cookieHash`, MS-RDPEUDP 2.2.2.9, matched by its source
 +    /// address) hands the guess over and keeps the request open; a version 3
 +    /// SYN whose `cookieHash` names the request then proves its sender the
 +    /// right client. The server calls this once, before the handshake over
-+    /// these datagrams starts, and keeps the future for as long as that
-+    /// handshake runs: when it resolves, the server abandons the handshake,
-+    /// drops these datagrams and starts over with the replacement, within the
-+    /// same [`UDP_ACCEPT_TIMEOUT`]. Dropping the future means the handshake is
-+    /// over, whatever its outcome, and the embedder can close the request.
++    /// these datagrams starts, and keeps the future until the transport is
++    /// established or [`UDP_ACCEPT_TIMEOUT`] runs out. When it resolves, the
++    /// server abandons the handshake if it still runs, drops these datagrams
++    /// and starts over with the replacement, within the same timeout. A
++    /// handshake that fails over guessed datagrams does not end the wait: the
++    /// guess may have been a SYN with a forged source address, whose sender
++    /// then breaks its handshake at once (a bad TLS record or Tunnel Create
++    /// Request), and the client the request was for may still send its
++    /// version 3 SYN. Dropping the future means the accept is over, whatever
++    /// its outcome, and the embedder can close the request.
 +    ///
-+    /// The default never resolves.
++    /// The default resolves to `None` at once, so a failed handshake ends the
++    /// accept.
 +    fn replacement(&self) -> SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>> {
-+        Box::pin(core::future::pending())
++        Box::pin(core::future::ready(None))
 +    }
 +}
 +
@@ -852,7 +858,7 @@ diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
  /// Shared handle to an established sideband UDP transport.
  ///
  /// `send()` uses `UdpTransportSender`, cloned once at construction from the
-@@ -124,17 +225,95 @@
+@@ -124,17 +231,125 @@
          }
      };
  
@@ -888,23 +894,53 @@ diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
 +    loop {
 +        let peer = datagrams.peer_addr();
 +        debug!(%peer, "Client answered the multitransport request over UDP");
-+        let mut replacement = datagrams.replacement();
++        let mut replacement = Some(datagrams.replacement());
 +        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
 +        let config = accept_config(Arc::clone(&tls_config), request, remaining);
-+        tokio::select! {
-+            result = accept_udp_with_datagram_io(BoxedDatagrams(datagrams), config) => {
-+                return established(result);
-+            }
-+            Some(next) = &mut replacement => {
++        let result = tokio::select! {
++            result = accept_udp_with_datagram_io(BoxedDatagrams(datagrams), config) => result,
++            Some(next) = next_replacement(&mut replacement) => {
 +                debug!(
 +                    abandoned = %peer,
 +                    peer = %next.peer_addr(),
 +                    "Another client proved it answers the multitransport request, restarting the UDP handshake"
 +                );
 +                datagrams = next;
++                continue;
 +            }
++        };
++        let error = match result {
++            Ok(transport) => return established(Ok(transport)),
++            Err(error) => error,
++        };
++        // Datagrams handed over on a guess can come from a sender that forged the client's
++        // source address and broke the handshake on purpose; the client the request was
++        // for can still prove itself with its cookieHash (MS-RDPEUDP 2.2.2.9) until the
++        // deadline.
++        match tokio::time::timeout_at(deadline, next_replacement(&mut replacement)).await {
++            Ok(Some(next)) => {
++                debug!(
++                    %error,
++                    failed = %peer,
++                    peer = %next.peer_addr(),
++                    "Another client proved it answers the multitransport request after a failed UDP handshake, starting over"
++                );
++                datagrams = next;
++            }
++            Ok(None) | Err(_) => return established(Err(error)),
 +        }
 +    }
++}
++
++/// Awaits the replacement in `slot` and empties the slot once it resolves, so that it is
++/// never polled again after completing. A wait dropped before then leaves the future in
++/// the slot to be awaited again; an empty slot resolves to `None` at once.
++async fn next_replacement(
++    slot: &mut Option<SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>>>,
++) -> Option<Box<dyn SidebandDatagrams>> {
++    let next = slot.as_mut()?.await;
++    *slot = None;
++    next
 +}
 +
 +fn accept_config(
@@ -953,7 +989,7 @@ diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
          Ok(transport) => {
              debug!("Sideband UDP transport established");
              Some(UdpTransportHandle::new(transport))
-@@ -196,5 +375,255 @@
+@@ -196,5 +411,317 @@
      fn unknown_connection_address_keeps_the_bind() {
          let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3389);
          assert_eq!(sideband_bind_addr(bind, None), bind);
@@ -1207,11 +1243,73 @@ diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
 +        assert_eq!(server.recv().await.expect("server receives").data, b"over udp");
 +        server.send(b"and back".to_vec()).await;
 +        assert_eq!(client.recv().await.as_deref(), Some(&b"and back"[..]));
++    }
++    // oracle: spec MS-RDPEUDP 2.2.2.9, 3.1.5.1.1 step 5, MS-RDPEMT 3.2.5.1
++    #[tokio::test]
++    async fn sideband_waits_for_a_replacement_after_a_guessed_handshake_fails() {
++        use ironrdp_rdpeudp_tokio::{UdpTransportConfig, connect_udp};
++
++        let security_cookie = [0x44; 16];
++        let request = request(security_cookie);
++        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
++        let server_addr = socket.local_addr().expect("address");
++
++        // The guessed sender breaks its handshake at once, before the right client's SYN
++        // has been sent.
++        let (replace, replacement) = tokio::sync::oneshot::channel();
++        let guessed: Box<dyn SidebandDatagrams> = Box::new(GuessedDatagrams {
++            syn: std::sync::Mutex::new(Some(vec![0xff; 16])),
++            replacement: std::sync::Mutex::new(Some(replacement)),
++        });
++        let server = tokio::spawn({
++            let request = request.clone();
++            async move { accept_sideband(Box::pin(async move { Some(guessed) }), tls_config(), &request).await }
++        });
++        tokio::task::yield_now().await;
++        assert!(!server.is_finished(), "the accept waits for the right client");
++
++        let right_client = first_sender_datagrams(socket);
++        tokio::spawn(async move {
++            if let Some(datagrams) = right_client.await {
++                let _ = replace.send(datagrams);
++            }
++        });
++        let client = connect_udp(UdpTransportConfig::new(
++            server_addr,
++            "localhost".into(),
++            TunnelConfig {
++                request_id: request.request_id,
++                security_cookie,
++            },
++        ))
++        .await
++        .expect("client transport");
++        let server = server
++            .await
++            .expect("accept task")
++            .expect("sideband transport over the replacement");
++
++        client.send(b"over udp".to_vec()).await.expect("client sends");
++        assert_eq!(server.recv().await.expect("server receives").data, b"over udp");
++    }
++
++    #[tokio::test]
++    async fn sideband_without_a_replacement_ends_with_its_failed_handshake() {
++        let datagrams: Box<dyn SidebandDatagrams> = Box::new(GuessedDatagrams {
++            syn: std::sync::Mutex::new(Some(vec![0xff; 16])),
++            replacement: std::sync::Mutex::new(None),
++        });
++        let request = request([0x44; 16]);
++        let accept = accept_sideband(Box::pin(async move { Some(datagrams) }), tls_config(), &request);
++        let result = tokio::time::timeout(Duration::from_secs(1), accept)
++            .await
++            .expect("over without waiting for the deadline");
++        assert!(result.is_none());
      }
  }
 diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
---- ironrdp-server-0.14.0/src/server.rs	2026-11-01 22:22:27
-+++ base/src/server.rs	2026-11-01 22:25:46
+--- ironrdp-server-0.14.0/src/server.rs	2026-11-02 00:46:02
++++ base/src/server.rs	2026-11-02 00:59:08
 @@ -20,7 +20,7 @@
  use ironrdp_cliprdr::CliprdrServer;
  use ironrdp_cliprdr::backend::ClipboardMessage;

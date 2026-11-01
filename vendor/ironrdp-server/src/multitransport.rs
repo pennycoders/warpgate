@@ -59,22 +59,28 @@ pub trait SidebandDatagrams: Send + Sync + 'static {
 
     /// Resolves to another client's datagrams when the embedder learns that
     /// the request these were handed over for belongs to that client instead,
-    /// or to `None` (or never) when it has no such client to offer.
+    /// or to `None` when it has no such client to offer.
     ///
     /// An embedder that can only guess which client answers a request (a SYN
     /// without a `cookieHash`, MS-RDPEUDP 2.2.2.9, matched by its source
     /// address) hands the guess over and keeps the request open; a version 3
     /// SYN whose `cookieHash` names the request then proves its sender the
     /// right client. The server calls this once, before the handshake over
-    /// these datagrams starts, and keeps the future for as long as that
-    /// handshake runs: when it resolves, the server abandons the handshake,
-    /// drops these datagrams and starts over with the replacement, within the
-    /// same [`UDP_ACCEPT_TIMEOUT`]. Dropping the future means the handshake is
-    /// over, whatever its outcome, and the embedder can close the request.
+    /// these datagrams starts, and keeps the future until the transport is
+    /// established or [`UDP_ACCEPT_TIMEOUT`] runs out. When it resolves, the
+    /// server abandons the handshake if it still runs, drops these datagrams
+    /// and starts over with the replacement, within the same timeout. A
+    /// handshake that fails over guessed datagrams does not end the wait: the
+    /// guess may have been a SYN with a forged source address, whose sender
+    /// then breaks its handshake at once (a bad TLS record or Tunnel Create
+    /// Request), and the client the request was for may still send its
+    /// version 3 SYN. Dropping the future means the accept is over, whatever
+    /// its outcome, and the embedder can close the request.
     ///
-    /// The default never resolves.
+    /// The default resolves to `None` at once, so a failed handshake ends the
+    /// accept.
     fn replacement(&self) -> SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>> {
-        Box::pin(core::future::pending())
+        Box::pin(core::future::ready(None))
     }
 }
 
@@ -256,23 +262,53 @@ pub(crate) async fn accept_sideband(
     loop {
         let peer = datagrams.peer_addr();
         debug!(%peer, "Client answered the multitransport request over UDP");
-        let mut replacement = datagrams.replacement();
+        let mut replacement = Some(datagrams.replacement());
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let config = accept_config(Arc::clone(&tls_config), request, remaining);
-        tokio::select! {
-            result = accept_udp_with_datagram_io(BoxedDatagrams(datagrams), config) => {
-                return established(result);
-            }
-            Some(next) = &mut replacement => {
+        let result = tokio::select! {
+            result = accept_udp_with_datagram_io(BoxedDatagrams(datagrams), config) => result,
+            Some(next) = next_replacement(&mut replacement) => {
                 debug!(
                     abandoned = %peer,
                     peer = %next.peer_addr(),
                     "Another client proved it answers the multitransport request, restarting the UDP handshake"
                 );
                 datagrams = next;
+                continue;
             }
+        };
+        let error = match result {
+            Ok(transport) => return established(Ok(transport)),
+            Err(error) => error,
+        };
+        // Datagrams handed over on a guess can come from a sender that forged the client's
+        // source address and broke the handshake on purpose; the client the request was
+        // for can still prove itself with its cookieHash (MS-RDPEUDP 2.2.2.9) until the
+        // deadline.
+        match tokio::time::timeout_at(deadline, next_replacement(&mut replacement)).await {
+            Ok(Some(next)) => {
+                debug!(
+                    %error,
+                    failed = %peer,
+                    peer = %next.peer_addr(),
+                    "Another client proved it answers the multitransport request after a failed UDP handshake, starting over"
+                );
+                datagrams = next;
+            }
+            Ok(None) | Err(_) => return established(Err(error)),
         }
     }
+}
+
+/// Awaits the replacement in `slot` and empties the slot once it resolves, so that it is
+/// never polled again after completing. A wait dropped before then leaves the future in
+/// the slot to be awaited again; an empty slot resolves to `None` at once.
+async fn next_replacement(
+    slot: &mut Option<SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>>>,
+) -> Option<Box<dyn SidebandDatagrams>> {
+    let next = slot.as_mut()?.await;
+    *slot = None;
+    next
 }
 
 fn accept_config(
@@ -625,5 +661,67 @@ mod tests {
         assert_eq!(server.recv().await.expect("server receives").data, b"over udp");
         server.send(b"and back".to_vec()).await;
         assert_eq!(client.recv().await.as_deref(), Some(&b"and back"[..]));
+    }
+    // oracle: spec MS-RDPEUDP 2.2.2.9, 3.1.5.1.1 step 5, MS-RDPEMT 3.2.5.1
+    #[tokio::test]
+    async fn sideband_waits_for_a_replacement_after_a_guessed_handshake_fails() {
+        use ironrdp_rdpeudp_tokio::{UdpTransportConfig, connect_udp};
+
+        let security_cookie = [0x44; 16];
+        let request = request(security_cookie);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let server_addr = socket.local_addr().expect("address");
+
+        // The guessed sender breaks its handshake at once, before the right client's SYN
+        // has been sent.
+        let (replace, replacement) = tokio::sync::oneshot::channel();
+        let guessed: Box<dyn SidebandDatagrams> = Box::new(GuessedDatagrams {
+            syn: std::sync::Mutex::new(Some(vec![0xff; 16])),
+            replacement: std::sync::Mutex::new(Some(replacement)),
+        });
+        let server = tokio::spawn({
+            let request = request.clone();
+            async move { accept_sideband(Box::pin(async move { Some(guessed) }), tls_config(), &request).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!server.is_finished(), "the accept waits for the right client");
+
+        let right_client = first_sender_datagrams(socket);
+        tokio::spawn(async move {
+            if let Some(datagrams) = right_client.await {
+                let _ = replace.send(datagrams);
+            }
+        });
+        let client = connect_udp(UdpTransportConfig::new(
+            server_addr,
+            "localhost".into(),
+            TunnelConfig {
+                request_id: request.request_id,
+                security_cookie,
+            },
+        ))
+        .await
+        .expect("client transport");
+        let server = server
+            .await
+            .expect("accept task")
+            .expect("sideband transport over the replacement");
+
+        client.send(b"over udp".to_vec()).await.expect("client sends");
+        assert_eq!(server.recv().await.expect("server receives").data, b"over udp");
+    }
+
+    #[tokio::test]
+    async fn sideband_without_a_replacement_ends_with_its_failed_handshake() {
+        let datagrams: Box<dyn SidebandDatagrams> = Box::new(GuessedDatagrams {
+            syn: std::sync::Mutex::new(Some(vec![0xff; 16])),
+            replacement: std::sync::Mutex::new(None),
+        });
+        let request = request([0x44; 16]);
+        let accept = accept_sideband(Box::pin(async move { Some(datagrams) }), tls_config(), &request);
+        let result = tokio::time::timeout(Duration::from_secs(1), accept)
+            .await
+            .expect("over without waiting for the deadline");
+        assert!(result.is_none());
     }
 }

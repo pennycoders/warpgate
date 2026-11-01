@@ -592,6 +592,37 @@ async fn a_guessed_request_closes_with_its_handshake() {
     assert!(listener.routes().is_empty());
 }
 
+// oracle: spec MS-RDPEUDP 2.2.2.9, 3.1.5.1.1 step 5
+#[tokio::test]
+async fn a_cookie_takes_over_after_the_guessed_handshake_failed() {
+    let listener = UdpListener::new();
+    let socket = reply_socket().await;
+    let pending = listener
+        .sideband(addr(VIEWER, 50000))
+        .open(&request(1, [0x11; 16]));
+    listener.deliver(&socket, addr(VIEWER, 61001), &syn(UdpVersion::V2, [0; 16]));
+    let guessed = opened(pending).await.expect("guessed flow");
+
+    // The handshake over the guessed flow failed: the server dropped its datagrams but
+    // still waits for a replacement.
+    let replacement = guessed.replacement();
+    drop(guessed);
+    assert!(listener.routes().flows.is_empty());
+    let hashed = syn(UdpVersion::V3, [0x11; 16]);
+    assert_eq!(
+        listener.routes().route(addr(VIEWER, 61002), &hashed),
+        Route::Replace { id: 0 }
+    );
+    listener.deliver(&socket, addr(VIEWER, 61002), &hashed);
+    let right = tokio::time::timeout(Duration::from_secs(1), replacement)
+        .await
+        .expect("replaced in time")
+        .expect("the hashed sender's flow");
+    assert_eq!(right.peer_addr(), addr(VIEWER, 61002));
+    assert_eq!(next_datagram(right.as_ref()).await, hashed);
+    assert!(listener.routes().pending.is_empty());
+}
+
 // oracle: spec MS-RDPEUDP 3.1.5.1.1 step 4, 2.2.2.9
 #[tokio::test]
 async fn a_syn_ironrdp_cannot_accept_is_not_routed() {

@@ -192,14 +192,22 @@ two accepts get different numbers.
 An embedder can tell which client answers a request for certain only from a version 3
 SYN's `cookieHash` (MS-RDPEUDP 2.2.2.9). A SYN without one (version 1 or 2) can only be
 matched by its source address, and a sender that forges that address can be handed the
-request first. `SidebandDatagrams::replacement` (default: never) lets the embedder hand
-over such a guess and still offer the right client once its hashed SYN arrives:
-`accept_sideband` takes the future before each handshake and, when it resolves, drops the
-guessed datagrams and starts the handshake over with the replacement, within the same
-`UDP_ACCEPT_TIMEOUT`. Dropping the future tells the embedder that the handshake is over.
-The Tunnel Create Request check (MS-RDPEMT 3.2.5.1) applies to whichever client finishes.
+request first. `SidebandDatagrams::replacement` (default: `None` at once) lets the
+embedder hand over such a guess and still offer the right client once its hashed SYN
+arrives: `accept_sideband` takes the future before each handshake and, when it resolves,
+drops the guessed datagrams and starts the handshake over with the replacement, within the
+same `UDP_ACCEPT_TIMEOUT`. A handshake that fails over guessed datagrams does not end the
+wait: the forging sender can break its own handshake at once (a bad TLS record, or a bad
+Tunnel Create Request; `ironrdp-rdpeudp` does not check the ACK's `snSourceAck` either),
+so `accept_sideband` keeps awaiting the replacement until the deadline and only then gives
+up. Dropping the future tells the embedder that the accept is over. The Tunnel Create
+Request check (MS-RDPEMT 3.2.5.1) applies to whichever client finishes.
 `multitransport::tests::sideband_restarts_the_handshake_with_a_replacement` brings the
-transport up over the replacement after a guessed client that never answers.
+transport up over the replacement after a guessed client that never answers,
+`sideband_waits_for_a_replacement_after_a_guessed_handshake_fails` after one whose
+handshake fails before the right client has sent its SYN, and
+`sideband_without_a_replacement_ends_with_its_failed_handshake` checks that datagrams with
+nothing to replace them still end the accept as soon as their handshake fails.
 
 ### UDP accepts end with their connection
 
