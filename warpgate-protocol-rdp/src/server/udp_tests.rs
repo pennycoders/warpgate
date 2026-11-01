@@ -743,7 +743,8 @@ async fn one_address_gets_a_bounded_share() {
         .open(&request(101, [0xef; 16]));
     assert_eq!(listener.routes().pending.len(), MAX_PER_ADDRESS + 1);
 
-    // Requests that open flows keep counting against the address.
+    // Requests that open flows keep counting against the address while their handshake
+    // runs.
     let (cookie, first) = waiting.remove(0);
     listener.deliver(&socket, addr(VIEWER, 61000), &syn(UdpVersion::V3, cookie));
     let _flow = opened(first).await.expect("flow");
@@ -751,6 +752,59 @@ async fn one_address_gets_a_bounded_share() {
         .sideband(addr(VIEWER, 51001))
         .open(&request(102, [0xf0; 16]));
     assert!(opened(refused).await.is_none());
+
+    // Once the peer acknowledges the SYN+ACK (MS-RDPEUDP 3.1.5.2 step 5), the flow no
+    // longer does.
+    listener.deliver(&socket, addr(VIEWER, 61000), &ack(b"ack"));
+    let _admitted = listener
+        .sideband(addr(VIEWER, 51002))
+        .open(&request(103, [0xf1; 16]));
+    assert_eq!(listener.routes().pending.len(), MAX_PER_ADDRESS + 1);
+}
+
+// oracle: spec MS-RDPEUDP 3.1.5.2
+#[tokio::test]
+async fn viewers_behind_one_address_all_get_flows() {
+    let listener = UdpListener::new();
+    let socket = reply_socket().await;
+    let mut flows = Vec::new();
+    for n in 0..3 * MAX_PER_ADDRESS {
+        let cookie = [u8::try_from(n).unwrap() + 1; 16];
+        let port = 50000 + u16::try_from(n).unwrap();
+        let peer = addr(VIEWER, 61000 + u16::try_from(n).unwrap());
+        let pending = listener
+            .sideband(addr(VIEWER, port))
+            .open(&request(u32::try_from(n).unwrap(), cookie));
+        listener.deliver(&socket, peer, &syn(UdpVersion::V3, cookie));
+        let flow = opened(pending)
+            .await
+            .expect("flow behind the shared address");
+        listener.deliver(&socket, peer, &ack(b"ack"));
+        flows.push(flow);
+    }
+    assert_eq!(listener.routes().flows.len(), 3 * MAX_PER_ADDRESS);
+    assert_eq!(listener.routes().setting_up(VIEWER.into()), 0);
+}
+
+// oracle: spec MS-RDPEUDP 2.2.2.9
+#[tokio::test]
+async fn a_guessed_request_and_its_flow_count_once() {
+    let listener = UdpListener::new();
+    let socket = reply_socket().await;
+    let pending = listener
+        .sideband(addr(VIEWER, 50000))
+        .open(&request(1, [0x11; 16]));
+    assert_eq!(listener.routes().setting_up(VIEWER.into()), 1);
+    listener.deliver(&socket, addr(VIEWER, 61001), &syn(UdpVersion::V2, [0; 16]));
+    let guessed = opened(pending).await.expect("guessed flow");
+    assert_eq!(listener.routes().setting_up(VIEWER.into()), 1);
+
+    // A failed guessed handshake drops the flow; the request still waits for its cookie.
+    let replacement = guessed.replacement();
+    drop(guessed);
+    assert_eq!(listener.routes().setting_up(VIEWER.into()), 1);
+    drop(replacement);
+    assert_eq!(listener.routes().setting_up(VIEWER.into()), 0);
 }
 
 #[test]

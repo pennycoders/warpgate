@@ -94,8 +94,17 @@ const MAX_PENDING: usize = 256;
 /// Flows that may be open at once; past this a SYN is dropped and its viewer stays on TCP.
 const MAX_FLOWS: usize = 1024;
 
-/// Waiting requests and open flows from one IP address; past this another connection from
-/// it stays on TCP.
+/// Requests from one IP address still setting up: waiting for their SYN, or with a flow
+/// still in its handshake. Past this another connection from it stays on TCP until one of
+/// them is through.
+///
+/// A flow is through its handshake once its peer sends something other than a SYN, the
+/// ACK of the SYN+ACK after which the server is Established (MS-RDPEUDP 3.1.5.2 step 5),
+/// and then no longer counts: viewers behind one NAT share an address, and every one of
+/// them gets UDP as long as no more than this many set up at once. Flows past their
+/// handshake are bounded by [`MAX_FLOWS`] and by their connections: each one needs a
+/// request of its own, and one whose transport does not come up closes with its accept
+/// (`UDP_ACCEPT_TIMEOUT`, 15 s, in `ironrdp-server`).
 const MAX_PER_ADDRESS: usize = 8;
 
 /// How long the listener waits after a failed receive, so a socket that keeps failing does
@@ -270,29 +279,32 @@ impl Routes {
             }
             ClientSyn::Unroutable => return Route::Drop(DropReason::Unroutable),
         };
-        if self.flows_from(source) >= MAX_PER_ADDRESS {
+        if self.handshakes_from(source, |_| true) >= MAX_PER_ADDRESS {
             return Route::Drop(DropReason::TooManyFromAddress);
         }
         opened
     }
 
-    fn flows_from(&self, ip: IpAddr) -> usize {
+    /// Flows from `ip` still in their handshake whose request `counted` says to count.
+    fn handshakes_from(&self, ip: IpAddr, counted: impl Fn(u64) -> bool) -> usize {
         self.flows
-            .keys()
-            .filter(|peer| peer.ip().to_canonical() == ip)
+            .iter()
+            .filter(|(peer, flow)| {
+                flow.handshake && peer.ip().to_canonical() == ip && counted(flow.id)
+            })
             .count()
     }
 
-    /// Requests waiting for a SYN from `ip`, and flows open from it.
-    fn used_by(&self, ip: IpAddr) -> usize {
-        let waiting = self
+    /// Requests from `ip` still setting up (see [`MAX_PER_ADDRESS`]): those still pending,
+    /// waiting for a SYN or matched on a guess, and those whose flow is in its handshake.
+    /// A guessed request and its flow count once.
+    fn setting_up(&self, ip: IpAddr) -> usize {
+        let pending = self
             .pending
             .values()
-            .filter(|pending| {
-                pending.viewer_ip == ip && matches!(pending.state, PendingState::Waiting(_))
-            })
+            .filter(|pending| pending.viewer_ip == ip)
             .count();
-        waiting + self.flows_from(ip)
+        pending + self.handshakes_from(ip, |id| !self.pending.contains_key(&id))
     }
 
     fn is_empty(&self) -> bool {
@@ -628,8 +640,10 @@ impl UdpListener {
         if routes.pending.len() >= MAX_PENDING {
             return Err("Too many viewers waiting for their RDP UDP SYN, continuing over TCP");
         }
-        if routes.used_by(viewer_ip) >= MAX_PER_ADDRESS {
-            return Err("Too many RDP UDP flows from this viewer's address, continuing over TCP");
+        if routes.setting_up(viewer_ip) >= MAX_PER_ADDRESS {
+            return Err(
+                "Too many RDP UDP flows setting up from this viewer's address, continuing over TCP",
+            );
         }
         let id = routes.next_id;
         routes.next_id = routes.next_id.wrapping_add(1);
