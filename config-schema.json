@@ -413,7 +413,7 @@
           "default": false
         },
         "udp": {
-          "description": "Offer native viewers the reliable UDP transport (MS-RDPEMT, MS-RDPEUDP) on the RDP\nlisten port, which then has to be reachable over UDP as well as TCP. The Graphics\nPipeline is what moves onto it, so it needs `graphics_pipeline`. Read at startup.",
+          "description": "Offer native viewers the reliable UDP transport (MS-RDPEMT, MS-RDPEUDP) on the RDP\nlisten port, which then has to be reachable over UDP as well as TCP. The Graphics\nPipeline is what moves onto it, so it needs `graphics_pipeline`. Applied whenever the\nRDP listener binds: at startup, and when its listen address, `proxy_protocol` or\ncertificate changes. If the UDP port cannot be bound, RDP is served over TCP only.\n\nReplies leave from the address the system routes them from, so on a host with\nseveral addresses `listen` has to name the one viewers connect to rather than a\nwildcard. A viewer's UDP traffic has to come from the IP its TCP connection came\nfrom (as `proxy_protocol` reports it, if enabled); behind SNAT or a proxy that\nchanges one but not the other, viewers stay on TCP.",
           "type": "boolean",
           "default": false
         }

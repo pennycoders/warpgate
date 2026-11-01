@@ -834,7 +834,15 @@ pub struct RdpConfig {
 
     /// Offer native viewers the reliable UDP transport (MS-RDPEMT, MS-RDPEUDP) on the RDP
     /// listen port, which then has to be reachable over UDP as well as TCP. The Graphics
-    /// Pipeline is what moves onto it, so it needs `graphics_pipeline`. Read at startup.
+    /// Pipeline is what moves onto it, so it needs `graphics_pipeline`. Applied whenever the
+    /// RDP listener binds: at startup, and when its listen address, `proxy_protocol` or
+    /// certificate changes. If the UDP port cannot be bound, RDP is served over TCP only.
+    ///
+    /// Replies leave from the address the system routes them from, so on a host with
+    /// several addresses `listen` has to name the one viewers connect to rather than a
+    /// wildcard. A viewer's UDP traffic has to come from the IP its TCP connection came
+    /// from (as `proxy_protocol` reports it, if enabled); behind SNAT or a proxy that
+    /// changes one but not the other, viewers stay on TCP.
     #[serde(default)]
     pub udp: bool,
 }

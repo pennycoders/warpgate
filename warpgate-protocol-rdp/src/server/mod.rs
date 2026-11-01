@@ -55,7 +55,7 @@ mod udp;
 use bridge::connect_backend;
 use hold_screen::{hold_while, run_banner_screen, run_hold_screen};
 use protocol::{AuthVerdict, Event as ServerEvent, Input as ServerInput};
-use udp::UdpListener;
+use udp::{UdpHold, UdpServices};
 use warpgate_desktop_auth::{
     AdmissionHold, DesktopAuthOutcome, admit_desktop_session, authenticate, finalize_user_auth,
 };
@@ -105,7 +105,8 @@ pub async fn bind_server(
 ) -> Result<BoxFuture<'static, Result<()>>> {
     let listener = address.tcp_accept_stream().await?;
     // The reliable UDP transport (MS-RDPEMT) on the same port, one socket for every viewer
-    // (MS-RDPEUDP 2.1, 3.1.3).
+    // (MS-RDPEUDP 2.1, 3.1.3). It outlives this listener (see `UdpServices`): a restart takes
+    // the same socket back, with the flows that viewers have open on it.
     let (udp_enabled, graphics_pipeline) = {
         let config = services.config.lock().await;
         (config.store.rdp.udp, config.store.rdp.graphics_pipeline)
@@ -114,28 +115,30 @@ pub async fn bind_server(
         warn!("rdp.udp has no effect without rdp.graphics_pipeline: only graphics move onto UDP");
     }
     let udp = if udp_enabled && graphics_pipeline {
-        let sockets = address
-            .udp_sockets()
-            .await
-            .context("binding the RDP UDP port")?;
-        info!(address = %address.address(), "Offering RDP viewers the UDP transport");
-        Some((UdpListener::new(), sockets))
+        match UdpServices::global().acquire(&address).await {
+            Ok(udp) => {
+                info!(address = %address.address(), "Offering RDP viewers the UDP transport");
+                Some(udp)
+            }
+            // The transport is optional: viewers stay on TCP, as they do with rdp.udp off.
+            Err(error) => {
+                warn!(
+                    address = %address.address(),
+                    %error,
+                    "Could not bind the RDP UDP port; serving RDP over TCP only until the listener restarts"
+                );
+                None
+            }
+        }
     } else {
         None
     };
-    let (udp, udp_sockets) = udp.unzip();
 
     Ok(async move {
-        let udp_serve = {
-            let udp = udp.clone();
-            async move {
-                if let (Some(udp), Some(sockets)) = (udp, udp_sockets) {
-                    udp.serve(sockets).await;
-                }
-                std::future::pending::<()>().await;
-            }
-        };
-        let tcp_accept = accept_loop(
+        // Held for as long as this listener accepts; connections take the listener itself.
+        let udp_hold = udp;
+        let udp = udp_hold.as_ref().map(UdpHold::listener);
+        accept_loop(
             "RDP connection",
             listener,
             proxy_protocol,
@@ -185,11 +188,9 @@ pub async fn bind_server(
                     Ok(())
                 }
             },
-        );
-        tokio::select! {
-            () = tcp_accept => {}
-            () = udp_serve => {}
-        }
+        )
+        .await;
+        drop(udp_hold);
 
         Ok(())
     }

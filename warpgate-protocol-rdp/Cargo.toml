@@ -60,6 +60,9 @@ warpgate-desktop-ui = { path = "../warpgate-desktop-ui" }
 warpgate-tls = { path = "../warpgate-tls" }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 ironrdp-rdpemt = "0.1"
 ironrdp-rdpeudp-tokio = "0.2"
