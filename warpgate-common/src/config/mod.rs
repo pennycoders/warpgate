@@ -851,6 +851,12 @@ pub struct RdpConfig {
     /// Offer native viewers the Graphics Pipeline (MS-RDPEGFX), which resizes without a reactivation.
     #[serde(default = "_default_false")]
     pub graphics_pipeline: bool,
+
+    /// Offer native viewers the reliable UDP transport (MS-RDPEMT, MS-RDPEUDP) on the RDP
+    /// listen port, which then has to be reachable over UDP as well as TCP. The Graphics
+    /// Pipeline is what moves onto it, so it needs `graphics_pipeline`. Read at startup.
+    #[serde(default)]
+    pub udp: bool,
 }
 
 impl Default for RdpConfig {
@@ -864,6 +870,7 @@ impl Default for RdpConfig {
             certificate: "".into(),
             key: "".into(),
             graphics_pipeline: false,
+            udp: false,
         }
     }
 }

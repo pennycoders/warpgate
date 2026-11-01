@@ -86,7 +86,8 @@
         "graphics_pipeline": false,
         "key": "",
         "listen": "[::]:3389",
-        "proxy_protocol": false
+        "proxy_protocol": false,
+        "udp": false
       }
     },
     "recordings": {
@@ -408,6 +409,11 @@
         },
         "proxy_protocol": {
           "description": "Accept HAProxy PROXY protocol v1/v2 headers from the listener's peer.",
+          "type": "boolean",
+          "default": false
+        },
+        "udp": {
+          "description": "Offer native viewers the reliable UDP transport (MS-RDPEMT, MS-RDPEUDP) on the RDP\nlisten port, which then has to be reachable over UDP as well as TCP. The Graphics\nPipeline is what moves onto it, so it needs `graphics_pipeline`. Read at startup.",
           "type": "boolean",
           "default": false
         }

@@ -19,7 +19,7 @@ use ironrdp_server::{
     BitmapUpdate, ConnectionHandler, ConnectionInfo, CredentialDecision, CredentialValidationError,
     CredentialValidator, Credentials, DesktopSize, DisplayContext, DisplayUpdate, GfxServerFactory,
     KeyboardEvent, MouseButton, MouseEvent, PixelFormat, RGBAPointer, RdpServer, RdpServerDisplay,
-    RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerResult,
+    RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerResult, UdpSideband,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -55,6 +55,7 @@ pub fn run_on_thread<S>(
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
     drives: super::ViewerDrives,
+    udp: Option<Arc<dyn UdpSideband>>,
 ) -> oneshot::Receiver<Result<()>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -84,6 +85,7 @@ where
                 out_tx,
                 in_rx,
                 drives,
+                udp,
             )
             .instrument(span),
         );
@@ -102,6 +104,7 @@ async fn run<S>(
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
     drives: super::ViewerDrives,
+    udp: Option<Arc<dyn UdpSideband>>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -144,7 +147,7 @@ where
         out: out_tx.clone(),
     });
 
-    let mut server = RdpServer::builder()
+    let server = RdpServer::builder()
         // `addr` is only used by `RdpServer::run()` (which binds a listener); we drive
         // `run_connection()` directly with the accepted stream, so it's a harmless
         // placeholder here.
@@ -169,8 +172,14 @@ where
         )
         .with_bitmap_codecs(bitmap_codecs(graphics_pipeline))
         .with_rdpdr_factory(Some(Box::new(drives)))
-        .with_connection_handler(Some(Box::new(ViewerConnectionLog)))
-        .build();
+        .with_connection_handler(Some(Box::new(ViewerConnectionLog)));
+    // Graphics move onto the UDP transport once it is up (MS-RDPEDYC 3.1.5.3 Soft-Sync);
+    // the target side stays on TCP.
+    let mut server = match udp {
+        Some(udp) => server.with_udp_sideband(udp),
+        None => server,
+    }
+    .build();
 
     let router = tokio::spawn(
         route_input(
