@@ -1196,7 +1196,7 @@ struct TargetChannels {
     /// Where the target's sound goes, when it is played.
     audio: Option<Sender<DesktopEvent>>,
     /// The `AUDIO_INPUT` channel, when the target may record the viewer's microphone.
-    microphone: Option<ironrdp_rdpeai::client::RdpeaiClient>,
+    microphone: Option<microphone::MicrophoneChannel>,
     /// Device redirection serving the viewer's drives, with the silent sound channel
     /// Windows needs before it services it.
     drives: Option<(ironrdp_rdpdr::Rdpdr, Rdpsnd)>,
@@ -1222,7 +1222,9 @@ fn target_connector(
     }
     let records = microphone.is_some();
     if let Some(microphone) = microphone {
-        drdynvc = drdynvc.with_dynamic_channel(microphone);
+        // A new processor for every recording: the target closes the channel in between.
+        drdynvc = drdynvc
+            .with_dynamic_channel_factory(ironrdp_rdpeai::CHANNEL_NAME, move || microphone.open());
     }
     if config.support_dyn_vc_gfx_protocol {
         // With no H.264 decoder the client advertises only the non-AVC capability sets it
@@ -1402,11 +1404,10 @@ mod tests {
     #[test]
     fn the_microphone_channel_is_offered_only_with_the_option() {
         use ironrdp_dvc::DrdynvcClient;
-        use ironrdp_rdpeai::client::RdpeaiClient;
 
         let options: warpgate_common::TargetRdpOptions =
             serde_json::from_str(r#"{"host":"h"}"#).unwrap();
-        let offers_audio_input = |microphone: Option<RdpeaiClient>| {
+        let offers_audio_input = |microphone: Option<super::microphone::MicrophoneChannel>| {
             use ironrdp_core::{Decode as _, ReadCursor, encode_vec};
             use ironrdp_dvc::pdu::{
                 CapabilitiesRequestPdu, CapsVersion, CreateRequestPdu, CreationStatus,
