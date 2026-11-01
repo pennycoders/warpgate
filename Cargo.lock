@@ -9402,6 +9402,7 @@ dependencies = [
  "ironrdp-session",
  "ironrdp-svc",
  "ironrdp-tokio",
+ "libc",
  "libz-sys",
  "openssl",
  "rcgen",
