@@ -138,6 +138,30 @@ so an embedder can see which clients offer the UDP transports (MS-RDPBCGR 2.2.15
 Soft-Sync (MS-RDPEDYC 3.1.5.3) without reaching into the acceptor. Warpgate logs it once
 per viewer connection.
 
+## UDP multitransport over the embedder's own listener
+
+Upstream's `with_udp_transport` binds a fresh UDP socket per connection for the sideband
+transport (`multitransport::accept`), which `ironrdp-rdpeudp-tokio` then `connect()`s to
+the first peer that sends to it. MS-RDPEUDP 2.1 and 3.1.3 have the terminal server listen
+on one UDP socket, bound to the RDP port, for every connection, and the client sends its
+SYN (3.1.5.1.1) to that port; with a socket per connection a second session's bind fails
+and it stays on TCP, so only one session at a time can use UDP.
+
+`RdpServerBuilder::with_udp_sideband` (`RdpServerOptions::udp_sideband`) takes an
+`Arc<dyn UdpSideband>` instead. When the acceptor has sent the Initiate Multitransport
+Request (MS-RDPBCGR 2.2.15.1), the server calls `UdpSideband::open` with it, before
+anything else runs, so the embedder can be ready for the client's SYN: a version 3 SYN
+carries the SHA-256 of the request's `securityCookie` as its `cookieHash` (MS-RDPEUDP
+2.2.2.9). `open` returns a future of the client's datagrams (`SidebandDatagrams`, SYN
+first), and `multitransport::accept_sideband` runs the RDPEUDP, TLS and RDPEMT handshakes
+over them through `ironrdp_rdpeudp_tokio::accept_udp_with_datagram_io` (see that fork's
+PATCHES.md). The wait for the datagrams and the handshakes share `UDP_ACCEPT_TIMEOUT`, and
+every failure falls back to TCP-only as on the socket path. The Tunnel Create Request is
+still checked against the request's `RequestID` and `SecurityCookie` (MS-RDPEMT 3.2.5.1),
+whatever the embedder routed. `with_udp_sideband` takes precedence over
+`with_udp_transport`; either one makes `PendingConnection::new` offer the transport
+(`RdpServerOptions::offers_udp`).
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the

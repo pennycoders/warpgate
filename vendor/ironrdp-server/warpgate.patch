@@ -1,3 +1,70 @@
+diff -ruN ironrdp-server-1f4dee6b/src/builder.rs base/src/builder.rs
+--- ironrdp-server-1f4dee6b/src/builder.rs
++++ base/src/builder.rs
+@@ -16,6 +16,7 @@
+     RdpServerSecurity, StaticChannelFactory,
+ };
+ use crate::error::ServerResult;
++use crate::multitransport::UdpSideband;
+ #[cfg(feature = "usb")]
+ use crate::urbdrc::DeviceFactory;
+ use crate::{
+@@ -65,6 +66,7 @@
+     remotefx_quant: Quant,
+     remotefx_entropy_coder: Option<EntropyBits>,
+     udp_bind_addr: Option<SocketAddr>,
++    udp_sideband: Option<Arc<dyn UdpSideband>>,
+ }
+ 
+ pub struct RdpServerBuilder<State> {
+@@ -180,6 +182,7 @@
+                 remotefx_quant: Quant::default(),
+                 remotefx_entropy_coder: None,
+                 udp_bind_addr: None,
++                udp_sideband: None,
+             },
+         }
+     }
+@@ -216,6 +219,7 @@
+                 remotefx_quant: Quant::default(),
+                 remotefx_entropy_coder: None,
+                 udp_bind_addr: None,
++                udp_sideband: None,
+             },
+         }
+     }
+@@ -471,6 +475,23 @@
+         self
+     }
+ 
++    /// Offer UDP multitransport like [`Self::with_udp_transport`], over a UDP
++    /// port the embedder listens on and demultiplexes itself instead of a
++    /// socket per connection.
++    ///
++    /// MS-RDPEUDP 2.1 and 3.1.3 have the server take every connection on one
++    /// UDP socket bound to the RDP port, which a socket per connection allows
++    /// only one connection at a time. For each Initiate Multitransport Request
++    /// (MS-RDPBCGR 2.2.15.1) the server asks `sideband` for the datagrams of
++    /// the client answering it (see [`UdpSideband::open`]) and runs the
++    /// RDPEUDP, TLS and RDPEMT handshakes over them. Takes precedence over
++    /// [`Self::with_udp_transport`]; the same security requirement and TCP-only
++    /// fallback apply.
++    pub fn with_udp_sideband(mut self, sideband: Arc<dyn UdpSideband>) -> Self {
++        self.state.udp_sideband = Some(sideband);
++        self
++    }
++
+     pub fn build(self) -> RdpServer {
+         let mut server = RdpServer::new(
+             RdpServerOptions {
+@@ -483,6 +504,7 @@
+                 remotefx_quant: self.state.remotefx_quant,
+                 remotefx_entropy_coder: self.state.remotefx_entropy_coder,
+                 udp_bind_addr: self.state.udp_bind_addr,
++                udp_sideband: self.state.udp_sideband,
+             },
+             self.state.handler,
+             self.state.display,
 diff -ruN ironrdp-server-1f4dee6b/src/capabilities.rs base/src/capabilities.rs
 --- ironrdp-server-1f4dee6b/src/capabilities.rs
 +++ base/src/capabilities.rs
@@ -623,7 +690,15 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/src/encoder/mod.rs
 diff -ruN ironrdp-server-1f4dee6b/src/lib.rs base/src/lib.rs
 --- ironrdp-server-1f4dee6b/src/lib.rs
 +++ base/src/lib.rs
-@@ -36,7 +36,7 @@
+@@ -28,6 +28,7 @@
+ mod urbdrc;
+ 
+ pub use clipboard::CliprdrServerFactory;
++pub use multitransport::{SidebandDatagrams, SidebandFuture, UdpSideband};
+ pub use display::{
+     BitmapUpdate, ColorPointer, DesktopSize, DisplayContext, DisplayUpdate, Framebuffer, LargePointer, PixelFormat,
+     RGBAPointer, RdpServerDisplay, RdpServerDisplayUpdates,
+@@ -36,7 +37,7 @@
  #[cfg(all(feature = "__test", feature = "qoiz"))]
  pub use encoder::qoiz::Compressor as QoizCompressor;
  #[cfg(feature = "__test")]
@@ -632,7 +707,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/lib.rs base/src/lib.rs
  pub use error::{ServerError, ServerErrorExt, ServerErrorKind, ServerResult, ServerResultExt};
  #[cfg(feature = "egfx")]
  pub use gfx::{EgfxServerMessage, GfxContext, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
-@@ -60,8 +60,6 @@
+@@ -60,8 +61,6 @@
  pub use server::autodetect_response_from_sub_header;
  #[cfg(all(feature = "__test", feature = "egfx"))]
  pub use server::autodetect_sub_header;
@@ -641,7 +716,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/lib.rs base/src/lib.rs
  pub use server::{
      AuthenticatedConnection, AutoReconnectCookieHandle, BoundConnection, ConnectionBinder, ConnectionHandler,
      ConnectionInfo, ConnectionPolicy, ConnectionSource, CredentialDecision, CredentialValidationError,
-@@ -70,6 +68,8 @@
+@@ -70,6 +69,8 @@
      ServerEventSender, ServerRedirectionHandle, SessionOutcome, StaticChannelFactory, TransportTls,
      pick_remotefx_entropy_coder,
  };
@@ -650,6 +725,178 @@ diff -ruN ironrdp-server-1f4dee6b/src/lib.rs base/src/lib.rs
  pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
  #[cfg(feature = "usb")]
  pub use urbdrc::{
+diff -ruN ironrdp-server-1f4dee6b/src/multitransport.rs base/src/multitransport.rs
+--- ironrdp-server-1f4dee6b/src/multitransport.rs
++++ base/src/multitransport.rs
+@@ -9,14 +9,20 @@
+ //!
+ //! [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b8e7c588-51cb-455b-bb73-92d480903133
+ 
++use core::future::Future;
+ use core::net::{SocketAddr, SocketAddrV6};
++use core::pin::Pin;
+ use core::time::Duration;
++use std::io;
+ use std::sync::Arc;
+ 
+ use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+ use ironrdp_rdpemt::TunnelConfig;
+ use ironrdp_rdpeudp::ConnectionConfig;
+-use ironrdp_rdpeudp_tokio::{TunnelMessage, UdpAcceptConfig, UdpTransport, UdpTransportSender, accept_udp};
++use ironrdp_rdpeudp_tokio::{
++    DatagramIo, TunnelMessage, UdpAcceptConfig, UdpTransport, UdpTransportSender, accept_udp,
++    accept_udp_with_datagram_io,
++};
+ use tokio::net::UdpSocket;
+ use tokio::sync::Mutex;
+ use tokio_rustls::rustls;
+@@ -27,6 +33,81 @@
+ /// continuing TCP-only.
+ const UDP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
+ 
++/// A boxed future, as the object-safe sideband traits below return them.
++pub type SidebandFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
++
++/// One client's datagrams on a UDP port the embedder listens on for every
++/// connection and demultiplexes itself; see [`UdpSideband`].
++pub trait SidebandDatagrams: Send + Sync + 'static {
++    /// The client's address: where [`Self::send`] sends to and what
++    /// [`Self::recv`] receives from.
++    fn peer_addr(&self) -> SocketAddr;
++
++    /// The local address the client sent to, if known.
++    fn local_addr(&self) -> Option<SocketAddr>;
++
++    /// Sends one datagram to the client.
++    fn send<'a>(&'a self, buf: &'a [u8]) -> SidebandFuture<'a, io::Result<usize>>;
++
++    /// Receives the client's next datagram into `buf` and returns its length,
++    /// truncating one longer than `buf`.
++    ///
++    /// Must be cancellation safe: the transport awaits it inside
++    /// `tokio::select!`, and a datagram has to be either returned or kept for
++    /// the next call.
++    fn recv<'a>(&'a self, buf: &'a mut [u8]) -> SidebandFuture<'a, io::Result<usize>>;
++}
++
++/// The sideband UDP transport of a server that listens on one UDP port for
++/// every connection, as MS-RDPEUDP 2.1 and 3.1.3 describe.
++///
++/// [`RdpServerBuilder::with_udp_transport`](crate::RdpServerBuilder::with_udp_transport)
++/// binds a socket per connection instead, so only one connection at a time
++/// can take the port. With a `UdpSideband`
++/// ([`RdpServerBuilder::with_udp_sideband`](crate::RdpServerBuilder::with_udp_sideband))
++/// the embedder owns the listening socket and hands each connection the
++/// datagrams of the client that answers its Initiate Multitransport Request
++/// (MS-RDPBCGR 2.2.15.1).
++pub trait UdpSideband: Send + Sync {
++    /// Called once the server has sent `request`, with its `requestId` and
++    /// `securityCookie`.
++    ///
++    /// Whatever the embedder needs to recognize the client's SYN
++    /// (MS-RDPEUDP 3.1.5.1.1) has to be in place by the time this returns, not
++    /// when the future is first polled: the client may already be sending. A
++    /// version 3 SYN carries the SHA-256 of `securityCookie` as its
++    /// `cookieHash` (MS-RDPEUDP 2.2.2.9).
++    ///
++    /// The future resolves to that client's datagrams, the SYN first, or to
++    /// `None` when there are none to give (the server then continues
++    /// TCP-only). The server bounds the wait together with the handshake that
++    /// follows and drops the future, or the datagrams, when it gives up or the
++    /// connection ends; the embedder can release what it set up for the
++    /// request then.
++    fn open(&self, request: &MultitransportRequestPdu) -> SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>>;
++}
++
++/// [`SidebandDatagrams`] as the transport's [`DatagramIo`].
++struct BoxedDatagrams(Box<dyn SidebandDatagrams>);
++
++impl DatagramIo for BoxedDatagrams {
++    fn local_addr(&self) -> Option<SocketAddr> {
++        self.0.local_addr()
++    }
++
++    fn peer_addr(&self) -> Option<SocketAddr> {
++        Some(self.0.peer_addr())
++    }
++
++    fn send<'a>(&'a self, buf: &'a [u8]) -> impl Future<Output = io::Result<usize>> + Send + 'a {
++        self.0.send(buf)
++    }
++
++    fn recv<'a>(&'a self, buf: &'a mut [u8]) -> impl Future<Output = io::Result<usize>> + Send + 'a {
++        self.0.recv(buf)
++    }
++}
++
+ /// Shared handle to an established sideband UDP transport.
+ ///
+ /// `send()` uses `UdpTransportSender`, cloned once at construction from the
+@@ -124,17 +205,60 @@
+         }
+     };
+ 
+-    let config = UdpAcceptConfig {
++    let config = accept_config(tls_config, request, UDP_ACCEPT_TIMEOUT);
++    established(accept_udp(socket, config).await)
++}
++
++/// [`accept`], over the client's datagrams as `sideband` hands them over
++/// rather than over a socket of its own.
++///
++/// `datagrams` is what [`UdpSideband::open`] returned for `request`. The wait
++/// for it and the handshake share one [`UDP_ACCEPT_TIMEOUT`]; failures are
++/// handled as in [`accept`].
++pub(crate) async fn accept_sideband(
++    datagrams: SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>>,
++    tls_config: Arc<rustls::ServerConfig>,
++    request: &MultitransportRequestPdu,
++) -> Option<UdpTransportHandle> {
++    let deadline = tokio::time::Instant::now() + UDP_ACCEPT_TIMEOUT;
++    let datagrams = match tokio::time::timeout_at(deadline, datagrams).await {
++        Ok(Some(datagrams)) => datagrams,
++        Ok(None) => {
++            debug!("No sideband UDP datagrams for this connection, continuing TCP-only");
++            return None;
++        }
++        Err(_) => {
++            debug!(timeout = ?UDP_ACCEPT_TIMEOUT, "Client sent no UDP SYN, continuing TCP-only");
++            return None;
++        }
++    };
++    let peer = datagrams.peer_addr();
++    debug!(%peer, "Client answered the multitransport request over UDP");
++    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
++    let config = accept_config(tls_config, request, remaining);
++    established(accept_udp_with_datagram_io(BoxedDatagrams(datagrams), config).await)
++}
++
++fn accept_config(
++    tls_config: Arc<rustls::ServerConfig>,
++    request: &MultitransportRequestPdu,
++    accept_timeout: Duration,
++) -> UdpAcceptConfig {
++    UdpAcceptConfig {
+         tls_config,
+         tunnel_config: TunnelConfig {
+             request_id: request.request_id,
+             security_cookie: request.security_cookie,
+         },
+         connection_config: ConnectionConfig::default(),
+-        accept_timeout: UDP_ACCEPT_TIMEOUT,
+-    };
++        accept_timeout,
++    }
++}
+ 
+-    match accept_udp(socket, config).await {
++fn established(
++    result: Result<UdpTransport, ironrdp_rdpeudp_tokio::UdpTransportError>,
++) -> Option<UdpTransportHandle> {
++    match result {
+         Ok(transport) => {
+             debug!("Sideband UDP transport established");
+             Some(UdpTransportHandle::new(transport))
 diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
 --- ironrdp-server-1f4dee6b/src/server.rs
 +++ base/src/server.rs
@@ -743,7 +990,26 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          }
      }
  }
-@@ -958,6 +1002,39 @@
+@@ -736,9 +780,18 @@
+     /// multitransport is offered. `None` disables the feature entirely. Set
+     /// via [`RdpServerBuilder::with_udp_transport`](crate::RdpServerBuilder::with_udp_transport).
+     pub udp_bind_addr: Option<SocketAddr>,
++    /// The embedder's own UDP listener for the sideband multitransport
++    /// transport, used instead of [`Self::udp_bind_addr`] when set. Set via
++    /// [`RdpServerBuilder::with_udp_sideband`](crate::RdpServerBuilder::with_udp_sideband).
++    pub udp_sideband: Option<Arc<dyn multitransport::UdpSideband>>,
+ }
+ 
+ impl RdpServerOptions {
++    /// Whether UDP multitransport is configured, by either of its two means.
++    fn offers_udp(&self) -> bool {
++        self.udp_bind_addr.is_some() || self.udp_sideband.is_some()
++    }
++
+     /// Default [MultifragmentUpdate] max reassembly buffer size (8 MB).
+     ///
+     /// Advertised to the client during capability exchange as the largest
+@@ -958,6 +1011,39 @@
      }
  }
  
@@ -783,7 +1049,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  #[cfg(feature = "usb")]
  #[derive(Default)]
  struct ServerUsbManager {
-@@ -1446,6 +1523,14 @@
+@@ -1446,6 +1532,14 @@
      Rdpsnd(RdpsndServerMessage),
      Rdpdr(RdpdrServerMessage),
      Rdpeai(RdpeaiServerMessage),
@@ -798,7 +1064,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
      Echo(EchoServerMessage),
      SetCredentials(Credentials),
      /// Replace or clear the Server Auto-Reconnect Cookie.
-@@ -1479,6 +1564,8 @@
+@@ -1479,6 +1573,8 @@
              Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
              Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
              Self::Rdpeai(..) => f.write_str("Rdpeai(..)"),
@@ -807,7 +1073,25 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
              Self::Echo(..) => f.write_str("Echo(..)"),
              Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
              Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
-@@ -1827,6 +1914,13 @@
+@@ -1628,7 +1724,7 @@
+         capabilities: Vec<CapabilitySet>,
+         creds: Option<Credentials>,
+         honor_client_desktop_size: Option<DesktopSize>,
+-        udp_bind_addr: Option<SocketAddr>,
++        offer_udp: bool,
+         credentials_handler: ServerCredentialsHandler,
+     ) -> Self {
+         let mut acceptor = Acceptor::new(security.flag(), desktop_size, capabilities, creds);
+@@ -1636,7 +1732,7 @@
+         // Multitransport requires Enhanced Security: `RdpServerSecurity::None`
+         // has nothing to authenticate the sideband transport's TLS with, and
+         // matches the reference client's own Enhanced-Security-only gate.
+-        if udp_bind_addr.is_some() && security.tls_acceptor().is_some() {
++        if offer_udp && security.tls_acceptor().is_some() {
+             // SOFT_SYNC_TCP_TO_UDP is included alongside the transport type
+             // itself: Without it, Soft-Sync is never negotiated (MS-RDPEDYC
+             // 3.1.5.3 requires both peers to advertise it), and
+@@ -1827,6 +1923,13 @@
      /// eligible for the hourly update when cookies are on request (see
      /// [`RdpServer::set_auto_reconnect_on_request`]).
      auto_reconnect_issued: bool,
@@ -821,7 +1105,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  }
  
  impl ConnectionState {
-@@ -1839,6 +1933,8 @@
+@@ -1839,6 +1942,8 @@
              autodetect: self.autodetect_handles.clone(),
              #[cfg(feature = "egfx")]
              gfx_handle: self.gfx_handle.clone(),
@@ -830,7 +1114,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          }
      }
  
-@@ -1852,6 +1948,42 @@
+@@ -1852,6 +1957,42 @@
          self.static_channels.get_channel_id_by_type::<T>()
      }
  
@@ -873,7 +1157,16 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
      #[cfg(feature = "usb")]
      fn remove_usb_device(&mut self, dvc_id: DynamicChannelId) {
          let Some(device) = self.usb_man.router.remove(&dvc_id) else {
-@@ -2714,7 +2846,7 @@
+@@ -2091,7 +2232,7 @@
+         capabilities,
+         ctx.creds.clone(),
+         ctx.opts.honor_client_desktop_size,
+-        ctx.opts.udp_bind_addr,
++        ctx.opts.offers_udp(),
+         ServerCredentialsHandler {
+             validator: ctx.credential_validator.clone(),
+             require_authenticated: ctx.requires_authenticated_credentials,
+@@ -2714,7 +2855,7 @@
          };
          let dvc = if let Some(monitor_count) = display_control_monitors {
              let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display), monitor_count);
@@ -882,7 +1175,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          } else {
              dvc
          };
-@@ -2730,9 +2862,12 @@
+@@ -2730,9 +2871,12 @@
              dvc
          };
  
@@ -898,7 +1191,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          } else {
              dvc
          };
-@@ -2786,6 +2921,9 @@
+@@ -2786,6 +2930,9 @@
              egfx_on_udp: false,
              early_tunnel_payloads: VecDeque::new(),
              auto_reconnect_issued: false,
@@ -908,7 +1201,16 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          }
      }
  
-@@ -3816,6 +3954,25 @@
+@@ -3022,7 +3169,7 @@
+             capabilities,
+             self.creds.clone(),
+             self.opts.honor_client_desktop_size,
+-            self.opts.udp_bind_addr,
++            self.opts.offers_udp(),
+             ServerCredentialsHandler {
+                 validator: self.credential_validator.clone(),
+                 require_authenticated: self.connection_binder.is_some(),
+@@ -3816,6 +3963,25 @@
                          .await?;
                  }
                  ServerEvent::Rdpsnd(s) => {
@@ -934,7 +1236,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                      let Some(rdpsnd) = conn.get_svc_processor::<RdpsndServer>() else {
                          warn!("No rdpsnd channel, dropping event");
                          continue;
-@@ -3955,6 +4112,7 @@
+@@ -3955,6 +4121,7 @@
                              input_buffer,
                              output_buffer_length,
                          ),
@@ -942,7 +1244,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                      }
                      .map_err_kind("failed to send rdpdr event", ServerErrorKind::Pdu)?;
                      let channel_id = conn
-@@ -3967,15 +4125,69 @@
+@@ -3967,15 +4134,69 @@
                          .await
                          .map_err(|e| ServerError::io("write_all", e))?;
                  }
@@ -1015,7 +1317,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                      // dvc_by_id_mut already returns None for a channel that isn't yet
                      // Opened, and that case is handled just below; a separate
                      // is_channel_opened check here would only duplicate it.
-@@ -4737,6 +4949,7 @@
+@@ -4737,6 +4958,7 @@
          let udp_transport_for_events = Rc::clone(&udp_transport);
          let udp_transport_for_pdus = Rc::clone(&udp_transport);
          let mut cliprdr_writer = writer.clone();
@@ -1023,7 +1325,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          let write_counter = writer.write_counter();
          let ev_receiver = Arc::clone(&self.ev_receiver);
          let s = Rc::new(Mutex::new((self, conn)));
-@@ -5061,17 +5274,32 @@
+@@ -5061,17 +5283,32 @@
              }
          };
  
@@ -1064,7 +1366,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          state
      }
  
-@@ -5166,6 +5394,7 @@
+@@ -5166,6 +5403,7 @@
                          })
                          .map(|cluster| cluster.redirected_session_id),
                      password_cookie: result.password_cookie.clone(),
@@ -1072,7 +1374,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                  });
              });
          }
-@@ -5208,10 +5437,12 @@
+@@ -5208,10 +5446,12 @@
          let mut update_codecs = UpdateEncoderCodecs::new();
          let mut surface_flags = CmdFlags::empty();
          let mut pointer_cache_size: u16 = 0;
@@ -1085,7 +1387,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          for c in result.capabilities {
              match c {
                  CapabilitySet::General(c) => {
-@@ -5293,6 +5524,7 @@
+@@ -5293,6 +5533,7 @@
                      // must not reference a cache slot via CachedPointer either, since nothing
                      // else in this crate populates that cache via the Color Pointer Update.
                      pointer_cache_size = p.pointer_cache_size;
@@ -1093,7 +1395,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                  }
                  CapabilitySet::LargePointer(lp) => {
                      // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
-@@ -5327,10 +5559,13 @@
+@@ -5327,10 +5568,13 @@
              desktop_size,
              surface_flags,
              update_codecs,
@@ -1108,7 +1410,55 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  
          // By default every connection gets a cookie at activation. On request, only one that came
          // back with a verified cookie does.
-@@ -7073,6 +7308,69 @@
+@@ -5757,6 +6001,7 @@
+             .opts
+             .udp_bind_addr
+             .map(|bind| multitransport::sideband_bind_addr(bind, self.connection_local_addr));
++        let udp_sideband = self.opts.udp_sideband.clone();
+         let tls_config = self
+             .opts
+             .security
+@@ -5798,16 +6043,26 @@
+                 self,
+                 async |request, _soft_sync| {
+                     // Defensive only: reached only if the acceptor sent a
+-                    // request despite one of these being unset, which
++                    // request despite these being unset, which
+                     // `PendingConnection::new`'s gate should prevent.
+-                    let (Some(udp_bind_addr), Some(tls_config)) = (udp_bind_addr, tls_config.clone()) else {
++                    let Some(tls_config) = tls_config.clone() else {
+                         return;
+                     };
+                     // Spawned rather than awaited inline: See the comment on
+                     // `pending_udp_accept`'s declaration above.
+-                    pending_udp_accept = Some(task::spawn(async move {
+-                        multitransport::accept(udp_bind_addr, tls_config, &request).await
+-                    }));
++                    if let Some(sideband) = &udp_sideband {
++                        // Opened here, before anything else runs: the
++                        // embedder has to be ready for the client's SYN,
++                        // which may already be on its way.
++                        let datagrams = sideband.open(&request);
++                        pending_udp_accept = Some(task::spawn(async move {
++                            multitransport::accept_sideband(datagrams, tls_config, &request).await
++                        }));
++                    } else if let Some(udp_bind_addr) = udp_bind_addr {
++                        pending_udp_accept = Some(task::spawn(async move {
++                            multitransport::accept(udp_bind_addr, tls_config, &request).await
++                        }));
++                    }
+                 },
+             );
+             let (new_framed, result) = match tokio::time::timeout(FINALIZE_TIMEOUT, finalize).await {
+@@ -6303,6 +6558,7 @@
+                 remotefx_quant: Quant::default(),
+                 remotefx_entropy_coder: None,
+                 udp_bind_addr: None,
++                udp_sideband: None,
+             },
+             creds: None,
+             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
+@@ -7073,6 +7329,69 @@
          );
          assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
      }
@@ -1178,7 +1528,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  }
  
  #[cfg(all(test, feature = "egfx"))]
-@@ -7239,6 +7537,44 @@
+@@ -7239,6 +7558,44 @@
  
      impl SvcServerProcessor for ResourceChannel {}
  

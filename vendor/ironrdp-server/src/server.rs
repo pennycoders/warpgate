@@ -780,9 +780,18 @@ pub struct RdpServerOptions {
     /// multitransport is offered. `None` disables the feature entirely. Set
     /// via [`RdpServerBuilder::with_udp_transport`](crate::RdpServerBuilder::with_udp_transport).
     pub udp_bind_addr: Option<SocketAddr>,
+    /// The embedder's own UDP listener for the sideband multitransport
+    /// transport, used instead of [`Self::udp_bind_addr`] when set. Set via
+    /// [`RdpServerBuilder::with_udp_sideband`](crate::RdpServerBuilder::with_udp_sideband).
+    pub udp_sideband: Option<Arc<dyn multitransport::UdpSideband>>,
 }
 
 impl RdpServerOptions {
+    /// Whether UDP multitransport is configured, by either of its two means.
+    fn offers_udp(&self) -> bool {
+        self.udp_bind_addr.is_some() || self.udp_sideband.is_some()
+    }
+
     /// Default [MultifragmentUpdate] max reassembly buffer size (8 MB).
     ///
     /// Advertised to the client during capability exchange as the largest
@@ -1715,7 +1724,7 @@ impl PendingConnection {
         capabilities: Vec<CapabilitySet>,
         creds: Option<Credentials>,
         honor_client_desktop_size: Option<DesktopSize>,
-        udp_bind_addr: Option<SocketAddr>,
+        offer_udp: bool,
         credentials_handler: ServerCredentialsHandler,
     ) -> Self {
         let mut acceptor = Acceptor::new(security.flag(), desktop_size, capabilities, creds);
@@ -1723,7 +1732,7 @@ impl PendingConnection {
         // Multitransport requires Enhanced Security: `RdpServerSecurity::None`
         // has nothing to authenticate the sideband transport's TLS with, and
         // matches the reference client's own Enhanced-Security-only gate.
-        if udp_bind_addr.is_some() && security.tls_acceptor().is_some() {
+        if offer_udp && security.tls_acceptor().is_some() {
             // SOFT_SYNC_TCP_TO_UDP is included alongside the transport type
             // itself: Without it, Soft-Sync is never negotiated (MS-RDPEDYC
             // 3.1.5.3 requires both peers to advertise it), and
@@ -2223,7 +2232,7 @@ where
         capabilities,
         ctx.creds.clone(),
         ctx.opts.honor_client_desktop_size,
-        ctx.opts.udp_bind_addr,
+        ctx.opts.offers_udp(),
         ServerCredentialsHandler {
             validator: ctx.credential_validator.clone(),
             require_authenticated: ctx.requires_authenticated_credentials,
@@ -3160,7 +3169,7 @@ impl RdpServer {
             capabilities,
             self.creds.clone(),
             self.opts.honor_client_desktop_size,
-            self.opts.udp_bind_addr,
+            self.opts.offers_udp(),
             ServerCredentialsHandler {
                 validator: self.credential_validator.clone(),
                 require_authenticated: self.connection_binder.is_some(),
@@ -5992,6 +6001,7 @@ impl RdpServer {
             .opts
             .udp_bind_addr
             .map(|bind| multitransport::sideband_bind_addr(bind, self.connection_local_addr));
+        let udp_sideband = self.opts.udp_sideband.clone();
         let tls_config = self
             .opts
             .security
@@ -6033,16 +6043,26 @@ impl RdpServer {
                 self,
                 async |request, _soft_sync| {
                     // Defensive only: reached only if the acceptor sent a
-                    // request despite one of these being unset, which
+                    // request despite these being unset, which
                     // `PendingConnection::new`'s gate should prevent.
-                    let (Some(udp_bind_addr), Some(tls_config)) = (udp_bind_addr, tls_config.clone()) else {
+                    let Some(tls_config) = tls_config.clone() else {
                         return;
                     };
                     // Spawned rather than awaited inline: See the comment on
                     // `pending_udp_accept`'s declaration above.
-                    pending_udp_accept = Some(task::spawn(async move {
-                        multitransport::accept(udp_bind_addr, tls_config, &request).await
-                    }));
+                    if let Some(sideband) = &udp_sideband {
+                        // Opened here, before anything else runs: the
+                        // embedder has to be ready for the client's SYN,
+                        // which may already be on its way.
+                        let datagrams = sideband.open(&request);
+                        pending_udp_accept = Some(task::spawn(async move {
+                            multitransport::accept_sideband(datagrams, tls_config, &request).await
+                        }));
+                    } else if let Some(udp_bind_addr) = udp_bind_addr {
+                        pending_udp_accept = Some(task::spawn(async move {
+                            multitransport::accept(udp_bind_addr, tls_config, &request).await
+                        }));
+                    }
                 },
             );
             let (new_framed, result) = match tokio::time::timeout(FINALIZE_TIMEOUT, finalize).await {
@@ -6538,6 +6558,7 @@ mod preempt_tests {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                udp_sideband: None,
             },
             creds: None,
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
