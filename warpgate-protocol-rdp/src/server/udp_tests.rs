@@ -13,7 +13,7 @@ use warpgate_common::ListenEndpoint;
 
 use super::{
     DropReason, MAX_DATAGRAM, MAX_PER_ADDRESS, MIN_SYN_LEN, PendingState, Route, SYN_BUDGET,
-    UdpListener, UdpServices, cookie_hash, is_transient_send_error,
+    UdpListener, UdpServices, cookie_hash, is_icmp_report, is_transient_send_error,
 };
 
 const VIEWER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -828,6 +828,22 @@ fn transient_send_errors_are_loss() {
         ErrorKind::AddrNotAvailable,
     ] {
         assert!(!is_transient_send_error(&Error::from(kind)), "{kind:?}");
+    }
+}
+
+#[test]
+fn icmp_reports_do_not_pause_the_listener() {
+    use std::io::{Error, ErrorKind};
+
+    assert!(is_icmp_report(&Error::from(ErrorKind::ConnectionReset)));
+    assert!(is_icmp_report(&Error::from(ErrorKind::ConnectionRefused)));
+    for kind in [
+        ErrorKind::WouldBlock,
+        ErrorKind::Interrupted,
+        ErrorKind::OutOfMemory,
+        ErrorKind::Other,
+    ] {
+        assert!(!is_icmp_report(&Error::from(kind)), "{kind:?}");
     }
 }
 

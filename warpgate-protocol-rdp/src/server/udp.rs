@@ -111,7 +111,7 @@ const MAX_FLOWS: usize = 1024;
 const MAX_PER_ADDRESS: usize = 8;
 
 /// How long the listener waits after a failed receive, so a socket that keeps failing does
-/// not spin.
+/// not spin. Not after [`is_icmp_report`] errors, which say nothing about the socket.
 const RECV_ERROR_PAUSE: Duration = Duration::from_millis(10);
 
 /// How often a UDP listener that no RDP listener holds checks whether it is still used. It
@@ -439,8 +439,10 @@ impl UdpListener {
                         self.deliver(&socket, from, datagram);
                     }
                 }
-                // An unconnected socket can see transient errors, e.g. an ICMP port
-                // unreachable reported on some platforms; none of them ends the listener.
+                // None of them ends the listener.
+                Err(error) if is_icmp_report(&error) => {
+                    trace!(%error, "A viewer's address reported an earlier RDP UDP send as undeliverable");
+                }
                 Err(error) => {
                     debug!(%error, "RDP UDP receive failed");
                     tokio::time::sleep(RECV_ERROR_PAUSE).await;
@@ -787,6 +789,18 @@ struct FlowDatagrams {
     queued: Arc<AtomicUsize>,
     replacement: Mutex<Option<Replacement>>,
     _registration: FlowRegistration,
+}
+
+/// Whether a failed receive is an ICMP error about an earlier send rather than a problem
+/// with the socket. Windows reports a port unreachable on the next `recvfrom` of the
+/// unconnected socket as `WSAECONNRESET` (`ConnectionReset`), and other systems can report
+/// one as `ECONNREFUSED`. Any viewer can cause these by closing its port, so the listener
+/// carries on at once rather than pause every flow.
+fn is_icmp_report(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+    )
 }
 
 /// Whether a failed send to a viewer is the network dropping the datagram rather than the
