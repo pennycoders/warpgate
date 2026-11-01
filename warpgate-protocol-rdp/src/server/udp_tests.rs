@@ -937,3 +937,77 @@ async fn a_taken_udp_port_is_an_error() {
     assert!(services.acquire(&endpoint).await.is_err());
     assert!(services.listeners().is_empty());
 }
+
+// The port is free once the listener that closed has; an acquire in between waits for it
+// instead of failing to bind.
+#[tokio::test]
+async fn a_closing_udp_listener_is_bound_again_once_closed() {
+    let services = UdpServices::with_linger(Duration::from_secs(3600));
+    let endpoint = free_endpoint();
+    let key = endpoint.address();
+    let hold = services.acquire(&endpoint).await.expect("bind");
+    let listener = hold.listener();
+    drop(hold);
+    assert!(!services.release_if_unused(key, &listener));
+    assert!(services.release_if_unused(key, &listener));
+
+    // What the closing listener refuses, a new one takes.
+    let refused = listener
+        .sideband(addr(VIEWER, 50000))
+        .open(&request(1, [0x11; 16]));
+    assert!(opened(refused).await.is_none());
+    let again = tokio::time::timeout(Duration::from_secs(2), services.acquire(&endpoint))
+        .await
+        .expect("bound in time")
+        .expect("bound again");
+    assert!(!again.listener().same_as(&listener));
+    assert!(
+        again
+            .listener()
+            .same_as(&flow_listener(&services, &endpoint))
+    );
+}
+
+#[tokio::test]
+async fn a_new_listen_address_takes_the_port_from_an_unused_listener() {
+    let services = UdpServices::with_linger(Duration::from_secs(3600));
+    let old = free_endpoint();
+    let new = ListenEndpoint::from(SocketAddr::from((
+        Ipv4Addr::UNSPECIFIED,
+        old.address().port(),
+    )));
+    drop(services.acquire(&old).await.expect("bind the old address"));
+
+    let hold = tokio::time::timeout(Duration::from_secs(2), services.acquire(&new))
+        .await
+        .expect("bound in time")
+        .expect("the port, taken from the unused listener");
+    assert!(hold.listener().same_as(&flow_listener(&services, &new)));
+    assert!(!services.listeners().contains_key(&old.address()));
+}
+
+#[tokio::test]
+async fn a_new_listen_address_leaves_a_listener_viewers_use() {
+    let services = UdpServices::with_linger(Duration::from_secs(3600));
+    let old = free_endpoint();
+    let new = ListenEndpoint::from(SocketAddr::from((
+        Ipv4Addr::UNSPECIFIED,
+        old.address().port(),
+    )));
+    let hold = services.acquire(&old).await.expect("bind the old address");
+    let _pending = hold
+        .listener()
+        .sideband(addr(VIEWER, 50000))
+        .open(&request(1, [0x11; 16]));
+    drop(hold);
+
+    assert!(services.acquire(&new).await.is_err());
+    assert!(
+        services
+            .acquire(&old)
+            .await
+            .expect("the old listener")
+            .listener()
+            .same_as(&flow_listener(&services, &old))
+    );
+}
