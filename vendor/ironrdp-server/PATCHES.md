@@ -130,6 +130,14 @@ it with a Close Request (MS-RDPEDYC 2.2.4), which is also the only way MS-RDPEAI
 a client recording. `ServerEvent::Rdpeai` goes to the channel opened that way. The embedder
 must not open the channel before the client's DVC Capabilities Response (MS-RDPEDYC 3.3.5.1).
 
+## The client's multitransport flags in `ConnectionInfo`
+
+`ConnectionInfo` gains `multitransport_flags`, the flags of the client's GCC Client
+Multitransport Channel Data (MS-RDPBCGR 2.2.1.3.8) that `AcceptorResult` already carries,
+so an embedder can see which clients offer the UDP transports (MS-RDPBCGR 2.2.15.1) and
+Soft-Sync (MS-RDPEDYC 3.1.5.3) without reaching into the acceptor. Warpgate logs it once
+per viewer connection.
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the

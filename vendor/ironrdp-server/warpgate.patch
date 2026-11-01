@@ -724,7 +724,26 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
  
  /// How often the server drives [`CliprdrServer::drive_timeouts`].
-@@ -958,6 +997,39 @@
+@@ -190,6 +229,10 @@
+     pub redirected_session_id: Option<u32>,
+     /// See [`ironrdp_acceptor::AcceptorResult::password_cookie`].
+     pub password_cookie: Option<rdp::client_info::PasswordCookie>,
++    /// See [`ironrdp_acceptor::AcceptorResult::multitransport_flags`]: the transports the
++    /// client announced in its GCC Client Multitransport Channel Data (MS-RDPBCGR
++    /// 2.2.1.3.8), empty when it sent none.
++    pub multitransport_flags: ironrdp_pdu::gcc::MultiTransportFlags,
+ }
+ 
+ impl ConnectionInfo {
+@@ -207,6 +250,7 @@
+             routing_token: None,
+             redirected_session_id: None,
+             password_cookie: None,
++            multitransport_flags: ironrdp_pdu::gcc::MultiTransportFlags::empty(),
+         }
+     }
+ }
+@@ -958,6 +1002,39 @@
      }
  }
  
@@ -764,7 +783,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  #[cfg(feature = "usb")]
  #[derive(Default)]
  struct ServerUsbManager {
-@@ -1446,6 +1518,14 @@
+@@ -1446,6 +1523,14 @@
      Rdpsnd(RdpsndServerMessage),
      Rdpdr(RdpdrServerMessage),
      Rdpeai(RdpeaiServerMessage),
@@ -779,7 +798,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
      Echo(EchoServerMessage),
      SetCredentials(Credentials),
      /// Replace or clear the Server Auto-Reconnect Cookie.
-@@ -1479,6 +1559,8 @@
+@@ -1479,6 +1564,8 @@
              Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
              Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
              Self::Rdpeai(..) => f.write_str("Rdpeai(..)"),
@@ -788,7 +807,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
              Self::Echo(..) => f.write_str("Echo(..)"),
              Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
              Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
-@@ -1827,6 +1909,13 @@
+@@ -1827,6 +1914,13 @@
      /// eligible for the hourly update when cookies are on request (see
      /// [`RdpServer::set_auto_reconnect_on_request`]).
      auto_reconnect_issued: bool,
@@ -802,7 +821,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  }
  
  impl ConnectionState {
-@@ -1839,6 +1928,8 @@
+@@ -1839,6 +1933,8 @@
              autodetect: self.autodetect_handles.clone(),
              #[cfg(feature = "egfx")]
              gfx_handle: self.gfx_handle.clone(),
@@ -811,7 +830,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          }
      }
  
-@@ -1852,6 +1943,42 @@
+@@ -1852,6 +1948,42 @@
          self.static_channels.get_channel_id_by_type::<T>()
      }
  
@@ -854,7 +873,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
      #[cfg(feature = "usb")]
      fn remove_usb_device(&mut self, dvc_id: DynamicChannelId) {
          let Some(device) = self.usb_man.router.remove(&dvc_id) else {
-@@ -2714,7 +2841,7 @@
+@@ -2714,7 +2846,7 @@
          };
          let dvc = if let Some(monitor_count) = display_control_monitors {
              let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display), monitor_count);
@@ -863,7 +882,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          } else {
              dvc
          };
-@@ -2730,9 +2857,12 @@
+@@ -2730,9 +2862,12 @@
              dvc
          };
  
@@ -879,7 +898,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          } else {
              dvc
          };
-@@ -2786,6 +2916,9 @@
+@@ -2786,6 +2921,9 @@
              egfx_on_udp: false,
              early_tunnel_payloads: VecDeque::new(),
              auto_reconnect_issued: false,
@@ -889,7 +908,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          }
      }
  
-@@ -3816,6 +3949,25 @@
+@@ -3816,6 +3954,25 @@
                          .await?;
                  }
                  ServerEvent::Rdpsnd(s) => {
@@ -915,7 +934,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                      let Some(rdpsnd) = conn.get_svc_processor::<RdpsndServer>() else {
                          warn!("No rdpsnd channel, dropping event");
                          continue;
-@@ -3955,6 +4107,7 @@
+@@ -3955,6 +4112,7 @@
                              input_buffer,
                              output_buffer_length,
                          ),
@@ -923,7 +942,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                      }
                      .map_err_kind("failed to send rdpdr event", ServerErrorKind::Pdu)?;
                      let channel_id = conn
-@@ -3967,15 +4120,69 @@
+@@ -3967,15 +4125,69 @@
                          .await
                          .map_err(|e| ServerError::io("write_all", e))?;
                  }
@@ -996,7 +1015,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                      // dvc_by_id_mut already returns None for a channel that isn't yet
                      // Opened, and that case is handled just below; a separate
                      // is_channel_opened check here would only duplicate it.
-@@ -4737,6 +4944,7 @@
+@@ -4737,6 +4949,7 @@
          let udp_transport_for_events = Rc::clone(&udp_transport);
          let udp_transport_for_pdus = Rc::clone(&udp_transport);
          let mut cliprdr_writer = writer.clone();
@@ -1004,7 +1023,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          let write_counter = writer.write_counter();
          let ev_receiver = Arc::clone(&self.ev_receiver);
          let s = Rc::new(Mutex::new((self, conn)));
-@@ -5061,17 +5269,32 @@
+@@ -5061,17 +5274,32 @@
              }
          };
  
@@ -1045,7 +1064,15 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          state
      }
  
-@@ -5208,10 +5431,12 @@
+@@ -5166,6 +5394,7 @@
+                         })
+                         .map(|cluster| cluster.redirected_session_id),
+                     password_cookie: result.password_cookie.clone(),
++                    multitransport_flags: result.multitransport_flags,
+                 });
+             });
+         }
+@@ -5208,10 +5437,12 @@
          let mut update_codecs = UpdateEncoderCodecs::new();
          let mut surface_flags = CmdFlags::empty();
          let mut pointer_cache_size: u16 = 0;
@@ -1058,7 +1085,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
          for c in result.capabilities {
              match c {
                  CapabilitySet::General(c) => {
-@@ -5293,6 +5518,7 @@
+@@ -5293,6 +5524,7 @@
                      // must not reference a cache slot via CachedPointer either, since nothing
                      // else in this crate populates that cache via the Color Pointer Update.
                      pointer_cache_size = p.pointer_cache_size;
@@ -1066,7 +1093,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
                  }
                  CapabilitySet::LargePointer(lp) => {
                      // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
-@@ -5327,10 +5553,13 @@
+@@ -5327,10 +5559,13 @@
              desktop_size,
              surface_flags,
              update_codecs,
@@ -1081,7 +1108,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  
          // By default every connection gets a cookie at activation. On request, only one that came
          // back with a verified cookie does.
-@@ -7073,6 +7302,69 @@
+@@ -7073,6 +7308,69 @@
          );
          assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
      }
@@ -1151,7 +1178,7 @@ diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/src/server.rs
  }
  
  #[cfg(all(test, feature = "egfx"))]
-@@ -7239,6 +7531,44 @@
+@@ -7239,6 +7537,44 @@
  
      impl SvcServerProcessor for ResourceChannel {}
  
