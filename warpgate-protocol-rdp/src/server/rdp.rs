@@ -668,8 +668,9 @@ impl RdpServerInputHandler for InputHandler {
                 button,
                 pressed,
             } => {
-                self.x = x;
-                self.y = y;
+                // Surface coordinates, like a move: with the desktop scaled into the viewer's
+                // surface the raw point is somewhere else on the desktop.
+                (self.x, self.y) = self.graphics.to_desktop(x, y);
                 match button_bit(button) {
                     Some(bit) => self.set_button(bit, pressed),
                     None => self.emit_pointer(),
@@ -681,8 +682,9 @@ impl RdpServerInputHandler for InputHandler {
                 button,
                 pressed,
             } => {
-                self.x = self.x.saturating_add_signed(clamp_to_i16(x));
-                self.y = self.y.saturating_add_signed(clamp_to_i16(y));
+                (self.x, self.y) =
+                    self.graphics
+                        .move_on_desktop(self.x, self.y, clamp_to_i16(x), clamp_to_i16(y));
                 match button_bit(button) {
                     Some(bit) => self.set_button(bit, pressed),
                     None => self.emit_pointer(),
@@ -709,8 +711,9 @@ impl RdpServerInputHandler for InputHandler {
                 }
             }
             MouseEvent::RelMove { x, y } => {
-                self.x = self.x.saturating_add_signed(clamp_to_i16(x));
-                self.y = self.y.saturating_add_signed(clamp_to_i16(y));
+                (self.x, self.y) =
+                    self.graphics
+                        .move_on_desktop(self.x, self.y, clamp_to_i16(x), clamp_to_i16(y));
                 self.emit_pointer();
             }
             _ => {}
@@ -1219,5 +1222,86 @@ mod framed_tests {
             .await
             .expect("read_by_hint spun instead of returning");
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use ironrdp_server::{DesktopSize, MouseButton, MouseEvent, RdpServerInputHandler as _};
+    use tokio::sync::mpsc;
+    use warpgate_core::DesktopInput;
+
+    use super::InputHandler;
+    use crate::server::gfx::GraphicsFactory;
+    use crate::server::protocol::Event;
+    use crate::server::surface::Placement;
+
+    fn size(width: u16, height: u16) -> DesktopSize {
+        DesktopSize { width, height }
+    }
+
+    /// A 1440x900 GNOME desktop on a 1728x1004 viewer, scaled 1.115 into it.
+    fn handler() -> (InputHandler, mpsc::UnboundedReceiver<Event>, Placement) {
+        let placement = Placement::fit(size(1440, 900), size(1728, 1004));
+        let (out, events) = mpsc::unbounded_channel();
+        let handler = InputHandler {
+            out,
+            x: 0,
+            y: 0,
+            buttons: 0,
+            graphics: GraphicsFactory::placed(placement),
+        };
+        (handler, events, placement)
+    }
+
+    fn pointers(events: &mut mpsc::UnboundedReceiver<Event>) -> Vec<(u16, u16, u8)> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::Input(DesktopInput::Pointer { x, y, buttons }) = event {
+                out.push((x, y, buttons));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_click_lands_where_the_pointer_is_on_a_scaled_desktop() {
+        let (mut handler, mut events, placement) = handler();
+        let at = placement.to_desktop(1600, 500);
+        handler.mouse(MouseEvent::Move { x: 1600, y: 500 });
+        handler.mouse(MouseEvent::Button {
+            x: 1600,
+            y: 500,
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        handler.mouse(MouseEvent::Button {
+            x: 1600,
+            y: 500,
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        assert_eq!(
+            pointers(&mut events),
+            [(at.0, at.1, 0), (at.0, at.1, 1), (at.0, at.1, 0)]
+        );
+        assert_ne!(
+            at,
+            (1439, 500),
+            "the raw surface point is not the desktop point"
+        );
+    }
+
+    #[test]
+    fn a_relative_motion_moves_by_desktop_pixels() {
+        let (mut handler, mut events, _) = handler();
+        handler.mouse(MouseEvent::Move { x: 61, y: 0 });
+        handler.mouse(MouseEvent::RelMove { x: 223, y: 112 });
+        let moved = pointers(&mut events);
+        assert_eq!(moved.len(), 2);
+        assert_eq!(
+            (moved[1].0, moved[1].1),
+            (moved[0].0 + 200, moved[0].1 + 100)
+        );
     }
 }

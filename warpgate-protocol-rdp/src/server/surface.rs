@@ -117,6 +117,29 @@ impl Placement {
         )
     }
 
+    /// The desktop point `(x, y)` moved by a relative motion the viewer made on its surface:
+    /// surface pixels are scaled to desktop pixels, and the result stays on the desktop.
+    pub(super) fn move_on_desktop(self, x: u16, y: u16, dx: i16, dy: i16) -> (u16, u16) {
+        let axis = |at: u16, delta: i16, scaled: u16, desktop: u16| -> u16 {
+            if desktop == 0 {
+                return 0;
+            }
+            let delta = if scaled == 0 || scaled == desktop {
+                i32::from(delta)
+            } else {
+                let d = i64::from(delta) * i64::from(desktop);
+                let s = i64::from(scaled);
+                // Rounded to the nearest desktop pixel, away from zero on halves.
+                ((d + d.signum() * s / 2) / s) as i32
+            };
+            (i32::from(at) + delta).clamp(0, i32::from(desktop) - 1) as u16
+        };
+        (
+            axis(x, dx, self.scaled.width, self.desktop.width),
+            axis(y, dy, self.scaled.height, self.desktop.height),
+        )
+    }
+
     /// The surface rectangle (exclusive edges) that depends on the desktop rectangle
     /// `[left, right) x [top, bottom)`.
     pub(super) fn to_output(self, left: u16, top: u16, right: u16, bottom: u16) -> Rect {
@@ -463,6 +486,17 @@ mod tests {
         let identity = Placement::identity(size(800, 600));
         assert_eq!(identity.to_desktop(799, 599), (799, 599));
         assert_eq!(identity.to_desktop(900, 700), (799, 599));
+    }
+
+    #[test]
+    fn a_relative_motion_is_scaled_to_the_desktop_and_stays_on_it() {
+        // A 1440x900 desktop on a 1728x1004 viewer: scaled 1.115 to 1606x1004.
+        let placement = Placement::fit(size(1440, 900), size(1728, 1004));
+        assert_eq!(placement.scaled, size(1606, 1004));
+        assert_eq!(placement.move_on_desktop(100, 100, 223, -112), (300, 0));
+        assert_eq!(placement.move_on_desktop(1430, 890, 50, 50), (1439, 899));
+        let identity = Placement::identity(size(800, 600));
+        assert_eq!(identity.move_on_desktop(10, 10, -3, 4), (7, 14));
     }
 
     #[test]
