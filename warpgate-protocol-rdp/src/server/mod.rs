@@ -50,10 +50,12 @@ mod protocol;
 mod rdp;
 mod sound;
 mod surface;
+mod udp;
 
 use bridge::connect_backend;
 use hold_screen::{hold_while, run_banner_screen, run_hold_screen};
 use protocol::{AuthVerdict, Event as ServerEvent, Input as ServerInput};
+use udp::UdpListener;
 use warpgate_desktop_auth::{
     AdmissionHold, DesktopAuthOutcome, admit_desktop_session, authenticate, finalize_user_auth,
 };
@@ -102,9 +104,38 @@ pub async fn bind_server(
     key_pem: String,
 ) -> Result<BoxFuture<'static, Result<()>>> {
     let listener = address.tcp_accept_stream().await?;
+    // The reliable UDP transport (MS-RDPEMT) on the same port, one socket for every viewer
+    // (MS-RDPEUDP 2.1, 3.1.3).
+    let (udp_enabled, graphics_pipeline) = {
+        let config = services.config.lock().await;
+        (config.store.rdp.udp, config.store.rdp.graphics_pipeline)
+    };
+    if udp_enabled && !graphics_pipeline {
+        warn!("rdp.udp has no effect without rdp.graphics_pipeline: only graphics move onto UDP");
+    }
+    let udp = if udp_enabled && graphics_pipeline {
+        let sockets = address
+            .udp_sockets()
+            .await
+            .context("binding the RDP UDP port")?;
+        info!(address = %address.address(), "Offering RDP viewers the UDP transport");
+        Some((UdpListener::new(), sockets))
+    } else {
+        None
+    };
+    let (udp, udp_sockets) = udp.unzip();
 
     Ok(async move {
-        accept_loop(
+        let udp_serve = {
+            let udp = udp.clone();
+            async move {
+                if let (Some(udp), Some(sockets)) = (udp, udp_sockets) {
+                    udp.serve(sockets).await;
+                }
+                std::future::pending::<()>().await;
+            }
+        };
+        let tcp_accept = accept_loop(
             "RDP connection",
             listener,
             proxy_protocol,
@@ -112,6 +143,7 @@ pub async fn bind_server(
                 let services = services.clone();
                 let cert_pem = cert_pem.clone();
                 let key_pem = key_pem.clone();
+                let udp = udp.as_ref().map(|udp| udp.sideband(remote_address));
                 async move {
                     let (session_handle, mut abort_rx) = RdpSessionHandle::new();
 
@@ -141,6 +173,7 @@ pub async fn bind_server(
                             remote_address,
                             cert_pem,
                             key_pem,
+                            udp,
                         ).instrument(span.clone()) => span.in_scope(|| match result {
                             Ok(()) => info!("Session ended"),
                             Err(error) => error!(%error, "Session failed"),
@@ -152,8 +185,11 @@ pub async fn bind_server(
                     Ok(())
                 }
             },
-        )
-        .await;
+        );
+        tokio::select! {
+            () = tcp_accept => {}
+            () = udp_serve => {}
+        }
 
         Ok(())
     }
@@ -167,6 +203,7 @@ async fn handle_connection(
     remote_address: SocketAddr,
     cert_pem: String,
     key_pem: String,
+    udp: Option<Arc<dyn ironrdp_server::UdpSideband>>,
 ) -> Result<()> {
     // Warpgate owns the viewer socket and the session; `rdp` runs the RDP server state
     // machine over it and terminates TLS toward the viewer.
@@ -192,6 +229,7 @@ async fn handle_connection(
         server_out_tx,
         server_in_rx,
         drives.clone(),
+        udp,
     );
 
     // Run the RDP server and the control loop concurrently; whichever ends first tears

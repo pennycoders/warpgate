@@ -8,7 +8,7 @@ use poem::listener::{AcceptorExt, BoxAcceptor, TcpAcceptor};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_stream::wrappers::TcpListenerStream;
 use tracing::warn;
 
@@ -32,6 +32,18 @@ fn bind_socket(addr: SocketAddr) -> std::io::Result<Socket> {
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(socket)
+}
+
+/// A UDP socket on `addr`, v6-only like [`bind_socket`]'s TCP sockets so that
+/// `[::]` and `0.0.0.0` can share the port.
+fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 fn listen_on(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
@@ -77,6 +89,17 @@ impl ListenEndpoint {
             .addresses_to_listen_on()
             .into_iter()
             .map(|addr| TcpListener::from_std(listen_on(addr)?))
+            .collect::<std::io::Result<_>>()?)
+    }
+
+    /// UDP sockets on the same addresses and port as [`Self::tcp_listeners`].
+    // async for the same reason as `tcp_listeners`
+    #[allow(clippy::unused_async)]
+    pub async fn udp_sockets(&self) -> Result<Vec<UdpSocket>, WarpgateError> {
+        Ok(self
+            .addresses_to_listen_on()
+            .into_iter()
+            .map(|addr| UdpSocket::from_std(bind_udp_socket(addr)?))
             .collect::<std::io::Result<_>>()?)
     }
 
