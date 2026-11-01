@@ -206,9 +206,15 @@ optional = true
 version = "8.2"
 optional = true
 
+[dev-dependencies.rcgen]
+version = "0.14"
+
 [dev-dependencies.tokio]
 version = "1"
-features = ["sync"]
+features = [
+    "sync",
+    "test-util",
+]
 
 [lints.clippy]
 alloc_instead_of_core = "warn"

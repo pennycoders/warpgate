@@ -170,3 +170,8 @@ still checked against the request's `RequestID` and `SecurityCookie` (MS-RDPEMT 
 whatever the embedder routed. `with_udp_sideband` takes precedence over
 `with_udp_transport`; either one makes `PendingConnection::new` offer the transport
 (`RdpServerOptions::offers_udp`).
+
+The `multitransport::tests::sideband_*` tests cover a sideband with no datagrams, a client
+that never sends, and the full handshake over a socket shared the way an embedder's
+listener shares it. They need `rcgen` and tokio's `test-util` as dev-dependencies, which
+`Cargo.toml` carries outside `warpgate.patch`; re-add them by hand on re-vendor.

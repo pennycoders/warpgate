@@ -1,6 +1,6 @@
 diff -ru ironrdp-server-0.14.0/src/builder.rs base/src/builder.rs
---- ironrdp-server-0.14.0/src/builder.rs	2026-11-01 21:11:07
-+++ base/src/builder.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/builder.rs	2026-11-01 21:23:06
++++ base/src/builder.rs	2026-11-01 21:23:06
 @@ -16,6 +16,7 @@
      RdpServerSecurity, StaticChannelFactory,
  };
@@ -66,8 +66,8 @@ diff -ru ironrdp-server-0.14.0/src/builder.rs base/src/builder.rs
              self.state.handler,
              self.state.display,
 diff -ru ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
---- ironrdp-server-0.14.0/src/capabilities.rs	2026-11-01 21:11:07
-+++ base/src/capabilities.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/capabilities.rs	2026-11-01 21:23:06
++++ base/src/capabilities.rs	2026-11-01 21:23:06
 @@ -1,4 +1,4 @@
 -use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
 +use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags, MajorPlatformType, MinorPlatformType};
@@ -86,8 +86,8 @@ diff -ru ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
          // Advertise that the server handles `SuppressOutput` and
          // `RefreshRectangle` (per MS-RDPBCGR 2.2.7.1.1) — spec-compliant
 diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
---- ironrdp-server-0.14.0/src/display.rs	2026-11-01 21:11:07
-+++ base/src/display.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/display.rs	2026-11-01 21:23:06
++++ base/src/display.rs	2026-11-01 21:23:06
 @@ -329,6 +329,19 @@
      /// and then signals the event loop via `ServerEvent::Egfx`.
      #[cfg(feature = "egfx")]
@@ -118,8 +118,8 @@ diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
      }
  }
 diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
---- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-11-01 21:11:07
-+++ base/src/encoder/bitmap.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-11-01 21:23:06
++++ base/src/encoder/bitmap.rs	2026-11-01 21:23:06
 @@ -1,6 +1,6 @@
 -use core::num::NonZeroUsize;
 +use core::iter;
@@ -210,8 +210,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
                  bitmap_data: &self.buffer[..len],
              };
 diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
---- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-11-01 21:11:07
-+++ base/src/encoder/fast_path.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-11-01 21:23:06
++++ base/src/encoder/fast_path.rs	2026-11-01 21:23:06
 @@ -4,7 +4,8 @@
  use ironrdp_pdu::{Encode as _, WriteCursor};
  
@@ -241,8 +241,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_pa
  
              1..=MAX_FASTPATH_UPDATE_SIZE => {
 diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-11-01 21:11:07
-+++ base/src/encoder/mod.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-11-01 21:23:06
++++ base/src/encoder/mod.rs	2026-11-01 21:23:06
 @@ -16,6 +16,8 @@
  use tracing::{debug, warn};
  
@@ -688,8 +688,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
  }
  
 diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
---- ironrdp-server-0.14.0/src/lib.rs	2026-11-01 21:11:07
-+++ base/src/lib.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/lib.rs	2026-11-01 21:23:06
++++ base/src/lib.rs	2026-11-01 21:23:06
 @@ -28,6 +28,7 @@
  mod urbdrc;
  
@@ -726,8 +726,8 @@ diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
  #[cfg(feature = "usb")]
  pub use urbdrc::{
 diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
---- ironrdp-server-0.14.0/src/multitransport.rs	2026-11-01 21:11:07
-+++ base/src/multitransport.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/multitransport.rs	2026-11-01 21:23:06
++++ base/src/multitransport.rs	2026-11-01 21:23:06
 @@ -9,14 +9,20 @@
  //!
  //! [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b8e7c588-51cb-455b-bb73-92d480903133
@@ -897,9 +897,151 @@ diff -ru ironrdp-server-0.14.0/src/multitransport.rs base/src/multitransport.rs
          Ok(transport) => {
              debug!("Sideband UDP transport established");
              Some(UdpTransportHandle::new(transport))
+@@ -196,5 +320,141 @@
+     fn unknown_connection_address_keeps_the_bind() {
+         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3389);
+         assert_eq!(sideband_bind_addr(bind, None), bind);
++    }
++
++    /// A client's datagrams as an embedder listening on one shared socket hands them over.
++    struct SharedSocketDatagrams {
++        socket: Arc<UdpSocket>,
++        peer: SocketAddr,
++        incoming: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
++    }
++
++    impl SidebandDatagrams for SharedSocketDatagrams {
++        fn peer_addr(&self) -> SocketAddr {
++            self.peer
++        }
++
++        fn local_addr(&self) -> Option<SocketAddr> {
++            self.socket.local_addr().ok()
++        }
++
++        fn send<'a>(&'a self, buf: &'a [u8]) -> SidebandFuture<'a, io::Result<usize>> {
++            Box::pin(self.socket.send_to(buf, self.peer))
++        }
++
++        fn recv<'a>(&'a self, buf: &'a mut [u8]) -> SidebandFuture<'a, io::Result<usize>> {
++            Box::pin(async move {
++                let datagram = self
++                    .incoming
++                    .lock()
++                    .await
++                    .recv()
++                    .await
++                    .ok_or_else(|| io::Error::from(io::ErrorKind::ConnectionAborted))?;
++                let len = datagram.len().min(buf.len());
++                buf[..len].copy_from_slice(&datagram[..len]);
++                Ok(len)
++            })
++        }
++    }
++
++    fn request(security_cookie: [u8; 16]) -> MultitransportRequestPdu {
++        use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
++        use ironrdp_pdu::rdp::multitransport::RequestedProtocol;
++
++        MultitransportRequestPdu {
++            security_header: BasicSecurityHeader {
++                flags: BasicSecurityHeaderFlags::TRANSPORT_REQ,
++            },
++            request_id: 3,
++            requested_protocol: RequestedProtocol::UdpFecR,
++            security_cookie,
++        }
++    }
++
++    fn tls_config() -> Arc<rustls::ServerConfig> {
++        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
++        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
++        let certificate = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
++        let key = rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).expect("key");
++        Arc::new(
++            rustls::ServerConfig::builder()
++                .with_no_client_auth()
++                .with_single_cert(vec![certificate], key)
++                .expect("server TLS config"),
++        )
++    }
++
++    #[tokio::test]
++    async fn sideband_without_datagrams_continues_tcp_only() {
++        let none: SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>> = Box::pin(async { None });
++        assert!(
++            accept_sideband(none, tls_config(), &request([0x44; 16]))
++                .await
++                .is_none()
++        );
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn sideband_gives_up_on_a_client_that_never_sends() {
++        let never: SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>> =
++            Box::pin(core::future::pending());
++        assert!(
++            accept_sideband(never, tls_config(), &request([0x44; 16]))
++                .await
++                .is_none()
++        );
++    }
++
++    // oracle: spec MS-RDPEUDP 2.1 / 3.1.3, MS-RDPEMT 3.2.5.1
++    #[tokio::test]
++    async fn sideband_establishes_the_transport_over_the_embedders_socket() {
++        use ironrdp_rdpeudp_tokio::{UdpTransportConfig, connect_udp};
++
++        let security_cookie = [0x44; 16];
++        let request = request(security_cookie);
++        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
++        let server_addr = socket.local_addr().expect("address");
++
++        // What the embedder does: learn the client from its SYN, then pass its datagrams on.
++        let (tx, rx) = tokio::sync::mpsc::channel(64);
++        let listening = Arc::clone(&socket);
++        let datagrams: SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>> = Box::pin(async move {
++            let mut buf = vec![0u8; 9000];
++            let (len, peer) = listening.recv_from(&mut buf).await.ok()?;
++            tx.send(buf[..len].to_vec()).await.ok()?;
++            let pump_socket = Arc::clone(&listening);
++            tokio::spawn(async move {
++                let mut buf = vec![0u8; 9000];
++                while let Ok((len, from)) = pump_socket.recv_from(&mut buf).await {
++                    if from == peer && tx.send(buf[..len].to_vec()).await.is_err() {
++                        break;
++                    }
++                }
++            });
++            Some(Box::new(SharedSocketDatagrams {
++                socket: listening,
++                peer,
++                incoming: Mutex::new(rx),
++            }) as Box<dyn SidebandDatagrams>)
++        });
++
++        let client = connect_udp(UdpTransportConfig::new(
++            server_addr,
++            "localhost".into(),
++            TunnelConfig {
++                request_id: request.request_id,
++                security_cookie,
++            },
++        ));
++        let (server, client) = tokio::join!(accept_sideband(datagrams, tls_config(), &request), client);
++        let server = server.expect("sideband transport");
++        let mut client = client.expect("client transport");
++
++        client.send(b"over udp".to_vec()).await.expect("client sends");
++        let message = server.recv().await.expect("server receives");
++        assert_eq!(message.data, b"over udp");
++        server.send(b"and back".to_vec()).await;
++        assert_eq!(client.recv().await.as_deref(), Some(&b"and back"[..]));
+     }
+ }
 diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
---- ironrdp-server-0.14.0/src/server.rs	2026-11-01 21:11:07
-+++ base/src/server.rs	2026-11-01 21:11:07
+--- ironrdp-server-0.14.0/src/server.rs	2026-11-01 21:23:06
++++ base/src/server.rs	2026-11-01 21:23:06
 @@ -20,7 +20,7 @@
  use ironrdp_cliprdr::CliprdrServer;
  use ironrdp_cliprdr::backend::ClipboardMessage;
