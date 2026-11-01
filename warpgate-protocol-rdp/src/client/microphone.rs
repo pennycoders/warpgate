@@ -34,11 +34,11 @@ struct Capture {
     pending: Vec<u8>,
 }
 
-/// The `AUDIO_INPUT` processor to register with the DRDYNVC client, the handle that feeds
+/// What builds the `AUDIO_INPUT` processor for the DRDYNVC client, the handle that feeds
 /// it the viewer's audio, and the channel its packets come out of; those are DRDYNVC
 /// messages for the session to send.
 pub struct MicrophoneRelay {
-    pub channel: RdpeaiClient,
+    pub channel: MicrophoneChannel,
     pub input: MicrophoneInput,
     pub uplink: UnboundedReceiver<Vec<SvcMessage>>,
 }
@@ -47,19 +47,40 @@ impl MicrophoneRelay {
     pub fn new(events: Sender<DesktopEvent>) -> Self {
         let capture = Arc::new(Mutex::new(Capture::default()));
         let (uplink_tx, uplink) = unbounded_channel();
-        let channel = RdpeaiClient::new(
-            Box::new(Handler {
-                formats: DESKTOP_MICROPHONE_FORMATS.map(pcm_format).to_vec(),
+        Self {
+            channel: MicrophoneChannel {
                 capture: Arc::clone(&capture),
                 events,
-            }),
-            uplink_sender(uplink_tx),
-        );
-        Self {
-            channel,
+                uplink: uplink_tx,
+            },
             input: MicrophoneInput(capture),
             uplink,
         }
+    }
+}
+
+/// Builds an `AUDIO_INPUT` processor each time the target opens the channel. A Windows target
+/// opens it when an application starts recording and closes it (MS-RDPEDYC 2.2.4) when the
+/// last one stops, so a session sees a new channel of the same name for every recording; a
+/// processor registered once is gone after the first close, and every later Create Request was
+/// refused.
+#[derive(Clone)]
+pub struct MicrophoneChannel {
+    capture: Arc<Mutex<Capture>>,
+    events: Sender<DesktopEvent>,
+    uplink: UnboundedSender<Vec<SvcMessage>>,
+}
+
+impl MicrophoneChannel {
+    pub fn open(&self) -> RdpeaiClient {
+        RdpeaiClient::new(
+            Box::new(Handler {
+                formats: DESKTOP_MICROPHONE_FORMATS.map(pcm_format).to_vec(),
+                capture: Arc::clone(&self.capture),
+                events: self.events.clone(),
+            }),
+            uplink_sender(self.uplink.clone()),
+        )
     }
 }
 
@@ -207,15 +228,24 @@ mod tests {
     }
 
     impl Target {
-        fn new(channel: ironrdp_rdpeai::client::RdpeaiClient) -> Self {
+        fn new(channel: super::MicrophoneChannel) -> Self {
             let mut target = Self {
-                drdynvc: DrdynvcClient::new().with_dynamic_channel(channel),
+                drdynvc: DrdynvcClient::new()
+                    .with_dynamic_channel_factory(ironrdp_rdpeai::CHANNEL_NAME, move || {
+                        channel.open()
+                    }),
             };
             target.exchange(DrdynvcServerPdu::Capabilities(CapabilitiesRequestPdu::new(
                 CapsVersion::V3,
                 None,
             )));
-            let created = target.exchange(DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            target.create();
+            target
+        }
+
+        /// The target opens AUDIO_INPUT; Warpgate must accept it.
+        fn create(&mut self) {
+            let created = self.exchange(DrdynvcServerPdu::Create(CreateRequestPdu::new(
                 ID,
                 ironrdp_rdpeai::CHANNEL_NAME.to_owned(),
             )));
@@ -223,7 +253,6 @@ mod tests {
                 created.as_slice(),
                 [DrdynvcClientPdu::Create(r)] if r.creation_status() == CreationStatus::OK
             ));
-            target
         }
 
         fn exchange(&mut self, pdu: DrdynvcServerPdu) -> Vec<DrdynvcClientPdu> {
@@ -390,6 +419,35 @@ mod tests {
         assert!(!closed.is_empty());
         assert!(matches!(rx.try_recv(), Ok(DesktopEvent::MicrophoneClose)));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Windows closes the channel after each recording and opens a new one for the next.
+    #[test]
+    fn the_target_can_open_the_channel_again_for_the_next_recording() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut relay = MicrophoneRelay::new(tx);
+        let mut target = Target::new(relay.channel);
+        negotiate(&mut target);
+        open(&mut target, 0, 4);
+        target.exchange(DrdynvcServerPdu::Close(ironrdp_dvc::pdu::ClosePdu::new(ID)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DesktopEvent::MicrophoneOpen { .. })
+        ));
+        assert!(matches!(rx.try_recv(), Ok(DesktopEvent::MicrophoneClose)));
+
+        target.create();
+        negotiate(&mut target);
+        open(&mut target, 0, 4);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DesktopEvent::MicrophoneOpen { .. })
+        ));
+        relay.input.push(&[9; 8]);
+        assert!(
+            relay.uplink.try_recv().is_ok(),
+            "audio reaches the new channel"
+        );
     }
 
     #[test]
