@@ -42,6 +42,7 @@ exclude = [
     "vendor/ironrdp-connector",
     "vendor/ironrdp-dvc",
     "vendor/ironrdp-rdpdr",
+    "vendor/ironrdp-rdpeudp-tokio",
     "vendor/ironrdp-rdpsnd",
     "vendor/ironrdp-server",
     "vendor/ironrdp-session",
@@ -55,6 +56,7 @@ ironrdp-async = { path = "vendor/ironrdp-async" }
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
 ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
+ironrdp-rdpeudp-tokio = { path = "vendor/ironrdp-rdpeudp-tokio" }
 ironrdp-rdpsnd = { path = "vendor/ironrdp-rdpsnd" }
 ironrdp-server = { path = "vendor/ironrdp-server" }
 ironrdp-session = { path = "vendor/ironrdp-session" }
