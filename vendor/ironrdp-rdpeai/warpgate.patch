@@ -1,0 +1,59 @@
+diff -ru ironrdp-rdpeai-0.2.0/src/pdu.rs base/src/pdu.rs
+--- ironrdp-rdpeai-0.2.0/src/pdu.rs	2026-11-01 20:59:03
++++ base/src/pdu.rs	2026-11-01 20:59:03
+@@ -197,13 +197,13 @@
+         pdu
+     }
+ 
+-    /// Build a server→client formats PDU (`cbSizeFormatsPacket` is arbitrary).
++    /// Build a server→client formats PDU.
++    ///
++    /// `cbSizeFormatsPacket` is arbitrary from the server (MS-RDPEAI 2.2.2.2), but a Windows
++    /// server sets it to the size of the PDU as the client does, and Windows App (macOS, iOS)
++    /// does not answer a Sound Formats PDU that carries 0 there.
+     pub fn server(formats: Vec<AudioFormat>) -> Self {
+-        Self {
+-            formats,
+-            cb_size_formats_packet: 0,
+-            extra_data: Vec::new(),
+-        }
++        Self::client(formats)
+     }
+ 
+     fn size_without_extra(&self) -> usize {
+@@ -465,5 +465,35 @@
+         n_block_align,
+         bits_per_sample,
+         data: None,
++    }
++}
++
++#[cfg(test)]
++mod server_formats_tests {
++    use ironrdp_core::{decode, encode_vec};
++    use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
++
++    use super::{FormatsPdu, RdpeaiPdu};
++
++    #[test]
++    fn the_server_formats_pdu_carries_its_size() {
++        let pcm = AudioFormat {
++            format: WaveFormat::PCM,
++            n_channels: 2,
++            n_samples_per_sec: 44_100,
++            n_avg_bytes_per_sec: 176_400,
++            n_block_align: 4,
++            bits_per_sample: 16,
++            data: None,
++        };
++        let bytes = encode_vec(&RdpeaiPdu::Formats(FormatsPdu::server(vec![pcm.clone(), pcm]))).expect("encodes");
++        // Header, NumFormats, cbSizeFormatsPacket, two 18-byte AUDIO_FORMATs, no ExtraData.
++        assert_eq!(bytes.len(), 1 + 4 + 4 + 2 * 18);
++        assert_eq!(u32::from_le_bytes(bytes[5..9].try_into().unwrap()), 45);
++        let RdpeaiPdu::Formats(back) = decode::<RdpeaiPdu>(&bytes).expect("decodes") else {
++            panic!("a Sound Formats PDU");
++        };
++        assert_eq!(back.cb_size_formats_packet, 45);
++        assert!(back.extra_data.is_empty());
+     }
+ }
