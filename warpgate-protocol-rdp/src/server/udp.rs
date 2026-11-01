@@ -13,7 +13,10 @@
 //!   (MS-RDPEUDP 2.2.2.9), which names the pending request it answers. One whose hash
 //!   names no request is dropped: its sender does not hold a cookie Warpgate issued, so
 //!   its Tunnel Create Request (MS-RDPEMT 3.2.5.1) would fail anyway, and routing it by
-//!   address instead would let it take another viewer's request;
+//!   address instead would let it take another viewer's request. This departs from
+//!   3.1.5.1.1 step 5, which has the server accept a SYN with an invalid hash and reset
+//!   the connection to version 2: without a request to hand it to there is no connection
+//!   to reset, and the client stays on TCP;
 //! * a SYN whose `SYNDATAEX` offers version 1 or 2 carries no `cookieHash` (2.2.2.9 forbids
 //!   one). It goes to a pending request only when exactly one is waiting for its source
 //!   address, and only on a guess: the request stays open, and a version 3 SYN whose
@@ -201,7 +204,8 @@ enum DropReason {
     /// A SYN without `cookieHash` that `ironrdp-rdpeudp` cannot accept: no `SYNDATAEX`, or
     /// a version 3 offer.
     Unroutable,
-    /// A SYN whose `cookieHash` names no request.
+    /// A SYN whose `cookieHash` names no request. MS-RDPEUDP 3.1.5.1.1 step 5 would
+    /// downgrade an invalid hash to version 2, but there is no request to bind it to.
     UnknownCookie,
     /// A SYN without `cookieHash` that no waiting request from its source IP matches.
     NoRequest,

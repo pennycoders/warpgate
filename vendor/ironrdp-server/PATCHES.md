@@ -171,6 +171,15 @@ whatever the embedder routed. `with_udp_sideband` takes precedence over
 `with_udp_transport`; either one makes `PendingConnection::new` offer the transport
 (`RdpServerOptions::offers_udp`).
 
+An embedder that routes by `cookieHash` cannot follow 3.1.5.1.1 step 5 for a version 3 SYN
+whose hash is not valid: the server is to accept it and reset the connection to version 2
+(which `ironrdp-rdpeudp`'s accept does), but a hash that names no request leaves nothing to
+hand the SYN to. Warpgate's listener (`warpgate-protocol-rdp`, `server::udp`) drops such a
+SYN, and a client that sends one stays on TCP. A client whose hash is wrong does not hold
+the cookie of any waiting request, so its Tunnel Create Request (MS-RDPEMT 3.2.5.1) would
+fail on whichever request it were given; Windows validates the hash itself from Windows 10
+v2004 on (MS-RDPEUDP 3.1.5.1.1, note 6).
+
 The `multitransport::tests::sideband_*` tests cover a sideband with no datagrams, a client
 that never sends, and the full handshake over a socket shared the way an embedder's
 listener shares it. They need `rcgen` and tokio's `test-util` as dev-dependencies, which
