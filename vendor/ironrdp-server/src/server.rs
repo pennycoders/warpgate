@@ -1518,6 +1518,14 @@ pub enum ServerEvent {
     Rdpsnd(RdpsndServerMessage),
     Rdpdr(RdpdrServerMessage),
     Rdpeai(RdpeaiServerMessage),
+    /// Open the client's `AUDIO_INPUT` channel, unless it is open already. A Windows server
+    /// creates it only when an application starts recording and closes it when the last one
+    /// stops; Windows App answers the server's Sound Formats PDU (MS-RDPEAI 3.2.5.1.5) only on
+    /// a channel opened that way, not on one opened while the connection is set up.
+    RdpeaiOpenChannel,
+    /// Close the client's `AUDIO_INPUT` channel (MS-RDPEDYC 2.2.4), which ends its recording:
+    /// MS-RDPEAI has no PDU that stops a client short of that.
+    RdpeaiCloseChannel,
     Echo(EchoServerMessage),
     SetCredentials(Credentials),
     /// Replace or clear the Server Auto-Reconnect Cookie.
@@ -1551,6 +1559,8 @@ impl fmt::Debug for ServerEvent {
             Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
             Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
             Self::Rdpeai(..) => f.write_str("Rdpeai(..)"),
+            Self::RdpeaiOpenChannel => f.write_str("RdpeaiOpenChannel"),
+            Self::RdpeaiCloseChannel => f.write_str("RdpeaiCloseChannel"),
             Self::Echo(..) => f.write_str("Echo(..)"),
             Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
             Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
@@ -1903,6 +1913,9 @@ struct ConnectionState {
     /// [`DisplayContext::pointer_cache_size`] and [`DisplayContext::color_pointer_cache_size`].
     pointer_cache_size: u16,
     color_pointer_cache_size: u16,
+    /// The `AUDIO_INPUT` channel opened by [`ServerEvent::RdpeaiOpenChannel`], until
+    /// [`ServerEvent::RdpeaiCloseChannel`].
+    rdpeai_channel_id: Option<u32>,
 }
 
 impl ConnectionState {
@@ -2844,12 +2857,7 @@ impl RdpServer {
             dvc
         };
 
-        let dvc = if let Some(factory) = self.rdpeai_factory.as_deref() {
-            let backend = factory.build_backend();
-            dvc.with_dynamic_channel(RdpeaiServer::new(backend))
-        } else {
-            dvc
-        };
+        // AUDIO_INPUT is not opened here but on ServerEvent::RdpeaiOpenChannel.
 
         // Clients that take audio only on AUDIO_PLAYBACK_DVC never open the rdpsnd static
         // channel; offering both lets each client use the one it supports.
@@ -2910,6 +2918,7 @@ impl RdpServer {
             auto_reconnect_issued: false,
             pointer_cache_size: 0,
             color_pointer_cache_size: 0,
+            rdpeai_channel_id: None,
         }
     }
 
@@ -4111,13 +4120,67 @@ impl RdpServer {
                         .await
                         .map_err(|e| ServerError::io("write_all", e))?;
                 }
-                ServerEvent::Rdpeai(msg) => {
-                    let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
-                        warn!("No drdynvc channel, dropping AUDIO_INPUT event");
+                ServerEvent::RdpeaiOpenChannel => {
+                    let Some(factory) = self.rdpeai_factory.as_deref() else {
+                        warn!("No AUDIO_INPUT factory, not opening the channel");
                         continue;
                     };
-                    let Some(channel_id) = drdynvc.get_channel_id_by_type::<RdpeaiServer>() else {
+                    let current = conn.rdpeai_channel_id;
+                    let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        warn!("No drdynvc channel, not opening AUDIO_INPUT");
+                        continue;
+                    };
+                    if current.is_some_and(|id| drdynvc.is_channel_opened(id)) {
+                        continue;
+                    }
+                    let mut opened = None;
+                    let create = drdynvc
+                        .create_channel_with(|channel_id| {
+                            opened = Some(channel_id);
+                            Ok::<_, ironrdp_pdu::PduError>(RdpeaiServer::new(factory.build_backend()))
+                        })
+                        .map_err_kind("create AUDIO_INPUT channel", ServerErrorKind::Pdu)?;
+                    conn.rdpeai_channel_id = opened;
+                    debug!(channel_id = ?opened, "Opening AUDIO_INPUT");
+                    let drdynvc_channel_id = conn
+                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
+                    let data = server_encode_svc_messages(vec![create], drdynvc_channel_id, user_channel_id)
+                        .map_err(ServerError::encode)?;
+                    writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| ServerError::io("write_all", e))?;
+                }
+                ServerEvent::RdpeaiCloseChannel => {
+                    let Some(channel_id) = conn.rdpeai_channel_id.take() else {
+                        continue;
+                    };
+                    let Some(close) = conn
+                        .get_svc_processor::<dvc::DrdynvcServer>()
+                        .and_then(|drdynvc| drdynvc.close_channel(channel_id))
+                    else {
+                        // The client closed it already, or declined it.
+                        continue;
+                    };
+                    debug!(channel_id, "Closing AUDIO_INPUT");
+                    let drdynvc_channel_id = conn
+                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
+                    let data = server_encode_svc_messages(vec![close], drdynvc_channel_id, user_channel_id)
+                        .map_err(ServerError::encode)?;
+                    writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| ServerError::io("write_all", e))?;
+                }
+                ServerEvent::Rdpeai(msg) => {
+                    let Some(channel_id) = conn.rdpeai_channel_id else {
                         warn!("No AUDIO_INPUT dynamic channel, dropping event");
+                        continue;
+                    };
+                    let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        warn!("No drdynvc channel, dropping AUDIO_INPUT event");
                         continue;
                     };
                     // dvc_by_id_mut already returns None for a channel that isn't yet
@@ -7238,6 +7301,69 @@ mod cliprdr_error_tests {
             "the session must keep running after a refused clipboard message, got {state:?}"
         );
         assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
+    }
+
+    struct NoMicrophone;
+
+    impl ServerEventSender for NoMicrophone {
+        fn set_sender(&mut self, _: mpsc::UnboundedSender<ServerEvent>) {}
+    }
+
+    impl RdpeaiServerFactory for NoMicrophone {
+        fn build_backend(&self) -> Box<dyn crate::RdpeaiServerBackend> {
+            Box::new(crate::NoopRdpeaiServerBackend)
+        }
+    }
+
+    /// AUDIO_INPUT is created on request and closed on request, not at connection time.
+    #[tokio::test]
+    async fn audio_input_opens_and_closes_on_request() {
+        let mut server = RdpServer::builder()
+            .with_addr((Ipv4Addr::LOCALHOST, 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .with_rdpeai_factory(Some(Box::new(NoMicrophone)))
+            .build();
+        let mut conn = ConnectionState::default();
+        conn.static_channels.insert(dvc::DrdynvcServer::new());
+        conn.static_channels
+            .attach_channel_id(TypeId::of::<dvc::DrdynvcServer>(), 1007);
+
+        let mut writer = CapturingWriter::default();
+        let mut events = vec![ServerEvent::RdpeaiOpenChannel];
+        server
+            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
+            .await
+            .expect("opening AUDIO_INPUT");
+        let opened = conn.rdpeai_channel_id.expect("the channel is remembered");
+        assert!(
+            writer.0.windows(b"AUDIO_INPUT\0".len()).any(|w| w == b"AUDIO_INPUT\0"),
+            "a Create Request names the channel"
+        );
+
+        let mut writer = CapturingWriter::default();
+        let mut events = vec![ServerEvent::RdpeaiCloseChannel];
+        server
+            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
+            .await
+            .expect("closing AUDIO_INPUT");
+        assert_eq!(conn.rdpeai_channel_id, None);
+        // MS-RDPEDYC 2.2.4: Cmd 0x04 in the high nibble, then the channel id.
+        let close = u8::try_from(opened).expect("a small channel id");
+        assert!(
+            writer.0.windows(2).any(|w| w[0] >> 4 == 0x04 && w[1] == close),
+            "a Close PDU for the channel"
+        );
+
+        // Closing again sends nothing.
+        let mut writer = CapturingWriter::default();
+        let mut events = vec![ServerEvent::RdpeaiCloseChannel];
+        server
+            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
+            .await
+            .expect("closing again");
+        assert!(writer.0.is_empty());
     }
 }
 

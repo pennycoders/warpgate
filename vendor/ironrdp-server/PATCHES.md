@@ -113,6 +113,20 @@ Desktop on macOS sends such layouts, and its sessions ended with a protocol erro
 channel is wrapped in `TolerantDisplayControl`, which logs the PDU and ignores it; a
 layout is only a resize request, so the session keeps its size.
 
+## `AUDIO_INPUT` opens when recording starts
+
+Upstream registers `AUDIO_INPUT` with the other dynamic channels, so it is created while the
+connection is set up. Windows App (macOS and iOS) accepts that channel and answers the
+server's Version PDU, but never sends the Incoming Data and Sound Formats PDUs that MS-RDPEAI
+3.2.5.1.4 and 3.2.5.1.5 require, so the server never gets to send Open (3.3.5.1.6) and the
+microphone stays silent. A Windows server creates the channel only when an application
+starts recording and closes it when the last one stops; the same client then completes the
+initialization sequence of MS-RDPEAI 1.3.1. `ServerEvent::RdpeaiOpenChannel` creates the
+channel (with a fresh backend from the factory) and `ServerEvent::RdpeaiCloseChannel` closes
+it with a Close Request (MS-RDPEDYC 2.2.4), which is also the only way MS-RDPEAI has to stop
+a client recording. `ServerEvent::Rdpeai` goes to the channel opened that way. The embedder
+must not open the channel before the client's DVC Capabilities Response (MS-RDPEDYC 3.3.5.1).
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same

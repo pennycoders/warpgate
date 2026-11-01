@@ -1,6 +1,6 @@
 diff -ru ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
---- ironrdp-server-0.14.0/src/capabilities.rs	2026-11-01 11:30:53
-+++ base/src/capabilities.rs	2026-11-01 11:30:53
+--- ironrdp-server-0.14.0/src/capabilities.rs	2026-11-01 18:38:57
++++ base/src/capabilities.rs	2026-11-01 18:38:57
 @@ -1,4 +1,4 @@
 -use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
 +use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags, MajorPlatformType, MinorPlatformType};
@@ -19,8 +19,8 @@ diff -ru ironrdp-server-0.14.0/src/capabilities.rs base/src/capabilities.rs
          // Advertise that the server handles `SuppressOutput` and
          // `RefreshRectangle` (per MS-RDPBCGR 2.2.7.1.1) — spec-compliant
 diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
---- ironrdp-server-0.14.0/src/display.rs	2026-11-01 11:30:53
-+++ base/src/display.rs	2026-11-01 11:30:53
+--- ironrdp-server-0.14.0/src/display.rs	2026-11-01 18:38:57
++++ base/src/display.rs	2026-11-01 18:38:57
 @@ -329,6 +329,19 @@
      /// and then signals the event loop via `ServerEvent::Egfx`.
      #[cfg(feature = "egfx")]
@@ -51,8 +51,8 @@ diff -ru ironrdp-server-0.14.0/src/display.rs base/src/display.rs
      }
  }
 diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
---- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-11-01 11:30:53
-+++ base/src/encoder/bitmap.rs	2026-11-01 11:30:53
+--- ironrdp-server-0.14.0/src/encoder/bitmap.rs	2026-11-01 18:38:57
++++ base/src/encoder/bitmap.rs	2026-11-01 18:38:57
 @@ -1,6 +1,6 @@
 -use core::num::NonZeroUsize;
 +use core::iter;
@@ -143,8 +143,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/bitmap.rs base/src/encoder/bitmap.rs
                  bitmap_data: &self.buffer[..len],
              };
 diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_path.rs
---- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-11-01 11:30:53
-+++ base/src/encoder/fast_path.rs	2026-11-01 11:30:53
+--- ironrdp-server-0.14.0/src/encoder/fast_path.rs	2026-11-01 18:38:57
++++ base/src/encoder/fast_path.rs	2026-11-01 18:38:57
 @@ -4,7 +4,8 @@
  use ironrdp_pdu::{Encode as _, WriteCursor};
  
@@ -174,8 +174,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/fast_path.rs base/src/encoder/fast_pa
  
              1..=MAX_FASTPATH_UPDATE_SIZE => {
 diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
---- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-11-01 11:30:53
-+++ base/src/encoder/mod.rs	2026-11-01 11:30:53
+--- ironrdp-server-0.14.0/src/encoder/mod.rs	2026-11-01 18:38:57
++++ base/src/encoder/mod.rs	2026-11-01 18:38:57
 @@ -16,6 +16,8 @@
  use tracing::{debug, warn};
  
@@ -621,8 +621,8 @@ diff -ru ironrdp-server-0.14.0/src/encoder/mod.rs base/src/encoder/mod.rs
  }
  
 diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
---- ironrdp-server-0.14.0/src/lib.rs	2026-11-01 11:30:53
-+++ base/src/lib.rs	2026-11-01 11:30:53
+--- ironrdp-server-0.14.0/src/lib.rs	2026-11-01 18:38:57
++++ base/src/lib.rs	2026-11-01 18:38:57
 @@ -36,7 +36,7 @@
  #[cfg(all(feature = "__test", feature = "qoiz"))]
  pub use encoder::qoiz::Compressor as QoizCompressor;
@@ -651,8 +651,8 @@ diff -ru ironrdp-server-0.14.0/src/lib.rs base/src/lib.rs
  #[cfg(feature = "usb")]
  pub use urbdrc::{
 diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
---- ironrdp-server-0.14.0/src/server.rs	2026-11-01 11:30:53
-+++ base/src/server.rs	2026-11-01 11:30:53
+--- ironrdp-server-0.14.0/src/server.rs	2026-11-01 18:38:57
++++ base/src/server.rs	2026-11-01 18:38:57
 @@ -20,7 +20,7 @@
  use ironrdp_cliprdr::CliprdrServer;
  use ironrdp_cliprdr::backend::ClipboardMessage;
@@ -764,7 +764,31 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
  #[cfg(feature = "usb")]
  #[derive(Default)]
  struct ServerUsbManager {
-@@ -1827,6 +1899,10 @@
+@@ -1446,6 +1518,14 @@
+     Rdpsnd(RdpsndServerMessage),
+     Rdpdr(RdpdrServerMessage),
+     Rdpeai(RdpeaiServerMessage),
++    /// Open the client's `AUDIO_INPUT` channel, unless it is open already. A Windows server
++    /// creates it only when an application starts recording and closes it when the last one
++    /// stops; Windows App answers the server's Sound Formats PDU (MS-RDPEAI 3.2.5.1.5) only on
++    /// a channel opened that way, not on one opened while the connection is set up.
++    RdpeaiOpenChannel,
++    /// Close the client's `AUDIO_INPUT` channel (MS-RDPEDYC 2.2.4), which ends its recording:
++    /// MS-RDPEAI has no PDU that stops a client short of that.
++    RdpeaiCloseChannel,
+     Echo(EchoServerMessage),
+     SetCredentials(Credentials),
+     /// Replace or clear the Server Auto-Reconnect Cookie.
+@@ -1479,6 +1559,8 @@
+             Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
+             Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
+             Self::Rdpeai(..) => f.write_str("Rdpeai(..)"),
++            Self::RdpeaiOpenChannel => f.write_str("RdpeaiOpenChannel"),
++            Self::RdpeaiCloseChannel => f.write_str("RdpeaiCloseChannel"),
+             Self::Echo(..) => f.write_str("Echo(..)"),
+             Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
+             Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
+@@ -1827,6 +1909,13 @@
      /// eligible for the hourly update when cookies are on request (see
      /// [`RdpServer::set_auto_reconnect_on_request`]).
      auto_reconnect_issued: bool,
@@ -772,10 +796,13 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
 +    /// [`DisplayContext::pointer_cache_size`] and [`DisplayContext::color_pointer_cache_size`].
 +    pointer_cache_size: u16,
 +    color_pointer_cache_size: u16,
++    /// The `AUDIO_INPUT` channel opened by [`ServerEvent::RdpeaiOpenChannel`], until
++    /// [`ServerEvent::RdpeaiCloseChannel`].
++    rdpeai_channel_id: Option<u32>,
  }
  
  impl ConnectionState {
-@@ -1839,6 +1915,8 @@
+@@ -1839,6 +1928,8 @@
              autodetect: self.autodetect_handles.clone(),
              #[cfg(feature = "egfx")]
              gfx_handle: self.gfx_handle.clone(),
@@ -784,7 +811,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          }
      }
  
-@@ -1852,6 +1930,42 @@
+@@ -1852,6 +1943,42 @@
          self.static_channels.get_channel_id_by_type::<T>()
      }
  
@@ -827,7 +854,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
      #[cfg(feature = "usb")]
      fn remove_usb_device(&mut self, dvc_id: DynamicChannelId) {
          let Some(device) = self.usb_man.router.remove(&dvc_id) else {
-@@ -2714,7 +2828,7 @@
+@@ -2714,7 +2841,7 @@
          };
          let dvc = if let Some(monitor_count) = display_control_monitors {
              let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display), monitor_count);
@@ -836,31 +863,33 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          } else {
              dvc
          };
-@@ -2737,6 +2851,14 @@
+@@ -2730,9 +2857,12 @@
              dvc
          };
  
+-        let dvc = if let Some(factory) = self.rdpeai_factory.as_deref() {
+-            let backend = factory.build_backend();
+-            dvc.with_dynamic_channel(RdpeaiServer::new(backend))
++        // AUDIO_INPUT is not opened here but on ServerEvent::RdpeaiOpenChannel.
++
 +        // Clients that take audio only on AUDIO_PLAYBACK_DVC never open the rdpsnd static
 +        // channel; offering both lets each client use the one it supports.
 +        let dvc = if let Some(factory) = self.sound_factory.as_deref() {
 +            dvc.with_dynamic_channel(RdpsndDvcServer::new(RdpsndServer::new(factory.build_backend())))
-+        } else {
-+            dvc
-+        };
-+
-         #[cfg(feature = "egfx")]
-         let (dvc, gfx_handle) = {
-             let mut dvc = dvc;
-@@ -2786,6 +2908,8 @@
+         } else {
+             dvc
+         };
+@@ -2786,6 +2916,9 @@
              egfx_on_udp: false,
              early_tunnel_payloads: VecDeque::new(),
              auto_reconnect_issued: false,
 +            pointer_cache_size: 0,
 +            color_pointer_cache_size: 0,
++            rdpeai_channel_id: None,
          }
      }
  
-@@ -3816,6 +3940,25 @@
+@@ -3816,6 +3949,25 @@
                          .await?;
                  }
                  ServerEvent::Rdpsnd(s) => {
@@ -886,7 +915,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      let Some(rdpsnd) = conn.get_svc_processor::<RdpsndServer>() else {
                          warn!("No rdpsnd channel, dropping event");
                          continue;
-@@ -3955,6 +4098,7 @@
+@@ -3955,6 +4107,7 @@
                              input_buffer,
                              output_buffer_length,
                          ),
@@ -894,7 +923,80 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      }
                      .map_err_kind("failed to send rdpdr event", ServerErrorKind::Pdu)?;
                      let channel_id = conn
-@@ -4737,6 +4881,7 @@
+@@ -3967,15 +4120,69 @@
+                         .await
+                         .map_err(|e| ServerError::io("write_all", e))?;
+                 }
+-                ServerEvent::Rdpeai(msg) => {
++                ServerEvent::RdpeaiOpenChannel => {
++                    let Some(factory) = self.rdpeai_factory.as_deref() else {
++                        warn!("No AUDIO_INPUT factory, not opening the channel");
++                        continue;
++                    };
++                    let current = conn.rdpeai_channel_id;
+                     let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
+-                        warn!("No drdynvc channel, dropping AUDIO_INPUT event");
++                        warn!("No drdynvc channel, not opening AUDIO_INPUT");
+                         continue;
+                     };
+-                    let Some(channel_id) = drdynvc.get_channel_id_by_type::<RdpeaiServer>() else {
++                    if current.is_some_and(|id| drdynvc.is_channel_opened(id)) {
++                        continue;
++                    }
++                    let mut opened = None;
++                    let create = drdynvc
++                        .create_channel_with(|channel_id| {
++                            opened = Some(channel_id);
++                            Ok::<_, ironrdp_pdu::PduError>(RdpeaiServer::new(factory.build_backend()))
++                        })
++                        .map_err_kind("create AUDIO_INPUT channel", ServerErrorKind::Pdu)?;
++                    conn.rdpeai_channel_id = opened;
++                    debug!(channel_id = ?opened, "Opening AUDIO_INPUT");
++                    let drdynvc_channel_id = conn
++                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
++                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
++                    let data = server_encode_svc_messages(vec![create], drdynvc_channel_id, user_channel_id)
++                        .map_err(ServerError::encode)?;
++                    writer
++                        .write_all(&data)
++                        .await
++                        .map_err(|e| ServerError::io("write_all", e))?;
++                }
++                ServerEvent::RdpeaiCloseChannel => {
++                    let Some(channel_id) = conn.rdpeai_channel_id.take() else {
++                        continue;
++                    };
++                    let Some(close) = conn
++                        .get_svc_processor::<dvc::DrdynvcServer>()
++                        .and_then(|drdynvc| drdynvc.close_channel(channel_id))
++                    else {
++                        // The client closed it already, or declined it.
++                        continue;
++                    };
++                    debug!(channel_id, "Closing AUDIO_INPUT");
++                    let drdynvc_channel_id = conn
++                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
++                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
++                    let data = server_encode_svc_messages(vec![close], drdynvc_channel_id, user_channel_id)
++                        .map_err(ServerError::encode)?;
++                    writer
++                        .write_all(&data)
++                        .await
++                        .map_err(|e| ServerError::io("write_all", e))?;
++                }
++                ServerEvent::Rdpeai(msg) => {
++                    let Some(channel_id) = conn.rdpeai_channel_id else {
+                         warn!("No AUDIO_INPUT dynamic channel, dropping event");
+                         continue;
+                     };
++                    let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
++                        warn!("No drdynvc channel, dropping AUDIO_INPUT event");
++                        continue;
++                    };
+                     // dvc_by_id_mut already returns None for a channel that isn't yet
+                     // Opened, and that case is handled just below; a separate
+                     // is_channel_opened check here would only duplicate it.
+@@ -4737,6 +4944,7 @@
          let udp_transport_for_events = Rc::clone(&udp_transport);
          let udp_transport_for_pdus = Rc::clone(&udp_transport);
          let mut cliprdr_writer = writer.clone();
@@ -902,7 +1004,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          let write_counter = writer.write_counter();
          let ev_receiver = Arc::clone(&self.ev_receiver);
          let s = Rc::new(Mutex::new((self, conn)));
-@@ -5061,17 +5206,32 @@
+@@ -5061,17 +5269,32 @@
              }
          };
  
@@ -943,7 +1045,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          state
      }
  
-@@ -5170,22 +5330,6 @@
+@@ -5170,22 +5393,6 @@
              });
          }
  
@@ -966,7 +1068,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          #[cfg(feature = "egfx")]
          if let Some(gfx_handle) = conn.gfx_handle.as_ref() {
              let mut server = gfx_handle
-@@ -5224,10 +5368,12 @@
+@@ -5224,10 +5431,12 @@
          let mut update_codecs = UpdateEncoderCodecs::new();
          let mut surface_flags = CmdFlags::empty();
          let mut pointer_cache_size: u16 = 0;
@@ -979,7 +1081,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
          for c in result.capabilities {
              match c {
                  CapabilitySet::General(c) => {
-@@ -5239,7 +5385,6 @@
+@@ -5239,7 +5448,6 @@
                  CapabilitySet::Bitmap(b) => {
                      if !b.desktop_resize_flag {
                          debug!("Desktop resize is not supported by the client");
@@ -987,7 +1089,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      }
  
                      let client_size = DesktopSize {
-@@ -5250,12 +5395,12 @@
+@@ -5250,12 +5458,12 @@
  
                      // It's problematic when the client didn't resize, as we send bitmap updates that don't fit.
                      // The client will likely drop the connection.
@@ -1005,7 +1107,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                      }
                  }
                  CapabilitySet::SurfaceCommands(c) => {
-@@ -5310,6 +5455,7 @@
+@@ -5310,6 +5518,7 @@
                      // must not reference a cache slot via CachedPointer either, since nothing
                      // else in this crate populates that cache via the Color Pointer Update.
                      pointer_cache_size = p.pointer_cache_size;
@@ -1013,7 +1115,7 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
                  }
                  CapabilitySet::LargePointer(lp) => {
                      // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
-@@ -5323,15 +5469,34 @@
+@@ -5323,15 +5532,34 @@
              }
          }
  
@@ -1049,7 +1151,77 @@ diff -ru ironrdp-server-0.14.0/src/server.rs base/src/server.rs
  
          // By default every connection gets a cookie at activation. On request, only one that came
          // back with a verified cookie does.
-@@ -7239,6 +7404,44 @@
+@@ -7074,6 +7302,69 @@
+         );
+         assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
+     }
++
++    struct NoMicrophone;
++
++    impl ServerEventSender for NoMicrophone {
++        fn set_sender(&mut self, _: mpsc::UnboundedSender<ServerEvent>) {}
++    }
++
++    impl RdpeaiServerFactory for NoMicrophone {
++        fn build_backend(&self) -> Box<dyn crate::RdpeaiServerBackend> {
++            Box::new(crate::NoopRdpeaiServerBackend)
++        }
++    }
++
++    /// AUDIO_INPUT is created on request and closed on request, not at connection time.
++    #[tokio::test]
++    async fn audio_input_opens_and_closes_on_request() {
++        let mut server = RdpServer::builder()
++            .with_addr((Ipv4Addr::LOCALHOST, 0))
++            .with_no_security()
++            .with_no_input()
++            .with_no_display()
++            .with_rdpeai_factory(Some(Box::new(NoMicrophone)))
++            .build();
++        let mut conn = ConnectionState::default();
++        conn.static_channels.insert(dvc::DrdynvcServer::new());
++        conn.static_channels
++            .attach_channel_id(TypeId::of::<dvc::DrdynvcServer>(), 1007);
++
++        let mut writer = CapturingWriter::default();
++        let mut events = vec![ServerEvent::RdpeaiOpenChannel];
++        server
++            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
++            .await
++            .expect("opening AUDIO_INPUT");
++        let opened = conn.rdpeai_channel_id.expect("the channel is remembered");
++        assert!(
++            writer.0.windows(b"AUDIO_INPUT\0".len()).any(|w| w == b"AUDIO_INPUT\0"),
++            "a Create Request names the channel"
++        );
++
++        let mut writer = CapturingWriter::default();
++        let mut events = vec![ServerEvent::RdpeaiCloseChannel];
++        server
++            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
++            .await
++            .expect("closing AUDIO_INPUT");
++        assert_eq!(conn.rdpeai_channel_id, None);
++        // MS-RDPEDYC 2.2.4: Cmd 0x04 in the high nibble, then the channel id.
++        let close = u8::try_from(opened).expect("a small channel id");
++        assert!(
++            writer.0.windows(2).any(|w| w[0] >> 4 == 0x04 && w[1] == close),
++            "a Close PDU for the channel"
++        );
++
++        // Closing again sends nothing.
++        let mut writer = CapturingWriter::default();
++        let mut events = vec![ServerEvent::RdpeaiCloseChannel];
++        server
++            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
++            .await
++            .expect("closing again");
++        assert!(writer.0.is_empty());
++    }
+ }
+ 
+ #[cfg(all(test, feature = "egfx"))]
+@@ -7239,6 +7530,44 @@
      }
  
      impl SvcServerProcessor for ResourceChannel {}

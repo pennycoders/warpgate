@@ -1,8 +1,11 @@
 //! The viewer's microphone (MS-RDPEAI) for the target, relayed unchanged.
 //!
 //! The viewer is offered the same PCM formats as the target ([`DESKTOP_MICROPHONE_FORMATS`]).
-//! Recording starts only once the target opens capture: the viewer is then asked for the
-//! target's format, and what it records goes to the target as it comes.
+//! The viewer's `AUDIO_INPUT` channel opens only once the target opens capture and closes when
+//! the target stops, as a Windows server does: Windows App does not answer the Sound Formats
+//! PDU (MS-RDPEAI 3.2.5.1.5) on a channel opened while the connection is set up. Once the
+//! formats are agreed the viewer is asked for the target's format, and what it records goes to
+//! the target as it comes.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -26,6 +29,8 @@ struct State {
     recording: Option<u32>,
     /// What the target records in, while it records.
     wanted: Option<(DesktopAudioFormat, u32)>,
+    /// Whether the viewer's channel was asked to open and not closed since.
+    channel: bool,
 }
 
 #[derive(Debug, Default)]
@@ -39,14 +44,24 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn send(&self, message: RdpeaiServerMessage) {
-        if let Some(server) = self
-            .server
+    /// Whether the event reached a running RDP server.
+    fn send_event(&self, event: ServerEvent) -> bool {
+        self.server
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-        {
-            let _ = server.send(ServerEvent::Rdpeai(message));
+            .is_some_and(|server| server.send(event).is_ok())
+    }
+
+    fn send(&self, message: RdpeaiServerMessage) {
+        self.send_event(ServerEvent::Rdpeai(message));
+    }
+
+    /// Opens the viewer's channel while the target records, once the server is running.
+    fn open_channel(&self) {
+        let mut state = self.state();
+        if state.wanted.is_some() && !state.channel {
+            state.channel = self.send_event(ServerEvent::RdpeaiOpenChannel);
         }
     }
 
@@ -102,13 +117,24 @@ impl ViewerMicrophone {
     /// The target started recording, or switched format.
     pub(super) fn open(&self, format: DesktopAudioFormat, frames_per_packet: u32) {
         self.shared.state().wanted = Some((format, frames_per_packet));
+        self.shared.open_channel();
         self.shared.sync();
     }
 
     /// The target stopped recording. MS-RDPEAI has no way to stop a client short of closing
-    /// the channel, so the viewer may keep recording; what it sends is dropped.
+    /// the channel (MS-RDPEDYC 2.2.4), so the channel is closed; it opens again with the next
+    /// recording.
     pub(super) fn close(&self) {
-        self.shared.state().wanted = None;
+        let close = {
+            let mut state = self.shared.state();
+            state.wanted = None;
+            state.negotiated.clear();
+            state.recording = None;
+            std::mem::take(&mut state.channel)
+        };
+        if close {
+            self.shared.send_event(ServerEvent::RdpeaiCloseChannel);
+        }
     }
 }
 
@@ -119,6 +145,8 @@ impl ServerEventSender for ViewerMicrophone {
             .server
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(sender);
+        // The target may have started recording before the viewer's server was up.
+        self.shared.open_channel();
     }
 }
 
@@ -350,8 +378,7 @@ mod tests {
         viewer.receive(RdpeaiPdu::FormatChange(FormatChangePdu::new(0)));
         viewer.receive(RdpeaiPdu::OpenReply(OpenReplyPdu::ok()));
 
-        // The target closes and reopens in the same format: nothing to tell the viewer.
-        viewer.microphone.close();
+        // Opening again in the same format: nothing to tell the viewer.
         viewer.microphone.open(MONO_16, 160);
         assert!(viewer.drive().is_empty());
 
@@ -360,6 +387,63 @@ mod tests {
             viewer.drive().as_slice(),
             [RdpeaiPdu::FormatChange(FormatChangePdu { new_format: 1 })]
         ));
+    }
+
+    fn channel_events(events: &mut mpsc::UnboundedReceiver<ServerEvent>) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ServerEvent::RdpeaiOpenChannel => out.push("open"),
+                ServerEvent::RdpeaiCloseChannel => out.push("close"),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_viewers_channel_is_open_only_while_the_target_records() {
+        let mut viewer = Viewer::new();
+        assert!(channel_events(&mut viewer.events).is_empty());
+
+        viewer.microphone.open(STEREO_44, 441);
+        // A format change keeps the channel.
+        viewer.microphone.open(MONO_16, 160);
+        assert_eq!(channel_events(&mut viewer.events), ["open"]);
+
+        viewer.microphone.close();
+        viewer.microphone.close();
+        assert_eq!(channel_events(&mut viewer.events), ["close"]);
+
+        viewer.microphone.open(MONO_16, 160);
+        assert_eq!(channel_events(&mut viewer.events), ["open"]);
+    }
+
+    #[test]
+    fn a_target_that_records_before_the_server_runs_opens_the_channel_once_it_does() {
+        let (out_tx, _out) = mpsc::unbounded_channel();
+        let mut microphone = ViewerMicrophone::new(out_tx);
+        microphone.open(MONO_16, 160);
+
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        microphone.set_sender(events_tx);
+        assert_eq!(channel_events(&mut events), ["open"]);
+    }
+
+    #[test]
+    fn a_reopened_channel_negotiates_again_before_the_viewer_records() {
+        let mut viewer = Viewer::new();
+        viewer.negotiate(vec![pcm_format(MONO_16)]);
+        viewer.microphone.open(MONO_16, 160);
+        assert!(matches!(viewer.drive().as_slice(), [RdpeaiPdu::Open(_)]));
+
+        viewer.microphone.close();
+        viewer.microphone.open(MONO_16, 160);
+        // The new channel has agreed no formats yet.
+        assert!(viewer.drive().is_empty());
+        viewer.server = RdpeaiServer::new(viewer.microphone.build_backend());
+        viewer.negotiate(vec![pcm_format(MONO_16)]);
+        assert!(matches!(viewer.drive().as_slice(), [RdpeaiPdu::Open(_)]));
     }
 
     #[test]
