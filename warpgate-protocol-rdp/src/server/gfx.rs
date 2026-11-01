@@ -67,6 +67,23 @@ impl GraphicsFactory {
     pub(super) fn to_desktop(&self, x: u16, y: u16) -> (u16, u16) {
         lock(&self.0.placement).to_desktop(x, y)
     }
+
+    /// Moves a desktop point by a relative motion on the viewer's surface.
+    pub(super) fn move_on_desktop(&self, x: u16, y: u16, dx: i16, dy: i16) -> (u16, u16) {
+        lock(&self.0.placement).move_on_desktop(x, y, dx, dy)
+    }
+
+    /// A factory whose desktop sits on the viewer's surface as `placement` says.
+    #[cfg(test)]
+    pub(super) fn placed(placement: Placement) -> Self {
+        let (signals, _) = mpsc::unbounded_channel();
+        Self(Arc::new(Shared {
+            events: Mutex::default(),
+            pipeline: Mutex::default(),
+            signals,
+            placement: Mutex::new(placement),
+        }))
+    }
 }
 
 impl ServerEventSender for GraphicsFactory {
