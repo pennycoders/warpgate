@@ -20,7 +20,7 @@ use ironrdp_async::Framed;
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_core::{WriteBuf, decode, encode_vec, impl_as_any};
-use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout};
+use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, DisplayControlPdu};
 use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer};
 use ironrdp_dvc as dvc;
 #[cfg(feature = "usb")]
@@ -996,6 +996,39 @@ impl DisplayControlHandler for DisplayControlBackend {
         Ok(capabilities)
     }
 }
+
+/// Display Control that drops a monitor layout it cannot decode instead of ending the session.
+///
+/// A layout is only a resize request, but `DisplayControlServer` returns the decode error,
+/// which ends the client loop. Jump Desktop on macOS sends layouts outside MS-RDPEDISP's
+/// 200..=8192 pixel range, and every such layout ended the session with a protocol error.
+struct TolerantDisplayControl(DisplayControlServer);
+
+impl_as_any!(TolerantDisplayControl);
+
+impl dvc::DvcProcessor for TolerantDisplayControl {
+    fn channel_name(&self) -> &str {
+        self.0.channel_name()
+    }
+
+    fn start(&mut self, channel_id: u32) -> PduResult<Vec<dvc::DvcMessage>> {
+        self.0.start(channel_id)
+    }
+
+    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<dvc::DvcMessage>> {
+        if let Err(error) = decode::<DisplayControlPdu>(payload) {
+            warn!(%error, payload = ?payload, "Ignoring a Display Control PDU that does not decode");
+            return Ok(Vec::new());
+        }
+        self.0.process(channel_id, payload)
+    }
+
+    fn close(&mut self, channel_id: u32) {
+        self.0.close(channel_id);
+    }
+}
+
+impl dvc::DvcServerProcessor for TolerantDisplayControl {}
 
 #[cfg(feature = "usb")]
 #[derive(Default)]
@@ -2795,7 +2828,7 @@ impl RdpServer {
         };
         let dvc = if let Some(monitor_count) = display_control_monitors {
             let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display), monitor_count);
-            dvc.with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)))
+            dvc.with_dynamic_channel(TolerantDisplayControl(DisplayControlServer::new(Box::new(dcs_backend))))
         } else {
             dvc
         };
@@ -7371,6 +7404,44 @@ mod tests {
     }
 
     impl SvcServerProcessor for ResourceChannel {}
+
+    #[derive(Default)]
+    struct RecordingLayouts(Arc<StdMutex<Vec<DisplayControlMonitorLayout>>>);
+
+    impl DisplayControlHandler for RecordingLayouts {
+        fn monitor_layout(&self, layout: DisplayControlMonitorLayout) {
+            self.0.lock().unwrap().push(layout);
+        }
+    }
+
+    /// A one-monitor layout PDU (MS-RDPEDISP 2.2.2.2) of the given size, encoded by hand so
+    /// that sizes the encoder refuses can be sent too.
+    fn monitor_layout_pdu(width: u32, height: u32) -> Vec<u8> {
+        let fields: [u32; 10] = [1, 0, 0, width, height, 300, 200, 0, 100, 100];
+        let mut pdu = Vec::new();
+        pdu.extend_from_slice(&2u32.to_le_bytes()); // DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT
+        pdu.extend_from_slice(&(16u32 + 40).to_le_bytes());
+        pdu.extend_from_slice(&40u32.to_le_bytes());
+        pdu.extend_from_slice(&1u32.to_le_bytes());
+        for field in fields {
+            pdu.extend_from_slice(&field.to_le_bytes());
+        }
+        pdu
+    }
+
+    #[test]
+    fn display_control_ignores_a_layout_that_does_not_decode() {
+        let layouts = RecordingLayouts::default();
+        let seen = Arc::clone(&layouts.0);
+        let mut channel = TolerantDisplayControl(DisplayControlServer::new(Box::new(layouts)));
+
+        let out = channel.process(1, &monitor_layout_pdu(9000, 1080)).expect("an invalid layout keeps the session");
+        assert!(out.is_empty());
+        assert!(seen.lock().unwrap().is_empty());
+
+        channel.process(1, &monitor_layout_pdu(1920, 1080)).expect("a valid layout");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
 
     struct NoopInput;
 
