@@ -9,14 +9,20 @@
 //!
 //! [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b8e7c588-51cb-455b-bb73-92d480903133
 
+use core::future::Future;
 use core::net::{SocketAddr, SocketAddrV6};
+use core::pin::Pin;
 use core::time::Duration;
+use std::io;
 use std::sync::Arc;
 
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_rdpemt::TunnelConfig;
 use ironrdp_rdpeudp::ConnectionConfig;
-use ironrdp_rdpeudp_tokio::{TunnelMessage, UdpAcceptConfig, UdpTransport, UdpTransportSender, accept_udp};
+use ironrdp_rdpeudp_tokio::{
+    DatagramIo, TunnelMessage, UdpAcceptConfig, UdpTransport, UdpTransportSender, accept_udp,
+    accept_udp_with_datagram_io,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls;
@@ -26,6 +32,81 @@ use tracing::{debug, warn};
 /// handshake, TLS, RDPEMT tunnel creation) may take before giving up and
 /// continuing TCP-only.
 const UDP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A boxed future, as the object-safe sideband traits below return them.
+pub type SidebandFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// One client's datagrams on a UDP port the embedder listens on for every
+/// connection and demultiplexes itself; see [`UdpSideband`].
+pub trait SidebandDatagrams: Send + Sync + 'static {
+    /// The client's address: where [`Self::send`] sends to and what
+    /// [`Self::recv`] receives from.
+    fn peer_addr(&self) -> SocketAddr;
+
+    /// The local address the client sent to, if known.
+    fn local_addr(&self) -> Option<SocketAddr>;
+
+    /// Sends one datagram to the client.
+    fn send<'a>(&'a self, buf: &'a [u8]) -> SidebandFuture<'a, io::Result<usize>>;
+
+    /// Receives the client's next datagram into `buf` and returns its length,
+    /// truncating one longer than `buf`.
+    ///
+    /// Must be cancellation safe: the transport awaits it inside
+    /// `tokio::select!`, and a datagram has to be either returned or kept for
+    /// the next call.
+    fn recv<'a>(&'a self, buf: &'a mut [u8]) -> SidebandFuture<'a, io::Result<usize>>;
+}
+
+/// The sideband UDP transport of a server that listens on one UDP port for
+/// every connection, as MS-RDPEUDP 2.1 and 3.1.3 describe.
+///
+/// [`RdpServerBuilder::with_udp_transport`](crate::RdpServerBuilder::with_udp_transport)
+/// binds a socket per connection instead, so only one connection at a time
+/// can take the port. With a `UdpSideband`
+/// ([`RdpServerBuilder::with_udp_sideband`](crate::RdpServerBuilder::with_udp_sideband))
+/// the embedder owns the listening socket and hands each connection the
+/// datagrams of the client that answers its Initiate Multitransport Request
+/// (MS-RDPBCGR 2.2.15.1).
+pub trait UdpSideband: Send + Sync {
+    /// Called once the server has sent `request`, with its `requestId` and
+    /// `securityCookie`.
+    ///
+    /// Whatever the embedder needs to recognize the client's SYN
+    /// (MS-RDPEUDP 3.1.5.1.1) has to be in place by the time this returns, not
+    /// when the future is first polled: the client may already be sending. A
+    /// version 3 SYN carries the SHA-256 of `securityCookie` as its
+    /// `cookieHash` (MS-RDPEUDP 2.2.2.9).
+    ///
+    /// The future resolves to that client's datagrams, the SYN first, or to
+    /// `None` when there are none to give (the server then continues
+    /// TCP-only). The server bounds the wait together with the handshake that
+    /// follows and drops the future, or the datagrams, when it gives up or the
+    /// connection ends; the embedder can release what it set up for the
+    /// request then.
+    fn open(&self, request: &MultitransportRequestPdu) -> SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>>;
+}
+
+/// [`SidebandDatagrams`] as the transport's [`DatagramIo`].
+struct BoxedDatagrams(Box<dyn SidebandDatagrams>);
+
+impl DatagramIo for BoxedDatagrams {
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        Some(self.0.peer_addr())
+    }
+
+    fn send<'a>(&'a self, buf: &'a [u8]) -> impl Future<Output = io::Result<usize>> + Send + 'a {
+        self.0.send(buf)
+    }
+
+    fn recv<'a>(&'a self, buf: &'a mut [u8]) -> impl Future<Output = io::Result<usize>> + Send + 'a {
+        self.0.recv(buf)
+    }
+}
 
 /// Shared handle to an established sideband UDP transport.
 ///
@@ -124,17 +205,60 @@ pub(crate) async fn accept(
         }
     };
 
-    let config = UdpAcceptConfig {
+    let config = accept_config(tls_config, request, UDP_ACCEPT_TIMEOUT);
+    established(accept_udp(socket, config).await)
+}
+
+/// [`accept`], over the client's datagrams as `sideband` hands them over
+/// rather than over a socket of its own.
+///
+/// `datagrams` is what [`UdpSideband::open`] returned for `request`. The wait
+/// for it and the handshake share one [`UDP_ACCEPT_TIMEOUT`]; failures are
+/// handled as in [`accept`].
+pub(crate) async fn accept_sideband(
+    datagrams: SidebandFuture<'static, Option<Box<dyn SidebandDatagrams>>>,
+    tls_config: Arc<rustls::ServerConfig>,
+    request: &MultitransportRequestPdu,
+) -> Option<UdpTransportHandle> {
+    let deadline = tokio::time::Instant::now() + UDP_ACCEPT_TIMEOUT;
+    let datagrams = match tokio::time::timeout_at(deadline, datagrams).await {
+        Ok(Some(datagrams)) => datagrams,
+        Ok(None) => {
+            debug!("No sideband UDP datagrams for this connection, continuing TCP-only");
+            return None;
+        }
+        Err(_) => {
+            debug!(timeout = ?UDP_ACCEPT_TIMEOUT, "Client sent no UDP SYN, continuing TCP-only");
+            return None;
+        }
+    };
+    let peer = datagrams.peer_addr();
+    debug!(%peer, "Client answered the multitransport request over UDP");
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let config = accept_config(tls_config, request, remaining);
+    established(accept_udp_with_datagram_io(BoxedDatagrams(datagrams), config).await)
+}
+
+fn accept_config(
+    tls_config: Arc<rustls::ServerConfig>,
+    request: &MultitransportRequestPdu,
+    accept_timeout: Duration,
+) -> UdpAcceptConfig {
+    UdpAcceptConfig {
         tls_config,
         tunnel_config: TunnelConfig {
             request_id: request.request_id,
             security_cookie: request.security_cookie,
         },
         connection_config: ConnectionConfig::default(),
-        accept_timeout: UDP_ACCEPT_TIMEOUT,
-    };
+        accept_timeout,
+    }
+}
 
-    match accept_udp(socket, config).await {
+fn established(
+    result: Result<UdpTransport, ironrdp_rdpeudp_tokio::UdpTransportError>,
+) -> Option<UdpTransportHandle> {
+    match result {
         Ok(transport) => {
             debug!("Sideband UDP transport established");
             Some(UdpTransportHandle::new(transport))

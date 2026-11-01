@@ -28,6 +28,7 @@ mod sound;
 mod urbdrc;
 
 pub use clipboard::CliprdrServerFactory;
+pub use multitransport::{SidebandDatagrams, SidebandFuture, UdpSideband};
 pub use display::{
     BitmapUpdate, ColorPointer, DesktopSize, DisplayContext, DisplayUpdate, Framebuffer, LargePointer, PixelFormat,
     RGBAPointer, RdpServerDisplay, RdpServerDisplayUpdates,
