@@ -48,6 +48,14 @@ Together they make `src/` identical to IronRDP master at `904a7da6` except for #
   leaving the viewer black (warp-tech/warpgate#2606). The buffer is now sized from the tile
   count up front as well. Warpgate's own patch for this is replaced by upstream's.
 
+## A Display Control layout that does not decode is dropped
+
+`DisplayControlServer` returns its decode error, which ends the client loop, so a single
+monitor layout outside MS-RDPEDISP's 200..=8192 pixel range ended the session. Jump
+Desktop on macOS sends such layouts, and its sessions ended with a protocol error. The
+channel is wrapped in `TolerantDisplayControl`, which logs the PDU and ignores it; a
+layout is only a resize request, so the session keeps its size.
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor. The same
