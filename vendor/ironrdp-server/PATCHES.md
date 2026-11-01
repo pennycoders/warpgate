@@ -138,3 +138,11 @@ code uses is unchanged between the two.
 `RdpdrServerMessage::Forward` (added by the `ironrdp-rdpdr` fork, see its PATCHES.md) is
 dispatched to `RdpdrServer::forward_drive_io_request`, next to the other RDPDR messages.
 Drop with the `ironrdp-rdpdr` fork.
+
+## The client's multitransport flags in `ConnectionInfo`
+
+`ConnectionInfo` gains `multitransport_flags`, the flags of the client's GCC Client
+Multitransport Channel Data (MS-RDPBCGR 2.2.1.3.8) that `AcceptorResult` already carries,
+so an embedder can see which clients offer the UDP transports (MS-RDPBCGR 2.2.15.1) and
+Soft-Sync (MS-RDPEDYC 3.1.5.3) without reaching into the acceptor. Warpgate logs it once
+per viewer connection.

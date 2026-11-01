@@ -229,6 +229,10 @@ pub struct ConnectionInfo {
     pub redirected_session_id: Option<u32>,
     /// See [`ironrdp_acceptor::AcceptorResult::password_cookie`].
     pub password_cookie: Option<rdp::client_info::PasswordCookie>,
+    /// See [`ironrdp_acceptor::AcceptorResult::multitransport_flags`]: the transports the
+    /// client announced in its GCC Client Multitransport Channel Data (MS-RDPBCGR
+    /// 2.2.1.3.8), empty when it sent none.
+    pub multitransport_flags: ironrdp_pdu::gcc::MultiTransportFlags,
 }
 
 impl ConnectionInfo {
@@ -246,6 +250,7 @@ impl ConnectionInfo {
             routing_token: None,
             redirected_session_id: None,
             password_cookie: None,
+            multitransport_flags: ironrdp_pdu::gcc::MultiTransportFlags::empty(),
         }
     }
 }
@@ -5389,6 +5394,7 @@ impl RdpServer {
                         })
                         .map(|cluster| cluster.redirected_session_id),
                     password_cookie: result.password_cookie.clone(),
+                    multitransport_flags: result.multitransport_flags,
                 });
             });
         }
