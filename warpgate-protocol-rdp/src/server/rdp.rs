@@ -16,16 +16,16 @@ use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntr
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, server_codecs_capabilities};
 use ironrdp_pdu::rdp::server_error_info::ServerSetErrorInfoPdu;
 use ironrdp_server::{
-    BitmapUpdate, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
-    DesktopSize, DisplayContext, DisplayUpdate, GfxServerFactory, KeyboardEvent, MouseButton,
-    MouseEvent, PixelFormat, RGBAPointer, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
-    RdpServerInputHandler, ServerEvent, ServerResult,
+    BitmapUpdate, ConnectionHandler, ConnectionInfo, CredentialDecision, CredentialValidationError,
+    CredentialValidator, Credentials, DesktopSize, DisplayContext, DisplayUpdate, GfxServerFactory,
+    KeyboardEvent, MouseButton, MouseEvent, PixelFormat, RGBAPointer, RdpServer, RdpServerDisplay,
+    RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerResult, UdpSideband,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
-use tracing::{Instrument as _, Span, debug, warn};
+use tracing::{Instrument as _, Span, debug, info, warn};
 use warpgate_core::{DesktopInput, Scancode};
 #[cfg(test)]
 use warpgate_desktop_ui::DEFAULT_SIZE;
@@ -55,6 +55,7 @@ pub fn run_on_thread<S>(
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
     drives: super::ViewerDrives,
+    udp: Option<Arc<dyn UdpSideband>>,
 ) -> oneshot::Receiver<Result<()>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -84,6 +85,7 @@ where
                 out_tx,
                 in_rx,
                 drives,
+                udp,
             )
             .instrument(span),
         );
@@ -102,6 +104,7 @@ async fn run<S>(
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
     drives: super::ViewerDrives,
+    udp: Option<Arc<dyn UdpSideband>>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -144,7 +147,7 @@ where
         out: out_tx.clone(),
     });
 
-    let mut server = RdpServer::builder()
+    let server = RdpServer::builder()
         // `addr` is only used by `RdpServer::run()` (which binds a listener); we drive
         // `run_connection()` directly with the accepted stream, so it's a harmless
         // placeholder here.
@@ -169,7 +172,14 @@ where
         )
         .with_bitmap_codecs(bitmap_codecs(graphics_pipeline))
         .with_rdpdr_factory(Some(Box::new(drives)))
-        .build();
+        .with_connection_handler(Some(Box::new(ViewerConnectionLog)));
+    // Graphics move onto the UDP transport once it is up (MS-RDPEDYC 3.1.5.3 Soft-Sync);
+    // the target side stays on TCP.
+    let mut server = match udp {
+        Some(udp) => server.with_udp_sideband(udp),
+        None => server,
+    }
+    .build();
 
     let router = tokio::spawn(
         route_input(
@@ -193,6 +203,22 @@ where
 
     router.abort();
     Ok(())
+}
+
+/// Logs what each viewer announced about itself during connection setup.
+struct ViewerConnectionLog;
+
+impl ConnectionHandler for ViewerConnectionLog {
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        // The client's Multitransport Channel Data (MS-RDPBCGR 2.2.1.3.8): whether it can
+        // take the reliable (TRANSPORT_TYPE_UDP_FECR) or lossy (TRANSPORT_TYPE_UDP_FECL) UDP
+        // transport, and whether it does Soft-Sync (SOFT_SYNC_TCP_TO_UDP, MS-RDPEDYC 3.1.5.3).
+        info!(
+            multitransport_flags = format_args!("{:#06x}", info.multitransport_flags.bits()),
+            multitransport = ?info.multitransport_flags,
+            "Viewer multitransport capabilities"
+        );
+    }
 }
 
 /// Build a rustls `TlsAcceptor` from PEM cert + key.
