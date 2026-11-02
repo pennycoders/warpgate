@@ -16,6 +16,7 @@ use super::server::{
     RdpServerSecurity, StaticChannelFactory,
 };
 use crate::error::ServerResult;
+use crate::multitransport::UdpSideband;
 #[cfg(feature = "usb")]
 use crate::urbdrc::DeviceFactory;
 use crate::{
@@ -65,6 +66,7 @@ pub struct BuilderDone {
     remotefx_quant: Quant,
     remotefx_entropy_coder: Option<EntropyBits>,
     udp_bind_addr: Option<SocketAddr>,
+    udp_sideband: Option<Arc<dyn UdpSideband>>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -180,6 +182,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                udp_sideband: None,
             },
         }
     }
@@ -216,6 +219,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                udp_sideband: None,
             },
         }
     }
@@ -471,6 +475,23 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Offer UDP multitransport like [`Self::with_udp_transport`], over a UDP
+    /// port the embedder listens on and demultiplexes itself instead of a
+    /// socket per connection.
+    ///
+    /// MS-RDPEUDP 2.1 and 3.1.3 have the server take every connection on one
+    /// UDP socket bound to the RDP port, which a socket per connection allows
+    /// only one connection at a time. For each Initiate Multitransport Request
+    /// (MS-RDPBCGR 2.2.15.1) the server asks `sideband` for the datagrams of
+    /// the client answering it (see [`UdpSideband::open`]) and runs the
+    /// RDPEUDP, TLS and RDPEMT handshakes over them. Takes precedence over
+    /// [`Self::with_udp_transport`]; the same security requirement and TCP-only
+    /// fallback apply.
+    pub fn with_udp_sideband(mut self, sideband: Arc<dyn UdpSideband>) -> Self {
+        self.state.udp_sideband = Some(sideband);
+        self
+    }
+
     pub fn build(self) -> RdpServer {
         let mut server = RdpServer::new(
             RdpServerOptions {
@@ -483,6 +504,7 @@ impl RdpServerBuilder<BuilderDone> {
                 remotefx_quant: self.state.remotefx_quant,
                 remotefx_entropy_coder: self.state.remotefx_entropy_coder,
                 udp_bind_addr: self.state.udp_bind_addr,
+                udp_sideband: self.state.udp_sideband,
             },
             self.state.handler,
             self.state.display,

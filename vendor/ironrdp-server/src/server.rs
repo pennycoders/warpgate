@@ -229,6 +229,10 @@ pub struct ConnectionInfo {
     pub redirected_session_id: Option<u32>,
     /// See [`ironrdp_acceptor::AcceptorResult::password_cookie`].
     pub password_cookie: Option<rdp::client_info::PasswordCookie>,
+    /// See [`ironrdp_acceptor::AcceptorResult::multitransport_flags`]: the transports the
+    /// client announced in its GCC Client Multitransport Channel Data (MS-RDPBCGR
+    /// 2.2.1.3.8), empty when it sent none.
+    pub multitransport_flags: ironrdp_pdu::gcc::MultiTransportFlags,
 }
 
 impl ConnectionInfo {
@@ -246,6 +250,7 @@ impl ConnectionInfo {
             routing_token: None,
             redirected_session_id: None,
             password_cookie: None,
+            multitransport_flags: ironrdp_pdu::gcc::MultiTransportFlags::empty(),
         }
     }
 }
@@ -775,9 +780,18 @@ pub struct RdpServerOptions {
     /// multitransport is offered. `None` disables the feature entirely. Set
     /// via [`RdpServerBuilder::with_udp_transport`](crate::RdpServerBuilder::with_udp_transport).
     pub udp_bind_addr: Option<SocketAddr>,
+    /// The embedder's own UDP listener for the sideband multitransport
+    /// transport, used instead of [`Self::udp_bind_addr`] when set. Set via
+    /// [`RdpServerBuilder::with_udp_sideband`](crate::RdpServerBuilder::with_udp_sideband).
+    pub udp_sideband: Option<Arc<dyn multitransport::UdpSideband>>,
 }
 
 impl RdpServerOptions {
+    /// Whether UDP multitransport is configured, by either of its two means.
+    fn offers_udp(&self) -> bool {
+        self.udp_bind_addr.is_some() || self.udp_sideband.is_some()
+    }
+
     /// Default [MultifragmentUpdate] max reassembly buffer size (8 MB).
     ///
     /// Advertised to the client during capability exchange as the largest
@@ -1710,7 +1724,7 @@ impl PendingConnection {
         capabilities: Vec<CapabilitySet>,
         creds: Option<Credentials>,
         honor_client_desktop_size: Option<DesktopSize>,
-        udp_bind_addr: Option<SocketAddr>,
+        offer_udp: bool,
         credentials_handler: ServerCredentialsHandler,
     ) -> Self {
         let mut acceptor = Acceptor::new(security.flag(), desktop_size, capabilities, creds);
@@ -1718,7 +1732,7 @@ impl PendingConnection {
         // Multitransport requires Enhanced Security: `RdpServerSecurity::None`
         // has nothing to authenticate the sideband transport's TLS with, and
         // matches the reference client's own Enhanced-Security-only gate.
-        if udp_bind_addr.is_some() && security.tls_acceptor().is_some() {
+        if offer_udp && security.tls_acceptor().is_some() {
             // SOFT_SYNC_TCP_TO_UDP is included alongside the transport type
             // itself: Without it, Soft-Sync is never negotiated (MS-RDPEDYC
             // 3.1.5.3 requires both peers to advertise it), and
@@ -1835,6 +1849,30 @@ struct NegotiatedConnection<S> {
     /// the server accepted itself; see [`RdpServer::set_connection_local_addr`].
     local_addr: Option<SocketAddr>,
     authenticated_credentials: Option<Credentials>,
+}
+
+/// Aborts the tasks it tracks when dropped.
+///
+/// `accept_finalize` holds one for its UDP multitransport accepts: dropping a
+/// `JoinHandle` only detaches its task, and an accept has no reason to outlive
+/// the connection it was started for (MS-RDPEMT 1.3.3).
+#[derive(Default)]
+struct AbortOnDrop(Vec<task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn track<T>(&mut self, handle: task::JoinHandle<T>) -> task::JoinHandle<T> {
+        self.0.retain(|tracked| !tracked.is_finished());
+        self.0.push(handle.abort_handle());
+        handle
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
 }
 
 /// State that belongs to a single client connection.
@@ -2218,7 +2256,7 @@ where
         capabilities,
         ctx.creds.clone(),
         ctx.opts.honor_client_desktop_size,
-        ctx.opts.udp_bind_addr,
+        ctx.opts.offers_udp(),
         ServerCredentialsHandler {
             validator: ctx.credential_validator.clone(),
             require_authenticated: ctx.requires_authenticated_credentials,
@@ -3155,7 +3193,7 @@ impl RdpServer {
             capabilities,
             self.creds.clone(),
             self.opts.honor_client_desktop_size,
-            self.opts.udp_bind_addr,
+            self.opts.offers_udp(),
             ServerCredentialsHandler {
                 validator: self.credential_validator.clone(),
                 require_authenticated: self.connection_binder.is_some(),
@@ -5173,7 +5211,8 @@ impl RdpServer {
             // an accepted narrow-window tradeoff; the alternative is
             // persisting in-flight `JoinHandle`s across reactivation, which
             // this integration does not attempt. The orphaned task also keeps
-            // `udp_bind_addr` bound for up to `UDP_ACCEPT_TIMEOUT`, so a NEXT
+            // `udp_bind_addr` bound for up to `UDP_ACCEPT_TIMEOUT`, or until
+            // the connection ends (`accept_finalize` aborts it then), so a NEXT
             // connection's own bind attempt during that window can collide
             // with it too, not only a concurrently preempted session's (see
             // `multitransport::accept`'s own doc comment on that failure
@@ -5389,6 +5428,7 @@ impl RdpServer {
                         })
                         .map(|cluster| cluster.redirected_session_id),
                     password_cookie: result.password_cookie.clone(),
+                    multitransport_flags: result.multitransport_flags,
                 });
             });
         }
@@ -5986,6 +6026,7 @@ impl RdpServer {
             .opts
             .udp_bind_addr
             .map(|bind| multitransport::sideband_bind_addr(bind, self.connection_local_addr));
+        let udp_sideband = self.opts.udp_sideband.clone();
         let tls_config = self
             .opts
             .security
@@ -6006,6 +6047,12 @@ impl RdpServer {
         // synchronously as part of finalize, so establishing it must never
         // block the RDP handshake finalize itself is driving.
         let mut pending_udp_accept: Option<task::JoinHandle<Option<multitransport::UdpTransportHandle>>> = None;
+        // Dropping a `JoinHandle` detaches its task, so without this an accept
+        // still running when the connection ends would keep its socket (or the
+        // embedder's request, see `UdpSideband::open`) until
+        // `UDP_ACCEPT_TIMEOUT`. MS-RDPEMT 1.3.3: the multitransport connection
+        // goes with the main RDP connection.
+        let mut udp_accept_guard = AbortOnDrop::default();
         loop {
             // Bounded: see `FINALIZE_TIMEOUT`. The bound belongs on THIS call
             // and not on `accept_finalize` itself or its callers — the loop
@@ -6027,16 +6074,26 @@ impl RdpServer {
                 self,
                 async |request, _soft_sync| {
                     // Defensive only: reached only if the acceptor sent a
-                    // request despite one of these being unset, which
+                    // request despite these being unset, which
                     // `PendingConnection::new`'s gate should prevent.
-                    let (Some(udp_bind_addr), Some(tls_config)) = (udp_bind_addr, tls_config.clone()) else {
+                    let Some(tls_config) = tls_config.clone() else {
                         return;
                     };
                     // Spawned rather than awaited inline: See the comment on
                     // `pending_udp_accept`'s declaration above.
-                    pending_udp_accept = Some(task::spawn(async move {
-                        multitransport::accept(udp_bind_addr, tls_config, &request).await
-                    }));
+                    if let Some(sideband) = &udp_sideband {
+                        // Opened here, before anything else runs: the
+                        // embedder has to be ready for the client's SYN,
+                        // which may already be on its way.
+                        let datagrams = sideband.open(&request);
+                        pending_udp_accept = Some(udp_accept_guard.track(task::spawn(async move {
+                            multitransport::accept_sideband(datagrams, tls_config, &request).await
+                        })));
+                    } else if let Some(udp_bind_addr) = udp_bind_addr {
+                        pending_udp_accept = Some(udp_accept_guard.track(task::spawn(async move {
+                            multitransport::accept(udp_bind_addr, tls_config, &request).await
+                        })));
+                    }
                 },
             );
             let (new_framed, result) = match tokio::time::timeout(FINALIZE_TIMEOUT, finalize).await {
@@ -6532,6 +6589,7 @@ mod preempt_tests {
                 remotefx_quant: Quant::default(),
                 remotefx_entropy_coder: None,
                 udp_bind_addr: None,
+                udp_sideband: None,
             },
             creds: None,
             display: Arc::new(Mutex::new(Box::new(NoDisplay))),
@@ -6786,6 +6844,18 @@ mod preempt_tests {
         // Negotiated, and the success arrives after finalization.
         RdpServer::handle_message_channel_data(&mut conn, response(&MultitransportResponsePdu::success(1)));
         assert!(conn.udp_migration_allowed);
+    }
+
+    // oracle: spec MS-RDPEMT 1.3.3
+    #[tokio::test]
+    async fn a_udp_accept_still_running_ends_with_its_connection() {
+        let mut guard = AbortOnDrop::default();
+        let finished = guard.track(task::spawn(async {}));
+        finished.await.expect("a finished accept");
+        let running = guard.track(task::spawn(core::future::pending::<()>()));
+        assert_eq!(guard.0.len(), 1, "finished accepts are not kept");
+        drop(guard);
+        assert!(running.await.expect_err("aborted").is_cancelled());
     }
 
     #[tokio::test]

@@ -1,0 +1,231 @@
+diff -ru ironrdp-rdpeudp-tokio-0.2.0/src/driver.rs base/src/driver.rs
+--- ironrdp-rdpeudp-tokio-0.2.0/src/driver.rs	2026-11-01 21:08:03
++++ base/src/driver.rs	2026-11-01 21:08:03
+@@ -26,10 +26,25 @@
+ use crate::error::{DriverError, DriverErrorExt as _, DriverErrorKind};
+ use crate::stream::SharedIo;
+ 
+-pub(crate) trait DatagramIo: Send + Sync + 'static {
++/// A connected datagram endpoint the driver sends and receives through.
++///
++/// Implemented for a [`UdpSocket`] `connect()`ed to its peer. A server that
++/// takes every connection on one UDP port, as MS-RDPEUDP 2.1 and 3.1.3
++/// describe, demultiplexes that port itself and implements this for each
++/// peer's share of the traffic, handing it to
++/// [`accept_udp_with_datagram_io`](crate::accept_udp_with_datagram_io).
++pub trait DatagramIo: Send + Sync + 'static {
++    /// The local address datagrams are sent from, if known.
+     fn local_addr(&self) -> Option<SocketAddr>;
++    /// The one peer this endpoint exchanges datagrams with.
+     fn peer_addr(&self) -> Option<SocketAddr>;
++    /// Sends one datagram to the peer.
+     fn send<'a>(&'a self, buf: &'a [u8]) -> impl Future<Output = io::Result<usize>> + Send + 'a;
++    /// Receives the peer's next datagram into `buf`, returning its length.
++    ///
++    /// The driver awaits this inside `tokio::select!`, so it must be
++    /// cancellation safe: a datagram is either returned or left for the
++    /// next call.
+     fn recv<'a>(&'a self, buf: &'a mut [u8]) -> impl Future<Output = io::Result<usize>> + Send + 'a;
+ }
+ 
+diff -ru ironrdp-rdpeudp-tokio-0.2.0/src/ice.rs base/src/ice.rs
+--- ironrdp-rdpeudp-tokio-0.2.0/src/ice.rs	2026-11-01 21:08:03
++++ base/src/ice.rs	2026-11-01 21:08:03
+@@ -29,7 +29,7 @@
+ use crate::driver::DatagramIo;
+ use crate::error::UdpTransportErrorExt as _;
+ use crate::transport::{
+-    UdpAcceptConfig, UdpTransport, UdpTransportConfig, accept_udp_with_datagram_io, connect_udp_with_datagram_io,
++    UdpAcceptConfig, UdpTransport, UdpTransportConfig, accept_udp_with_datagram_io_inner, connect_udp_with_datagram_io,
+ };
+ 
+ const MAX_ICE_SERVERS: usize = 8;
+@@ -353,7 +353,7 @@
+     validate_timeout(config.accept_timeout)?;
+     let accept_timeout = config.accept_timeout;
+     let (io, agent) = connect_ice_candidates(local, remote, role, timeout).await?;
+-    let mut transport = tokio::time::timeout(accept_timeout, accept_udp_with_datagram_io(io, config))
++    let mut transport = tokio::time::timeout(accept_timeout, accept_udp_with_datagram_io_inner(io, config))
+         .await
+         .map_err(|_| IceTransportError::Transport(crate::UdpTransportError::handshake_timeout("accept udp with ice")))?
+         .map_err(IceTransportError::Transport)?;
+diff -ru ironrdp-rdpeudp-tokio-0.2.0/src/lib.rs base/src/lib.rs
+--- ironrdp-rdpeudp-tokio-0.2.0/src/lib.rs	2026-11-01 21:08:03
++++ base/src/lib.rs	2026-11-01 21:08:03
+@@ -15,6 +15,7 @@
+ pub(crate) mod tls;
+ pub(crate) mod tunnel;
+ 
++pub use self::driver::DatagramIo;
+ pub use self::error::{DriverError, DriverErrorKind, UdpTransportError, UdpTransportErrorKind};
+ #[cfg(feature = "ice")]
+ pub use self::ice::{
+@@ -24,7 +25,7 @@
+ pub use self::multitransport::MultitransportBootstrap;
+ pub use self::transport::{
+     TunnelMessage, UdpAcceptConfig, UdpTlsConfig, UdpTransport, UdpTransportConfig, UdpTransportSender, accept_udp,
+-    connect_udp, connect_udp_with_socket,
++    accept_udp_with_datagram_io, connect_udp, connect_udp_with_socket,
+ };
+ 
+ #[cfg(test)]
+diff -ru ironrdp-rdpeudp-tokio-0.2.0/src/transport.rs base/src/transport.rs
+--- ironrdp-rdpeudp-tokio-0.2.0/src/transport.rs	2026-11-01 21:08:03
++++ base/src/transport.rs	2026-11-01 21:08:03
+@@ -789,8 +789,36 @@
+     accept_udp_after_initial_datagram(socket, config, recv_buf[..n].to_vec(), client_addr).await
+ }
+ 
+-#[cfg(feature = "ice")]
+-pub(crate) async fn accept_udp_with_datagram_io<S: DatagramIo>(
++/// Accept a UDP transport connection over a caller-supplied datagram
++/// endpoint.
++///
++/// Performs the same sequence as [`accept_udp`], bounded by the same
++/// `config.accept_timeout`, but reads and writes through `io` instead of a
++/// socket of its own. MS-RDPEUDP 2.1 and 3.1.3 have the server take every
++/// connection on one UDP port, which a socket per connection cannot do: a
++/// server that listens that way demultiplexes the port by peer and passes
++/// each peer's datagrams here.
++///
++/// `io` must report its peer ([`DatagramIo::peer_addr`]), and its first
++/// datagram must be the client's SYN (MS-RDPEUDP 3.1.5.1.1).
++///
++/// # Errors
++///
++/// Returns `UdpTransportError` if any phase of the accept fails.
++pub async fn accept_udp_with_datagram_io<S: DatagramIo>(
++    io: S,
++    config: UdpAcceptConfig,
++) -> Result<UdpTransport, UdpTransportError> {
++    let config_timeout = config.accept_timeout;
++    tokio::time::timeout(config.accept_timeout, accept_udp_with_datagram_io_inner(io, config))
++        .await
++        .map_err(|_| {
++            debug!(timeout = ?config_timeout, "UDP accept timed out");
++            UdpTransportError::handshake_timeout("accept udp with datagram I/O")
++        })?
++}
++
++pub(crate) async fn accept_udp_with_datagram_io_inner<S: DatagramIo>(
+     socket: S,
+     config: UdpAcceptConfig,
+ ) -> Result<UdpTransport, UdpTransportError> {
+@@ -1318,5 +1346,117 @@
+             encode(message(250)).is_err(),
+             "the encoder refuses what the precheck refuses"
+         );
++    }
++
++    /// One peer's share of a server socket that other peers share too, the way a server
++    /// listening on a single port hands each connection's datagrams over.
++    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
++    struct SharedPortIo {
++        socket: Arc<UdpSocket>,
++        peer: SocketAddr,
++        incoming: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
++    }
++
++    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
++    #[expect(clippy::manual_async_fn, reason = "DatagramIo requires Send futures")]
++    impl DatagramIo for SharedPortIo {
++        fn local_addr(&self) -> Option<SocketAddr> {
++            self.socket.local_addr().ok()
++        }
++
++        fn peer_addr(&self) -> Option<SocketAddr> {
++            Some(self.peer)
++        }
++
++        fn send<'a>(&'a self, buf: &'a [u8]) -> impl Future<Output = std::io::Result<usize>> + Send + 'a {
++            async move { self.socket.send_to(buf, self.peer).await }
++        }
++
++        fn recv<'a>(&'a self, buf: &'a mut [u8]) -> impl Future<Output = std::io::Result<usize>> + Send + 'a {
++            async move {
++                let datagram = self
++                    .incoming
++                    .lock()
++                    .await
++                    .recv()
++                    .await
++                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionAborted))?;
++                let len = datagram.len().min(buf.len());
++                buf[..len].copy_from_slice(&datagram[..len]);
++                Ok(len)
++            }
++        }
++    }
++
++    // oracle: spec MS-RDPEUDP 2.1 / 3.1.3 (one server port for every connection)
++    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
++    #[tokio::test]
++    async fn accepts_over_a_shared_server_socket() {
++        use tokio_rustls::rustls;
++
++        #[cfg(feature = "rustls-ring")]
++        let _ = rustls::crypto::ring::default_provider().install_default();
++        #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
++        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
++
++        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
++        let certificate = rustls::pki_types::CertificateDer::from(certified_key.cert.der().to_vec());
++        let key =
++            rustls::pki_types::PrivateKeyDer::try_from(certified_key.signing_key.serialize_der()).expect("private key");
++        let tls_config = Arc::new(
++            rustls::ServerConfig::builder()
++                .with_no_client_auth()
++                .with_single_cert(vec![certificate], key)
++                .expect("server TLS config"),
++        );
++        let tunnel_config = TunnelConfig {
++            request_id: 7,
++            security_cookie: [0x5A; 16],
++        };
++
++        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind server socket"));
++        let server_addr = socket.local_addr().expect("server address");
++
++        let client = tokio::spawn(connect_udp(UdpTransportConfig::new(
++            server_addr,
++            "localhost".into(),
++            tunnel_config.clone(),
++        )));
++
++        // The listener learns the peer from its SYN, then forwards that peer's datagrams.
++        let mut buf = vec![0u8; 9000];
++        let (n, peer) = socket.recv_from(&mut buf).await.expect("client SYN");
++        let (tx, rx) = mpsc::channel(64);
++        tx.send(buf[..n].to_vec()).await.expect("queue SYN");
++        let pump_socket = Arc::clone(&socket);
++        let pump = tokio::spawn(async move {
++            let mut buf = vec![0u8; 9000];
++            while let Ok((n, from)) = pump_socket.recv_from(&mut buf).await {
++                if from == peer && tx.send(buf[..n].to_vec()).await.is_err() {
++                    break;
++                }
++            }
++        });
++
++        let io = SharedPortIo {
++            socket: Arc::clone(&socket),
++            peer,
++            incoming: tokio::sync::Mutex::new(rx),
++        };
++        let config = UdpAcceptConfig {
++            tls_config,
++            tunnel_config,
++            connection_config: ConnectionConfig::default(),
++            accept_timeout: Duration::from_secs(10),
++        };
++        let mut server = accept_udp_with_datagram_io(io, config).await.expect("server accepts");
++        let mut client = client.await.expect("client task").expect("client connects");
++
++        client.send(b"to server".to_vec()).await.expect("client sends");
++        assert_eq!(server.recv().await.as_deref(), Some(&b"to server"[..]));
++        server.send(b"to client".to_vec()).await.expect("server sends");
++        assert_eq!(client.recv().await.as_deref(), Some(&b"to client"[..]));
++
++        pump.abort();
+     }
+ }
