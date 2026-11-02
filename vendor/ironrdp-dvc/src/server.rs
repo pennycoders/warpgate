@@ -19,6 +19,9 @@ use crate::{CompleteData, DvcProcessor, DynamicChannelMut, DynamicChannelRef, en
 
 pub trait DvcServerProcessor: DvcProcessor {}
 
+/// Channels the server closed and still remembers while their Close response is awaited.
+const MAX_CLOSING_CHANNELS: usize = 64;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum ChannelState {
     Pending,
@@ -147,6 +150,8 @@ pub struct DrdynvcServer {
     soft_sync_state: SoftSyncState,
     outgoing_tunnel_channels: BTreeMap<u32, SoftSyncTunnelType>,
     incoming_tunnel_channels: BTreeMap<u32, SoftSyncTunnelType>,
+    /// Channels the server closed whose Close response has not arrived yet.
+    closing_channels: BTreeSet<u32>,
 }
 
 impl fmt::Debug for DrdynvcServer {
@@ -174,6 +179,7 @@ impl DrdynvcServer {
             soft_sync_state: SoftSyncState::Idle,
             outgoing_tunnel_channels: BTreeMap::new(),
             incoming_tunnel_channels: BTreeMap::new(),
+            closing_channels: BTreeSet::new(),
         }
     }
 
@@ -296,10 +302,20 @@ impl DrdynvcServer {
         })
     }
 
+    /// Closes a DVC on the server's initiative, returns the Close Request PDU to send to the client.
+    ///
+    /// The channel stays closing until the client's Close response arrives (MS-RDPEDYC 1.3.3.3,
+    /// 3.3.5.2). Data the client sent before it saw the request is dropped meanwhile.
     pub fn close_channel(&mut self, channel_id: u32) -> Option<SvcMessage> {
         self.remove_by_channel_id(channel_id)?;
         self.outgoing_tunnel_channels.remove(&channel_id);
         self.incoming_tunnel_channels.remove(&channel_id);
+        self.closing_channels.insert(channel_id);
+        // The client MAY leave the request unanswered (MS-RDPEDYC 3.2.5.2), so the set is bounded.
+        // Channel IDs are allocated in increasing order, so the first one is the oldest close.
+        if MAX_CLOSING_CHANNELS < self.closing_channels.len() {
+            self.closing_channels.pop_first();
+        }
         Some(
             SvcMessage::from(DrdynvcServerPdu::Close(ClosePdu::new(channel_id)))
                 .with_flags(ChannelFlags::SHOW_PROTOCOL),
@@ -388,6 +404,13 @@ impl DrdynvcServer {
         let DrdynvcClientPdu::Data(data) = pdu else {
             return Err(pdu_other_err!("only DVC data is permitted on a multitransport tunnel"));
         };
+        if self.closing_channels.contains(&data.channel_id()) {
+            debug!(
+                channel_id = data.channel_id(),
+                "Dropping tunneled DVC data for a channel the server is closing"
+            );
+            return Ok(Vec::new());
+        }
         if !self.incoming_tunnel_channels.contains_key(&data.channel_id()) {
             return Err(pdu_other_err!(
                 "received tunneled data for a channel not selected by Soft-Sync"
@@ -398,7 +421,17 @@ impl DrdynvcServer {
 
     fn process_data(&mut self, data: crate::pdu::DrdynvcDataPdu) -> PduResult<Vec<SvcMessage>> {
         let channel_id = data.channel_id();
-        let c = self.channel_by_id(channel_id).map_err(|e| decode_err!(e))?;
+        // The client may send on a channel until it reads the server's Close Request
+        // (MS-RDPEDYC 1.3.3.3, 3.3.5.2), and the ChannelId stops being valid with that request
+        // (3.1.1). Such data has no consumer; dropping it keeps the session alive.
+        let Some(c) = self.dynamic_channels.get_mut(channel_id) else {
+            if self.closing_channels.contains(&channel_id) {
+                debug!(channel_id, "Dropping DVC data for a channel the server is closing");
+            } else {
+                debug!(channel_id, "Dropping DVC data for an unknown channel");
+            }
+            return Ok(Vec::new());
+        };
         if c.state != ChannelState::Opened {
             debug!(?channel_id, ?c.state, "Invalid channel state");
             return Err(pdu_other_err!("invalid channel state"));
@@ -493,6 +526,14 @@ impl SvcProcessor for DrdynvcServer {
             DrdynvcClientPdu::Create(create_resp) => {
                 debug!("Got DVC Create Response PDU: {create_resp:?}");
                 let id = create_resp.channel_id();
+                if self.closing_channels.contains(&id) {
+                    // The server closed the channel before the client answered its Create Request.
+                    debug!(
+                        channel_id = id,
+                        "Ignoring DVC Create Response for a channel the server is closing"
+                    );
+                    return Ok(resp);
+                }
                 let c = self.channel_by_id(id).map_err(|e| decode_err!(e))?;
                 if c.state != ChannelState::Creation {
                     return Err(pdu_other_err!("invalid channel state"));
@@ -514,7 +555,13 @@ impl SvcProcessor for DrdynvcServer {
             DrdynvcClientPdu::Close(close) => {
                 debug!("Got DVC Close PDU: {close:?}");
                 let channel_id = close.channel_id();
-                self.remove_by_channel_id(channel_id);
+                if self.closing_channels.remove(&channel_id) {
+                    // The Close response to the server's Close Request (MS-RDPEDYC 3.3.5.2).
+                    debug!(channel_id, "DVC close completed");
+                } else {
+                    // A client-initiated close, which the server does not answer (3.3.5.2).
+                    self.remove_by_channel_id(channel_id);
+                }
             }
             DrdynvcClientPdu::Data(data) => {
                 if self.incoming_tunnel_channels.contains_key(&data.channel_id()) {
@@ -565,6 +612,153 @@ mod tests {
     }
 
     impl DvcServerProcessor for TestDvc {}
+
+    #[derive(Default)]
+    struct RecordingDvc {
+        received: Vec<Vec<u8>>,
+    }
+
+    impl_as_any!(RecordingDvc);
+
+    impl DvcProcessor for RecordingDvc {
+        fn channel_name(&self) -> &str {
+            "recording"
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<crate::DvcMessage>> {
+            self.received.push(payload.to_vec());
+            Ok(Vec::new())
+        }
+    }
+
+    impl DvcServerProcessor for RecordingDvc {}
+
+    fn client_pdu(pdu: DrdynvcClientPdu) -> Vec<u8> {
+        ironrdp_core::encode_vec(&pdu).unwrap()
+    }
+
+    fn client_data(data: crate::pdu::DrdynvcDataPdu) -> Vec<u8> {
+        client_pdu(DrdynvcClientPdu::Data(data))
+    }
+
+    #[test]
+    fn data_and_close_response_after_a_server_close_keep_the_session() {
+        let mut server = DrdynvcServer::new();
+        let closed_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+        let open_id = server
+            .dynamic_channels
+            .insert_channel(RecordingDvc::default(), ChannelState::Opened);
+
+        server.close_channel(closed_id).unwrap();
+        assert!(!server.is_channel_opened(closed_id));
+
+        // The client sent these before it read the Close Request.
+        let in_flight = [
+            client_data(crate::pdu::DrdynvcDataPdu::Data(crate::pdu::DataPdu::new(
+                closed_id,
+                alloc::vec![1, 2, 3],
+            ))),
+            client_data(crate::pdu::DrdynvcDataPdu::DataFirst(crate::pdu::DataFirstPdu::new(
+                closed_id,
+                8,
+                alloc::vec![1, 2, 3, 4],
+            ))),
+            client_data(crate::pdu::DrdynvcDataPdu::DataFirstCompressed(
+                crate::pdu::DataFirstCompressedPdu::new(closed_id, 8, alloc::vec![1, 2, 3, 4]),
+            )),
+            client_data(crate::pdu::DrdynvcDataPdu::DataCompressed(
+                crate::pdu::DataCompressedPdu::new(closed_id, alloc::vec![1, 2, 3]),
+            )),
+        ];
+        for pdu in &in_flight {
+            assert!(server.process(pdu).unwrap().is_empty());
+        }
+
+        // The Close response completes the close and is not answered.
+        let close_response = client_pdu(DrdynvcClientPdu::Close(ClosePdu::new(closed_id)));
+        assert!(server.process(&close_response).unwrap().is_empty());
+        assert!(!server.closing_channels.contains(&closed_id));
+
+        // Data still in flight behind the response, now for a forgotten channel, is dropped too.
+        assert!(server.process(&in_flight[0]).unwrap().is_empty());
+
+        // The other channel keeps working.
+        let data = client_data(crate::pdu::DrdynvcDataPdu::Data(crate::pdu::DataPdu::new(
+            open_id,
+            alloc::vec![9],
+        )));
+        server.process(&data).unwrap();
+        let open = server.dvc_by_id::<RecordingDvc>(open_id).unwrap();
+        assert_eq!(open.processor().received, alloc::vec![alloc::vec![9]]);
+    }
+
+    #[test]
+    fn create_response_for_a_channel_closed_during_creation_is_ignored() {
+        let mut server = DrdynvcServer::new();
+        let channel_id = server.dynamic_channels.reserve_channel();
+        server.create_channel_with_id(TestDvc, channel_id).unwrap();
+        server.close_channel(channel_id).unwrap();
+
+        let create_response = client_pdu(DrdynvcClientPdu::Create(crate::pdu::CreateResponsePdu::new(
+            channel_id,
+            CreationStatus::OK,
+        )));
+        assert!(server.process(&create_response).unwrap().is_empty());
+        assert!(!server.is_channel_opened(channel_id));
+
+        let close_response = client_pdu(DrdynvcClientPdu::Close(ClosePdu::new(channel_id)));
+        assert!(server.process(&close_response).unwrap().is_empty());
+    }
+
+    #[test]
+    fn data_for_a_never_opened_channel_is_dropped() {
+        let mut server = DrdynvcServer::new();
+        let open_id = server
+            .dynamic_channels
+            .insert_channel(RecordingDvc::default(), ChannelState::Opened);
+        let unknown_id = open_id + 41;
+
+        let unknown = [
+            client_data(crate::pdu::DrdynvcDataPdu::Data(crate::pdu::DataPdu::new(
+                unknown_id,
+                alloc::vec![1],
+            ))),
+            client_data(crate::pdu::DrdynvcDataPdu::DataFirst(crate::pdu::DataFirstPdu::new(
+                unknown_id,
+                4,
+                alloc::vec![1, 2],
+            ))),
+            client_data(crate::pdu::DrdynvcDataPdu::DataCompressed(
+                crate::pdu::DataCompressedPdu::new(unknown_id, alloc::vec![1]),
+            )),
+        ];
+        for pdu in &unknown {
+            assert!(server.process(pdu).unwrap().is_empty());
+        }
+
+        let data = client_data(crate::pdu::DrdynvcDataPdu::Data(crate::pdu::DataPdu::new(
+            open_id,
+            alloc::vec![7],
+        )));
+        server.process(&data).unwrap();
+        let open = server.dvc_by_id::<RecordingDvc>(open_id).unwrap();
+        assert_eq!(open.processor().received, alloc::vec![alloc::vec![7]]);
+    }
+
+    #[test]
+    fn closing_channels_are_bounded() {
+        let mut server = DrdynvcServer::new();
+        for _ in 0..=MAX_CLOSING_CHANNELS {
+            let channel_id = server.dynamic_channels.insert_channel(TestDvc, ChannelState::Opened);
+            server.close_channel(channel_id).unwrap();
+        }
+        assert_eq!(server.closing_channels.len(), MAX_CLOSING_CHANNELS);
+        assert!(!server.closing_channels.contains(&0));
+    }
 
     #[test]
     fn soft_sync_rejects_tunnel_data_until_the_client_responds() {
