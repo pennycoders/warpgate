@@ -12,24 +12,38 @@ releases: the commits after it (#2232, #2272, #2293, #2107, ...) rely on changes
 
 Re-vendor from a published `ironrdp-server` 0.14+ once one exists.
 
-## RemoteFX header blocks lost to a buffer retry
+## Backported upstream fixes
 
-`RemoteFxHandler` carries the desktop size as an `Option`, and `Some` is what makes
-`RfxEncoder::encode` emit the once-per-connection RFX header blocks (`TS_RFX_SYNC`,
-`TS_RFX_CONTEXT`, `TS_RFX_CHANNELS`, `TS_RFX_CODEC_VERSIONS`). The snapshot `take()`s that
-`Option` *inside* the loop that grows the output buffer on `NotEnoughBytes`, so a first
-frame whose encoding overruns the buffer consumes the headers on the attempt that failed
-and re-encodes without them. The buffer is sized from the frame's raw BGRA length, and RFX
-always emits whole 64x64 tiles, so anything tile-padded — a few-pixel rect, or a thin strip
-like a 1px window border — encodes larger than its source and takes that path. The headers
-are never re-armed, so every later frame is rejected (FreeRDP: `rfx_process_message:
-incomplete header blocks processing`) and the viewer stays black for the life of the
-connection while input still works; see warp-tech/warpgate#2606.
+`warpgate.patch` carries three IronRDP master commits made after `1f4dee6b`, applied in
+this order with their `ironrdp-server/src` changes only (the testsuite changes stay
+upstream). Together they make `src/` identical to IronRDP master at `904a7da6` except for
+#2293 (rdpsnd left unstarted for a client that asked for no audio), which needs an
+`ironrdp-acceptor` change and is not taken. All three drop out on a re-vendor past
+`904a7da6`. #2261 (size the display for non-resizing clients before input), which an
+earlier base of this fork carried as a backport too, is the snapshot commit itself.
 
-`warpgate.patch` reads the size without consuming it and clears it only once a message
-carrying the headers has been built. It also drops a `* 2` from the adjacent buffer-resize
-`debug!`, which reported twice the size actually allocated. Upstream fixed the same bug
-differently in #2274 (take before the loop, buffer reused), which is past the snapshot.
+- **#2291, keep pointer updates within the client's pointer cache.** A pointer update whose
+  `cache_index` is not below the client's `pointerCacheSize` is dropped, since mstsc ends
+  the session and FreeRDP drops the connection on one. `DisplayContext` gains
+  `pointer_cache_size` and `color_pointer_cache_size`.
+- **#2123, cap fast-path updates at the client's MaxRequestSize** (Devolutions/IronRDP#2122).
+  The encoder used the server's own `max_request_size` (8 MB) and ignored the client's
+  Multifragment Update Capability Set; Jump Desktop sends 65536 and dropped the connection
+  on the first full-screen bitmap update ("FastPath: Not enough space in the reassembly
+  buffer"). It also counts the rows of a bitmap chunk with `div_ceil`: a sub-rectangle's
+  data ends at its last pixel, short of a full stride, so the legacy bitmap path sent every
+  region narrower than the screen one row short (horizontal lines in Jump Desktop).
+- **#2274, fix pointer update encoding and reuse the RemoteFX buffer.** It also takes the
+  desktop size once, outside the loop that grows the buffer, which is the fix for the RFX
+  header blocks a buffer retry used to drop: `RemoteFxHandler` carries the desktop size as
+  an `Option` whose `Some` makes `RfxEncoder::encode` emit the once-per-connection
+  `TS_RFX_SYNC` / `TS_RFX_CONTEXT` / `TS_RFX_CHANNELS` / `TS_RFX_CODEC_VERSIONS` blocks, and
+  the snapshot `take()`s it inside the loop, so a first frame whose encoding overran the
+  buffer consumed the blocks on the failed attempt and every later frame was rejected
+  (FreeRDP: `rfx_process_message: incomplete header blocks processing`), leaving the viewer
+  black (warp-tech/warpgate#2606). The buffer is now sized from the tile count up front as
+  well. This replaces Warpgate's own patch for the same bug, which read the size without
+  consuming it and cleared it once a message carrying the blocks had been built.
 
 ## Manifest
 
